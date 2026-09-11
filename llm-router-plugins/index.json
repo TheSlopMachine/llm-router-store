@@ -1,1 +1,1 @@
-{"title": "Official llm-router store", "description": "Provider plugins for llm-router", "plugins": ["google.lua", "kiro.lua", "opencode-zen.lua"]}
+{"title": "Official llm-router store", "description": "Essential plugins and providers for llm-router", "plugins": ["google.lua", "kiro.lua", "opencode-zen.lua", "groq.lua", "proxifly.lua"]}
