@@ -1,9 +1,11 @@
 --- @plugin Google AI Studio
 --- @author TheSlopMachine
---- @version 1.0.2
+--- @version 1.1.0
 --- @router_version 0.0.4
 --- @description Google Gemini models via AI Studio API
 --- @allow_host generativelanguage.googleapis.com
+--- @proxy_location US
+--- @proxy_force_on_mismatch true
 
 local BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
@@ -37,8 +39,10 @@ local function map_finish_reason(r)
   else return "stop" end
 end
 
--- Merge consecutive same-role messages into Google contents.
+-- Split off system messages; merge consecutive same-role messages into
+-- Google contents. Gemini wants alternating user/model turns.
 local function build_contents(messages)
+  local system_parts = {}
   local contents = {}
   local current = nil
   local current_role = nil
@@ -49,23 +53,31 @@ local function build_contents(messages)
     end
   end
   for _, m in ipairs(messages or {}) do
-    local role = m.role
-    if role == "system" then role = "user"
-    elseif role == "assistant" then role = "model"
-    else role = "user" end
-    if current == nil or current_role ~= role then
-      flush()
-      current = { role = role, parts = {} }
-      current_role = role
+    if m.role == "system" then
+      if m.content and m.content ~= "" then
+        table.insert(system_parts, { text = m.content })
+      end
+    else
+      local role = "user"
+      if m.role == "assistant" then role = "model" end
+      if current == nil or current_role ~= role then
+        flush()
+        current = { role = role, parts = {} }
+        current_role = role
+      end
+      table.insert(current.parts, { text = m.content or "" })
     end
-    local text = m.content or ""
-    table.insert(current.parts, { text = text })
   end
   flush()
-  return contents
+  return contents, system_parts
 end
 
-local function build_generation_config(request)
+local function build_payload(request)
+  local contents, system_parts = build_contents(request.messages)
+  local payload = { contents = contents }
+  if #system_parts > 0 then
+    payload.systemInstruction = { parts = system_parts }
+  end
   local cfg = nil
   if request.max_tokens and request.max_tokens > 0 then
     cfg = cfg or {}
@@ -79,7 +91,44 @@ local function build_generation_config(request)
     cfg = cfg or {}
     cfg.topP = request.top_p
   end
-  return cfg
+  if request.reasoning_effort and request.reasoning_effort ~= "" and request.reasoning_effort ~= "minimal" then
+    cfg = cfg or {}
+    cfg.thinkingConfig = { includeThoughts = true }
+  end
+  if cfg then payload.generationConfig = cfg end
+  return payload
+end
+
+-- Split candidate parts into visible text and thought summaries.
+local function split_parts(cand)
+  local text, reasoning = {}, {}
+  local parts = cand and cand.content and cand.content.parts or {}
+  for _, p in ipairs(parts) do
+    if type(p.text) == "string" then
+      if p.thought == true then
+        table.insert(reasoning, p.text)
+      else
+        table.insert(text, p.text)
+      end
+    end
+  end
+  return table.concat(text), table.concat(reasoning)
+end
+
+local function build_usage(meta)
+  if not meta then return nil end
+  local usage = {
+    prompt_tokens = meta.promptTokenCount or 0,
+    completion_tokens = meta.candidatesTokenCount or 0,
+    total_tokens = meta.totalTokenCount or 0,
+  }
+  if meta.thoughtsTokenCount and meta.thoughtsTokenCount > 0 then
+    usage.completion_tokens_details = { reasoning_tokens = meta.thoughtsTokenCount }
+  end
+  if meta.cachedContentTokenCount and meta.cachedContentTokenCount > 0 then
+    usage.prompt_tokens_details = { cached_tokens = meta.cachedContentTokenCount }
+  end
+  return usage
 end
 
 local function estimate_rpm(name)
@@ -127,6 +176,11 @@ local function supports_generate_content(entry)
     if m == "generateContent" then return true end
   end
   return false
+end
+
+local function request_model_name(model)
+  local name = model:match("([^/]+)$") or model
+  return (name:gsub("^models/", ""))
 end
 
 llm_router.register("google", {
@@ -195,53 +249,46 @@ llm_router.register("google", {
   end,
 
   complete = function(ctx, credential, request)
-    local model = request.model:match("([^/]+)$")
     local client = llm_router.create_http_client({})
-    local payload = { contents = build_contents(request.messages) }
-    local cfg = build_generation_config(request)
-    if cfg then payload.generationConfig = cfg end
+    local payload = build_payload(request)
     local resp, err = client:request({
-      method = "POST", url = BASE_URL .. "/models/" .. model .. ":generateContent",
+      method = "POST", url = BASE_URL .. "/models/" .. request_model_name(request.model) .. ":generateContent",
       headers = { ["x-goog-api-key"] = api_key_of(credential), ["Content-Type"] = "application/json" },
       body = json.encode(payload),
     })
     if err then return nil, err end
     if resp.status ~= 200 then return classify_error(resp.status, resp.body) end
     local g = json.decode(resp.body)
+    if (not g.candidates or #g.candidates == 0) and g.promptFeedback and g.promptFeedback.blockReason then
+      return nil, { type = "invalid_request", message = "prompt blocked: " .. tostring(g.promptFeedback.blockReason) }
+    end
     local choices = {}
     if g.candidates and #g.candidates > 0 then
       local cand = g.candidates[1]
-      local text = ""
-      if cand.content and cand.content.parts and #cand.content.parts > 0 then
-        text = cand.content.parts[1].text or ""
-      end
+      local text, reasoning = split_parts(cand)
+      local message = { role = "assistant", content = text }
+      if reasoning ~= "" then message.reasoning_content = reasoning end
       table.insert(choices, {
         index = cand.index or 0,
-        message = { role = "assistant", content = text },
+        message = message,
         finish_reason = map_finish_reason(cand.finishReason or ""),
       })
     end
-    local usage = { prompt_tokens = 0, completion_tokens = 0, total_tokens = 0 }
-    if g.usageMetadata then
-      usage.prompt_tokens = g.usageMetadata.promptTokenCount or 0
-      usage.completion_tokens = g.usageMetadata.candidatesTokenCount or 0
-      usage.total_tokens = g.usageMetadata.totalTokenCount or 0
-    end
     return {
       id = "google-" .. tostring(os.time()), object = "chat.completion", created = os.time(),
-      model = request.model, choices = choices, usage = usage,
+      model = request.model, choices = choices,
+      usage = build_usage(g.usageMetadata) or { prompt_tokens = 0, completion_tokens = 0, total_tokens = 0 },
     }
   end,
 
   complete_stream = function(ctx, credential, request, emit)
-    local model = request.model:match("([^/]+)$")
     local client = llm_router.create_http_client({})
-    local payload = { contents = build_contents(request.messages) }
-    local cfg = build_generation_config(request)
-    if cfg then payload.generationConfig = cfg end
+    local payload = build_payload(request)
     local full_model = request.model
+    local chunk_id = "google-" .. tostring(os.time())
     local stream_err = client:stream({
-      method = "POST", url = BASE_URL .. "/models/" .. model .. ":streamGenerateContent",
+      method = "POST",
+      url = BASE_URL .. "/models/" .. request_model_name(request.model) .. ":streamGenerateContent?alt=sse",
       headers = { ["x-goog-api-key"] = api_key_of(credential), ["Content-Type"] = "application/json" },
       body = json.encode(payload),
       on_line = function(line)
@@ -249,30 +296,34 @@ llm_router.register("google", {
         local data = line:sub(7)
         if data == "[DONE]" then return end
         local ok, g = pcall(json.decode, data)
-        if not ok or not g.candidates or #g.candidates == 0 then return end
-        local cand = g.candidates[1]
-        local text = ""
-        if cand.content and cand.content.parts and #cand.content.parts > 0 then
-          text = cand.content.parts[1].text or ""
+        if not ok or type(g) ~= "table" then return end
+        local cand = g.candidates and g.candidates[1]
+        if cand then
+          local text, reasoning = split_parts(cand)
+          local delta = {}
+          if reasoning ~= "" then delta.reasoning_content = reasoning end
+          if text ~= "" then delta.content = text end
+          local choice = { index = cand.index or 0, delta = delta }
+          if cand.finishReason and cand.finishReason ~= "" then
+            choice.finish_reason = map_finish_reason(cand.finishReason)
+          end
+          if delta.content or delta.reasoning_content or choice.finish_reason then
+            emit({
+              id = chunk_id, object = "chat.completion.chunk", created = os.time(),
+              model = full_model, choices = { choice },
+            })
+          end
         end
-        local chunk = {
-          id = "google-" .. tostring(os.time()), object = "chat.completion.chunk", created = os.time(),
-          model = full_model,
-          choices = {
-            { index = cand.index or 0, delta = { role = "assistant", content = text } },
-          },
-        }
-        if cand.finishReason and cand.finishReason ~= "" then
-          chunk.choices[1].finish_reason = map_finish_reason(cand.finishReason)
+        local usage = build_usage(g.usageMetadata)
+        if usage then
+          emit({
+            id = chunk_id, object = "chat.completion.chunk", created = os.time(),
+            model = full_model, choices = {}, usage = usage,
+          })
         end
-        emit(chunk)
       end,
     })
     if stream_err then
-      if stream_err.status then
-        -- client:stream only returns transport errors; status errors surface per-line.
-        return nil, stream_err
-      end
       return nil, stream_err
     end
   end,
