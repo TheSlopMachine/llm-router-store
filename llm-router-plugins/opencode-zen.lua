@@ -1,6 +1,6 @@
 --- @plugin OpenCode Zen
 --- @author TheSlopMachine
---- @version 1.0.3
+--- @version 1.0.4
 --- @router_version 0.0.4
 --- @description OpenAI/Anthropic/Google compatible free provider OpenCode Zen
 --- @allow_host opencode.ai
@@ -85,6 +85,19 @@ local FALLBACK_MODELS = {
   { name = "gemini-3-flash", display_name = "Gemini 3 Flash" },
 }
 
+-- Upstream /models carries no capability metadata, so reasoning support
+-- is matched by model family. Conservative: known-thinking families only.
+-- (Declared before with_limits: Lua binds the name used inside a function
+-- at compile time, so a later local would resolve to a nil global.)
+local function supports_reasoning(name)
+  local m = name:lower()
+  if m:find("claude") then return true end
+  if m:find("^gpt%-5") or m:match("^o[0-9]") then return true end
+  if m:find("gemini") and not m:find("tts") and not m:find("image") then return true end
+  if m:find("grok%-4") or m:find("grok%-code") then return true end
+  return false
+end
+
 local function with_limits(infos)
   for _, m in ipairs(infos) do
     m.context_window = 200000
@@ -92,6 +105,10 @@ local function with_limits(infos)
     m.rpm = 60
     m.tpm = 100000
     m.rpd = 500
+    m.supported_parameters = { "tools", "tool_choice", "response_format", "temperature", "top_p", "max_tokens" }
+    if supports_reasoning(m.name or "") then
+      m.reasoning = { default_enabled = true, supported_efforts = { "high", "medium", "low" } }
+    end
   end
   return infos
 end
@@ -169,6 +186,22 @@ local function extract_responses_text(raw)
   end
   if type(raw.output_text) == "string" then return raw.output_text end
   return ""
+end
+
+local function extract_responses_reasoning(raw)
+  local output = raw.output
+  if type(output) ~= "table" then return "" end
+  local parts = {}
+  for _, item in ipairs(output) do
+    if type(item) == "table" and item.type == "reasoning" and type(item.summary) == "table" then
+      for _, s in ipairs(item.summary) do
+        if type(s) == "table" and type(s.text) == "string" and s.text ~= "" then
+          table.insert(parts, s.text)
+        end
+      end
+    end
+  end
+  return table.concat(parts, "\n")
 end
 
 local function extract_responses_tool_calls(raw)
@@ -254,6 +287,21 @@ llm_router.register("opencode-zen", {
       if request.max_tokens and request.max_tokens > 0 then payload.max_output_tokens = request.max_tokens end
       if request.temperature and request.temperature > 0 then payload.temperature = request.temperature end
       if request.top_p and request.top_p > 0 then payload.top_p = request.top_p end
+      local effort = request.reasoning_effort
+      if effort == "low" or effort == "medium" or effort == "high" or effort == "xhigh" then
+        payload.reasoning = { effort = effort, summary = "auto" }
+      end
+      local rf = request.response_format
+      if type(rf) == "table" and type(rf.type) == "string" then
+        if rf.type == "json_object" then
+          payload.text = { format = { type = "json_object" } }
+        elseif rf.type == "json_schema" and type(rf.json_schema) == "table" then
+          local fmt = { type = "json_schema", strict = true }
+          if type(rf.json_schema.name) == "string" then fmt.name = rf.json_schema.name end
+          if type(rf.json_schema.schema) == "table" then fmt.schema = rf.json_schema.schema end
+          payload.text = { format = fmt }
+        end
+      end
       local tools = build_responses_tools(request.tools)
       if #tools > 0 then payload.tools = tools end
 
@@ -267,6 +315,7 @@ llm_router.register("opencode-zen", {
       if resp.status ~= 200 then return classify_error(resp.status, resp.body) end
       local raw = json.decode(resp.body)
       local text = extract_responses_text(raw)
+      local reasoning = extract_responses_reasoning(raw)
       local tool_calls = extract_responses_tool_calls(raw)
       local finish = "stop"
       if #tool_calls > 0 then finish = "tool_calls" end
@@ -276,11 +325,13 @@ llm_router.register("opencode-zen", {
         usage.completion_tokens = raw.usage.output_tokens or 0
         usage.total_tokens = raw.usage.total_tokens or (usage.prompt_tokens + usage.completion_tokens)
       end
+      local message = { role = "assistant", content = text, tool_calls = tool_calls }
+      if reasoning ~= "" then message.reasoning_content = reasoning end
       return {
         id = "zen-" .. tostring(os.time()), object = "chat.completion", created = os.time(),
         model = request.model,
         choices = {
-          { index = 0, message = { role = "assistant", content = text, tool_calls = tool_calls }, finish_reason = finish },
+          { index = 0, message = message, finish_reason = finish },
         },
         usage = usage,
       }
@@ -292,6 +343,7 @@ llm_router.register("opencode-zen", {
     if request.top_p and request.top_p > 0 then payload.top_p = request.top_p end
     if request.tools then payload.tools = request.tools end
     if request.tool_choice then payload.tool_choice = request.tool_choice end
+    if type(request.response_format) == "table" then payload.response_format = request.response_format end
 
     local headers = opencode_headers({ ["Content-Type"] = "application/json", ["Accept"] = "application/json" })
     if api_key ~= "" then headers["Authorization"] = "Bearer " .. api_key end

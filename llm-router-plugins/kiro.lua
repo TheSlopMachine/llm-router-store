@@ -1,6 +1,6 @@
 --- @plugin Kiro AI
 --- @author TheSlopMachine
---- @version 1.0.6
+--- @version 1.0.7
 --- @router_version 0.0.4
 --- @description AWS Kiro models via device login (OAuth2 with proactive refresh)
 --- @allow_host codewhisperer.us-east-1.amazonaws.com
@@ -477,12 +477,13 @@ llm_router.register("kiro", {
   end,
 
   get_model_infos = function(ctx, credential, provider_config)
+    local tools = { "tools" }
     return {
-      { name = "claude-opus-4.7", display_name = "Claude Opus 4.7", context_window = 200000, max_tokens = 32000 },
-      { name = "claude-opus-4.6", display_name = "Claude Opus 4.6", context_window = 200000, max_tokens = 32000 },
-      { name = "claude-sonnet-4.6", display_name = "Claude Sonnet 4.6", context_window = 200000, max_tokens = 32000 },
-      { name = "claude-sonnet-4.5", display_name = "Claude Sonnet 4.5", context_window = 200000, max_tokens = 32000 },
-      { name = "claude-haiku-4.5", display_name = "Claude Haiku 4.5", context_window = 200000, max_tokens = 32000 },
+      { name = "claude-opus-4.7", display_name = "Claude Opus 4.7", context_window = 200000, max_tokens = 32000, supported_parameters = tools },
+      { name = "claude-opus-4.6", display_name = "Claude Opus 4.6", context_window = 200000, max_tokens = 32000, supported_parameters = tools },
+      { name = "claude-sonnet-4.6", display_name = "Claude Sonnet 4.6", context_window = 200000, max_tokens = 32000, supported_parameters = tools },
+      { name = "claude-sonnet-4.5", display_name = "Claude Sonnet 4.5", context_window = 200000, max_tokens = 32000, supported_parameters = tools },
+      { name = "claude-haiku-4.5", display_name = "Claude Haiku 4.5", context_window = 200000, max_tokens = 32000, supported_parameters = tools },
     }
   end,
 
@@ -490,7 +491,11 @@ llm_router.register("kiro", {
     local data = credential.data or {}
     if not data.refresh_token or data.refresh_token == "" then return false end
     if not data.access_token or data.access_token == "" then return true end
-    if not data.expires_at or data.expires_at == "" then return false end
+    if not data.expires_at or data.expires_at == "" then
+      -- Pasted tokens carry no expiry metadata: a refresh attempt only
+      -- makes sense when the device flow stored OIDC client credentials.
+      return (data.client_id or "") ~= ""
+    end
     local now = os.time()
     local exp = nil
     local y, mo, d, h, mi, s = data.expires_at:match("^(%d+)-(%d+)-(%d+)T(%d+):(%d+):(%d+)")
@@ -700,6 +705,7 @@ llm_router.register("kiro", {
     local builders = {}
     local saw_tool = false
     local first = true
+    local stream_usage = nil
     local payload = build_payload(request, short_model)
     local stream_err = client_stream_raw(generate_headers(credential), payload, function(bytes)
       buffer = buffer .. bytes
@@ -746,6 +752,14 @@ llm_router.register("kiro", {
                 model = model, choices = { { index = 0, delta = delta } } })
               builders[id] = nil
             end
+          elseif etype == "metricsEvent" then
+            local m = p.metricsEvent or p
+            local itok = tonumber(m.inputTokens) or 0
+            local otok = tonumber(m.outputTokens) or 0
+            if itok > 0 or otok > 0 then
+              stream_usage = { prompt_tokens = itok, completion_tokens = otok,
+                total_tokens = itok + otok }
+            end
           end
         end
       end
@@ -753,8 +767,10 @@ llm_router.register("kiro", {
     if stream_err then return nil, stream_err end
     local finish = "stop"
     if saw_tool then finish = "tool_calls" end
-    emit({ id = response_id, object = "chat.completion.chunk", created = created,
-      model = model, choices = { { index = 0, delta = {}, finish_reason = finish } } })
+    local last = { id = response_id, object = "chat.completion.chunk", created = created,
+      model = model, choices = { { index = 0, delta = {}, finish_reason = finish } } }
+    if stream_usage then last.usage = stream_usage end
+    emit(last)
   end,
 })
 
