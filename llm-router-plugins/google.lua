@@ -1,6 +1,6 @@
 --- @plugin Google AI Studio
 --- @author TheSlopMachine
---- @version 1.1.0
+--- @version 1.2.0
 --- @router_version 0.0.4
 --- @description Google Gemini models via AI Studio API
 --- @allow_host generativelanguage.googleapis.com
@@ -17,6 +17,9 @@ local function classify_error(status, body)
   end
   if status == 401 or status == 403 then
     return nil, { type = "auth", message = message }
+  elseif status == 400 and message:find("location is not supported") then
+    -- Geo-blocked: the proxy exit is at fault, not the request.
+    return nil, { type = "geo", message = message }
   elseif status == 429 then
     return nil, { type = "rate_limit", message = message, retry_after = os.time() + 60 }
   elseif status == 408 or status == 504 then
@@ -94,6 +97,19 @@ local function build_payload(request)
   if request.reasoning_effort and request.reasoning_effort ~= "" and request.reasoning_effort ~= "minimal" then
     cfg = cfg or {}
     cfg.thinkingConfig = { includeThoughts = true }
+  end
+  local rf = request.response_format
+  if type(rf) == "table" and type(rf.type) == "string" then
+    if rf.type == "json_object" then
+      cfg = cfg or {}
+      cfg.responseMimeType = "application/json"
+    elseif rf.type == "json_schema" then
+      cfg = cfg or {}
+      cfg.responseMimeType = "application/json"
+      if type(rf.json_schema) == "table" and type(rf.json_schema.schema) == "table" then
+        cfg.responseSchema = rf.json_schema.schema
+      end
+    end
   end
   if cfg then payload.generationConfig = cfg end
   return payload
@@ -236,7 +252,11 @@ llm_router.register("google", {
             rpm = estimate_rpm(name), tpm = estimate_tpm(name), rpd = estimate_rpd(name),
             context_window = entry.inputTokenLimit or 0,
             max_tokens = entry.outputTokenLimit or 0,
+            supported_parameters = { "response_format", "structured_outputs" },
           })
+          if entry.thinking == true then
+            infos[#infos].reasoning = { default_enabled = true, supported_efforts = { "high", "medium", "low" } }
+          end
         end
       end
       if page.nextPageToken and page.nextPageToken ~= "" then
