@@ -1,17 +1,16 @@
 --- @plugin OpenCode Zen
 --- @author TheSlopMachine
---- @version 1.0.8
+--- @version 1.0.9
 --- @router_version 0.0.4
 --- @description OpenAI/Anthropic/Google compatible free provider OpenCode Zen
 --- @allow_host opencode.ai
 
 local BASE_URL = "https://opencode.ai/zen/v1"
 
+-- Protocol families first: muse-spark/gpt/grok serve /responses even for
+-- their -free variants. Remaining -free models are chat-protocol.
 local function endpoint_for_model(model)
   local m = model:lower()
-  if m:match("%-free$") then
-    return "/chat/completions"
-  end
   if m:match("^gpt%-") or m:match("muse%-spark") or m:match("^grok%-") then
     return "/responses"
   end
@@ -44,6 +43,48 @@ local TOOLS_JSON_SRC = [==[[{"type": "function", "function": {"name": "bash", "d
 local INJECTED_TOOLS = json.decode(TOOLS_JSON_SRC)
 if type(INJECTED_TOOLS) ~= "table" or #INJECTED_TOOLS < 6 then
   error("opencode-zen: embedded tool definitions failed to decode")
+end
+
+-- Flat Responses-protocol view of the same definitions.
+local INJECTED_TOOLS_RESP = {}
+for _, t in ipairs(INJECTED_TOOLS) do
+  local fn = t["function"] or {}
+  table.insert(INJECTED_TOOLS_RESP, {
+    type = "function",
+    name = fn.name or "",
+    description = fn.description or "",
+    parameters = fn.parameters or { type = "object", properties = {} },
+  })
+end
+
+local function merge_tools_resp(client_tools)
+  local out = {}
+  local seen = {}
+  for _, t in ipairs(client_tools or {}) do
+    local name = ""
+    if type(t) == "table" then
+      if type(t["function"]) == "table" and type(t["function"].name) == "string" then
+        name = t["function"].name
+      elseif type(t.name) == "string" then
+        name = t.name
+      end
+    end
+    if name ~= "" then seen[name] = true end
+    if type(t) == "table" and type(t.name) == "string" then
+      table.insert(out, t)
+    else
+      table.insert(out, {
+        type = "function",
+        name = name,
+        description = (type(t["function"]) == "table" and t["function"].description) or "",
+        parameters = (type(t["function"]) == "table" and t["function"].parameters) or { type = "object", properties = {} },
+      })
+    end
+  end
+  for _, t in ipairs(INJECTED_TOOLS_RESP) do
+    if t.name == "" or not seen[t.name] then table.insert(out, t) end
+  end
+  return out
 end
 
 local ULID_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
@@ -387,6 +428,150 @@ local function build_anon_chat_payload(request, model)
   return payload
 end
 
+-- Anonymous Responses payload. Single turns pass with the title fragment
+-- as developer content; history shapes need the full agent text plus
+-- genuine tools. reasoning minimal is the cheapest effort this family
+-- accepts; the genuine shape carries no temperature default.
+local function build_anon_responses_payload(request, model)
+  local agent_path = has_history(request.messages) or has_client_tools(request)
+  local input = {}
+  if agent_path then
+    table.insert(input, { role = "developer", content = AGENT_SYS })
+  else
+    table.insert(input, { role = "developer", content = FINGERPRINT })
+  end
+  for _, item in ipairs(build_responses_input(request.messages)) do
+    table.insert(input, item)
+  end
+  local payload = {
+    model = model,
+    input = input,
+    stream = true,
+  }
+  if request.max_tokens and request.max_tokens > 0 then
+    payload.max_output_tokens = request.max_tokens
+  else
+    payload.max_output_tokens = 32000
+  end
+  payload.store = false
+  local effort = request.reasoning_effort
+  if effort == "low" or effort == "medium" or effort == "high" or effort == "xhigh"
+      or effort == "minimal" or effort == "max" then
+    payload.reasoning = { effort = effort, summary = "auto" }
+  else
+    payload.reasoning = { effort = "minimal", summary = "auto" }
+  end
+  if request.temperature and request.temperature > 0 then payload.temperature = request.temperature end
+  if request.top_p and request.top_p > 0 then payload.top_p = request.top_p end
+  if agent_path then
+    payload.tools = merge_tools_resp(request.tools)
+    if request.tool_choice then
+      payload.tool_choice = request.tool_choice
+    else
+      payload.tool_choice = "auto"
+    end
+  else
+    local tools = build_responses_tools(request.tools)
+    if #tools > 0 then
+      payload.tools = tools
+      if request.tool_choice then payload.tool_choice = request.tool_choice end
+    end
+  end
+  local rf = request.response_format
+  if type(rf) == "table" and type(rf.type) == "string" then
+    if rf.type == "json_object" then
+      payload.text = { format = { type = "json_object" } }
+    elseif rf.type == "json_schema" and type(rf.json_schema) == "table" then
+      local fmt = { type = "json_schema", strict = true }
+      if type(rf.json_schema.name) == "string" then fmt.name = rf.json_schema.name end
+      if type(rf.json_schema.schema) == "table" then fmt.schema = rf.json_schema.schema end
+      payload.text = { format = fmt }
+    end
+  end
+  return payload
+end
+
+-- Assemble one chat.completion from a streamed Responses SSE body.
+local function assemble_responses_stream(body, model)
+  local text_parts = {}
+  local reasoning_parts = {}
+  local fn_by_index = {}
+  local fn_order = {}
+  local prompt_tokens, completion_tokens, total_tokens = 0, 0, 0
+  local out_model = model
+  local function fn_slot(index)
+    local acc = fn_by_index[index]
+    if not acc then
+      acc = { call_id = "", name = "", args = {} }
+      fn_by_index[index] = acc
+      table.insert(fn_order, index)
+    end
+    return acc
+  end
+  for line in (body .. "\n"):gmatch("([^\n]*)\n") do
+    if line:sub(1, 6) == "data: " then
+      local data = line:sub(7)
+      if data ~= "[DONE]" and data ~= "" then
+        local ok, ev = pcall(json.decode, data)
+        if ok and type(ev) == "table" and type(ev.type) == "string" then
+          local et = ev.type
+          if et == "response.output_text.delta" and type(ev.delta) == "string" then
+            table.insert(text_parts, ev.delta)
+          elseif et == "response.reasoning_summary_text.delta" and type(ev.delta) == "string" then
+            table.insert(reasoning_parts, ev.delta)
+          elseif (et == "response.output_item.added" or et == "response.output_item.done")
+              and type(ev.item) == "table" and ev.item.type == "function_call" then
+            local acc = fn_slot(ev.output_index or 0)
+            if type(ev.item.call_id) == "string" and ev.item.call_id ~= "" then acc.call_id = ev.item.call_id end
+            if type(ev.item.name) == "string" and ev.item.name ~= "" then acc.name = ev.item.name end
+            if type(ev.item.arguments) == "string" and ev.item.arguments ~= "" then
+              table.insert(acc.args, ev.item.arguments)
+            end
+          elseif et == "response.function_call_arguments.delta" and type(ev.delta) == "string" then
+            table.insert(fn_slot(ev.output_index or 0).args, ev.delta)
+          elseif et == "response.completed" and type(ev.response) == "table" then
+            local r = ev.response
+            if type(r.model) == "string" and r.model ~= "" then out_model = r.model end
+            if type(r.usage) == "table" then
+              prompt_tokens = r.usage.input_tokens or 0
+              completion_tokens = r.usage.output_tokens or 0
+              total_tokens = r.usage.total_tokens or (prompt_tokens + completion_tokens)
+            end
+          end
+        end
+      end
+    end
+  end
+  table.sort(fn_order)
+  local tool_calls = {}
+  for _, idx in ipairs(fn_order) do
+    local acc = fn_by_index[idx]
+    if acc.name ~= "" then
+      table.insert(tool_calls, {
+        id = acc.call_id, type = "function",
+        ["function"] = { name = acc.name, arguments = table.concat(acc.args) },
+      })
+    end
+  end
+  local finish = "stop"
+  if #tool_calls > 0 then finish = "tool_calls" end
+  local message = { role = "assistant", content = table.concat(text_parts), tool_calls = tool_calls }
+  local reasoning = table.concat(reasoning_parts)
+  if reasoning ~= "" then message.reasoning_content = reasoning end
+  return {
+    id = "zen-" .. tostring(os.time()), object = "chat.completion", created = os.time(),
+    model = out_model,
+    choices = {
+      { index = 0, message = message, finish_reason = finish },
+    },
+    usage = {
+      prompt_tokens = prompt_tokens,
+      completion_tokens = completion_tokens,
+      total_tokens = total_tokens,
+    },
+  }
+end
+
 -- Assemble one chat.completion from a streamed chat/completions body.
 local function assemble_chat_response(body, model)
   local text_parts = {}
@@ -545,7 +730,7 @@ llm_router.register("opencode-zen", {
     local ses, msg = mint_ids()
     local anonymous = api_key == ""
 
-    if endpoint == "/responses" then
+    if endpoint == "/responses" and not anonymous then
       local payload = { model = model, input = build_responses_input(request.messages), stream = false }
       if request.max_tokens and request.max_tokens > 0 then payload.max_output_tokens = request.max_tokens end
       if request.temperature and request.temperature > 0 then payload.temperature = request.temperature end
@@ -597,6 +782,20 @@ llm_router.register("opencode-zen", {
         },
         usage = usage,
       }
+    end
+
+    if endpoint == "/responses" then
+      -- Anonymous Responses path: stream upstream like the genuine
+      -- client and assemble the event stream into one completion.
+      local payload = build_anon_responses_payload(request, model)
+      local headers = opencode_headers(api_key, ses, msg)
+      local resp, err = client:request({
+        method = "POST", url = BASE_URL .. "/responses",
+        headers = headers, body = json.encode(payload),
+      })
+      if err then return nil, err end
+      if resp.status ~= 200 then return classify_error(resp.status, resp.body) end
+      return assemble_responses_stream(resp.body, request.model)
     end
 
     if not anonymous then
@@ -673,8 +872,76 @@ llm_router.register("opencode-zen", {
       return
     end
 
-    -- Keyed chat path and /responses models: relay the client's shape.
+    -- Keyed chat path: relay the client's shape.
     local endpoint = endpoint_for_model(model)
+    if endpoint == "/responses" and api_key ~= "" then
+      local payload = { model = model, input = build_responses_input(request.messages), stream = true }
+      if request.max_tokens and request.max_tokens > 0 then payload.max_output_tokens = request.max_tokens end
+      if request.temperature and request.temperature > 0 then payload.temperature = request.temperature end
+      if request.top_p and request.top_p > 0 then payload.top_p = request.top_p end
+      local effort = request.reasoning_effort
+      if effort == "low" or effort == "medium" or effort == "high" or effort == "xhigh"
+          or effort == "minimal" or effort == "max" then
+        payload.reasoning = { effort = effort, summary = "auto" }
+      end
+      local tools = build_responses_tools(request.tools)
+      if #tools > 0 then
+        payload.tools = tools
+        if request.tool_choice then payload.tool_choice = request.tool_choice end
+      end
+      local headers = opencode_headers(api_key, ses, msg)
+      local stream_err = client:stream({
+        method = "POST", url = BASE_URL .. "/responses",
+        headers = headers,
+        body = json.encode(payload),
+        on_line = function(line)
+          if line:sub(1, 6) ~= "data: " then return end
+          local data = line:sub(7)
+          if data == "[DONE]" or data == "" then return end
+          local ok, chunk = pcall(json.decode, data)
+          if not ok or type(chunk) ~= "table" then return end
+          emit(chunk)
+        end,
+      })
+      if stream_err then
+        local status = tonumber(tostring(stream_err.message):match("unexpected status (%d+)"))
+        if status then
+          local inner = tostring(stream_err.message):match("unexpected status %d+: (.*)$") or ""
+          return classify_error(status, inner)
+        end
+        return nil, stream_err
+      end
+      return
+    end
+
+    if api_key == "" and endpoint == "/responses" then
+      -- Anonymous Responses relay: forward event lines as-is.
+      local payload = build_anon_responses_payload(request, model)
+      local headers = opencode_headers(api_key, ses, msg)
+      local stream_err = client:stream({
+        method = "POST", url = BASE_URL .. "/responses",
+        headers = headers,
+        body = json.encode(payload),
+        on_line = function(line)
+          if line:sub(1, 6) ~= "data: " then return end
+          local data = line:sub(7)
+          if data == "[DONE]" or data == "" then return end
+          local ok, chunk = pcall(json.decode, data)
+          if not ok or type(chunk) ~= "table" then return end
+          emit(chunk)
+        end,
+      })
+      if stream_err then
+        local status = tonumber(tostring(stream_err.message):match("unexpected status (%d+)"))
+        if status then
+          local inner = tostring(stream_err.message):match("unexpected status %d+: (.*)$") or ""
+          return classify_error(status, inner)
+        end
+        return nil, stream_err
+      end
+      return
+    end
+
     local payload = { model = model, messages = request.messages, stream = true }
     if request.max_tokens and request.max_tokens > 0 then payload.max_tokens = request.max_tokens end
     if request.temperature and request.temperature > 0 then payload.temperature = request.temperature end
