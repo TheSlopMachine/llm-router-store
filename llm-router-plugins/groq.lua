@@ -1,8 +1,8 @@
 --- @plugin Groq
 --- @author TheSlopMachine
---- @version 1.1.0
---- @router_version 0.0.4
---- @description Groq OpenAI-compatible API: fast Llama/Qwen/gpt-oss inference
+--- @version 1.2.0
+--- @router_version 0.0.5
+--- @description Groq OpenAI-compatible API: fast Llama/Qwen/gpt-oss inference, Whisper speech-to-text
 --- @allow_host api.groq.com
 
 local BASE_URL = "https://api.groq.com/openai/v1"
@@ -20,6 +20,10 @@ local RATE_LIMITS = {
   ["meta-llama/llama-prompt-guard-2-22m"] = { rpm = 30, rpd = 14400, tpm = 15000 },
   ["meta-llama/llama-prompt-guard-2-86m"] = { rpm = 30, rpd = 14400, tpm = 15000 },
   ["allam-2-7b"] = { rpm = 30, rpd = 1000, tpm = 8000 },
+  -- Whisper STT: audio-seconds quotas instead of tokens; tpm stays 0.
+  ["whisper-large-v3"] = { rpm = 20, rpd = 2000, tpm = 0 },
+  ["whisper-large-v3-turbo"] = { rpm = 20, rpd = 2000, tpm = 0 },
+  ["distil-whisper-large-v3-en"] = { rpm = 20, rpd = 1000, tpm = 0 },
 }
 local DEFAULT_LIMITS = { rpm = 30, rpd = 1000, tpm = 8000 }
 
@@ -112,12 +116,24 @@ llm_router.register("groq", {
     local page = json.decode(resp.body)
     local infos = {}
     for _, m in ipairs(page.data or {}) do
-      -- Chat models only: text in, text out. Drops whisper (audio) and orpheus (speech out).
+      -- Split by modality: audio-in/text-out models are speech-to-text,
+      -- text-in/text-out are chat. Text-in/audio-out (playai-tts) waits for
+      -- the speech endpoint.
       local function has(list, v)
         for _, x in ipairs(list or {}) do if x == v then return true end end
         return false
       end
-      if m.active and has(m.input_modalities, "text") and has(m.output_modalities, "text") then
+      if m.active and has(m.input_modalities, "audio") and has(m.output_modalities, "text") then
+        local limits = RATE_LIMITS[m.id] or { rpm = 20, rpd = 2000, tpm = 0 }
+        table.insert(infos, {
+          name = m.id,
+          display_name = (m.name and m.name ~= "") and m.name or m.id,
+          rpm = limits.rpm, tpm = limits.tpm, rpd = limits.rpd,
+          input_modalities = m.input_modalities,
+          output_modalities = m.output_modalities,
+          endpoints = { "audio/transcriptions" },
+        })
+      elseif m.active and has(m.input_modalities, "text") and has(m.output_modalities, "text") then
         local limits = RATE_LIMITS[m.id] or DEFAULT_LIMITS
         -- OpenRouter-style parameter list: sampling params + feature flags.
         local params = {}
@@ -160,6 +176,7 @@ llm_router.register("groq", {
           output_modalities = m.output_modalities,
           supported_parameters = params,
           reasoning = reasoning,
+          endpoints = { "chat/completions" },
         })
       end
     end
@@ -212,5 +229,39 @@ llm_router.register("groq", {
       end
       return nil, stream_err
     end
+  end,
+
+  -- Speech-to-text: always fetch verbose_json upstream; the router renders
+  -- the client's response_format (json/text/srt/vtt) from the normalized
+  -- response, so segments must be present when the client asked for them.
+  transcribe = function(ctx, credential, request)
+    local client = llm_router.create_http_client({ timeout_ms = 300000 })
+    local parts = {
+      { name = "model", value = bare_model(request.model) },
+      { name = "file", filename = request.file_name, content_type = request.content_type, data = request.file },
+      { name = "response_format", value = "verbose_json" },
+    }
+    if request.language then parts[#parts + 1] = { name = "language", value = request.language } end
+    if request.prompt then parts[#parts + 1] = { name = "prompt", value = request.prompt } end
+    if request.temperature then parts[#parts + 1] = { name = "temperature", value = tostring(request.temperature) } end
+    local gran = {}
+    local function add_gran(g)
+      for _, x in ipairs(gran) do if x == g then return end end
+      gran[#gran + 1] = g
+    end
+    if request.needs_segments then add_gran("segment") end
+    for _, g in ipairs(request.timestamp_granularities or {}) do add_gran(g) end
+    for _, g in ipairs(gran) do
+      parts[#parts + 1] = { name = "timestamp_granularities[]", value = g }
+    end
+    local body, ctype = llm_router.multipart(parts)
+    local resp, err = client:request({
+      method = "POST", url = BASE_URL .. "/audio/transcriptions",
+      headers = { ["Authorization"] = "Bearer " .. api_key_of(credential), ["Content-Type"] = ctype },
+      body = body,
+    })
+    if err then return nil, err end
+    if resp.status ~= 200 then return classify_error(resp.status, resp.headers, resp.body) end
+    return json.decode(resp.body)
   end,
 })
