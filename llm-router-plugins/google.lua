@@ -1,7 +1,7 @@
 --- @plugin Google AI Studio
 --- @author TheSlopMachine
---- @version 1.4.0
---- @router_version 0.0.4
+--- @version 1.6.0
+--- @router_version 0.0.6
 --- @description Google Gemini models via AI Studio API
 --- @allow_host generativelanguage.googleapis.com
 --- @proxy_location US
@@ -693,6 +693,84 @@ local function supports_generate_content(entry)
   return false
 end
 
+-- TTS preview models speak PCM only; image models (Nano Banana family) also
+-- chat, so they keep chat/completions next to images/generations.
+local function is_tts_model(name)
+  return name:lower():find("tts", 1, true) ~= nil
+end
+
+local function is_image_model(name)
+  local lower = name:lower()
+  return lower:find("image", 1, true) ~= nil or lower:find("nano%-banana") ~= nil
+end
+
+-- RIFF/WAVE header around PCM s16le (the only encoding Gemini TTS emits).
+local function wrap_wav(pcm, rate, channels)
+  local bits = 16
+  local function u32(n)
+    return string.char(n % 256, math.floor(n / 256) % 256, math.floor(n / 65536) % 256, math.floor(n / 16777216) % 256)
+  end
+  local function u16(n)
+    return string.char(n % 256, math.floor(n / 256) % 256)
+  end
+  local byte_rate = rate * channels * (bits / 8)
+  local block_align = channels * (bits / 8)
+  local data_size = #pcm
+  return "RIFF" .. u32(36 + data_size) .. "WAVE"
+    .. "fmt " .. u32(16) .. u16(1) .. u16(channels) .. u32(rate)
+    .. u32(byte_rate) .. u16(block_align) .. u16(bits)
+    .. "data" .. u32(data_size) .. pcm
+end
+
+-- Map an OpenAI size string ("1024x1024") to a Gemini aspect ratio.
+local function aspect_ratio_of(size)
+  if type(size) ~= "string" then return nil end
+  local w, h = size:match("^(%d+)x(%d+)$")
+  w, h = tonumber(w), tonumber(h)
+  if not w or not h or w <= 0 or h <= 0 then return nil end
+  local r = w / h
+  local candidates = {
+    { ratio = 1.0, label = "1:1" },
+    { ratio = 4 / 3, label = "4:3" },
+    { ratio = 3 / 4, label = "3:4" },
+    { ratio = 3 / 2, label = "3:2" },
+    { ratio = 2 / 3, label = "2:3" },
+    { ratio = 16 / 9, label = "16:9" },
+    { ratio = 9 / 16, label = "9:16" },
+  }
+  local best, best_diff = nil, math.huge
+  for _, c in ipairs(candidates) do
+    local diff = math.abs(c.ratio - r)
+    if diff < best_diff then best, best_diff = c.label, diff end
+  end
+  return best
+end
+
+-- First candidate's inlineData part, or nil. Gemini returns generated
+-- media as inlineData parts on the first candidate.
+local function find_inline_data(g, family_prefix)
+  if not g.candidates then return nil end
+  for _, cand in ipairs(g.candidates) do
+    local parts = cand and cand.content and cand.content.parts or {}
+    for _, p in ipairs(parts) do
+      local inline = type(p) == "table" and p.inlineData or nil
+      if inline and type(inline.data) == "string" and inline.data ~= ""
+          and type(inline.mimeType) == "string"
+          and inline.mimeType:sub(1, #family_prefix) == family_prefix then
+        return inline
+      end
+    end
+  end
+  return nil
+end
+
+local function blocked_error(g)
+  if g and g.promptFeedback and g.promptFeedback.blockReason then
+    return nil, { type = "invalid_request", message = "prompt blocked: " .. tostring(g.promptFeedback.blockReason) }
+  end
+  return nil, { type = "upstream", message = "upstream returned no generated content" }
+end
+
 llm_router.register("google", {
   icon = "https://www.gstatic.com/lamda/images/favicon_v1_150160cddff7f294ce30.svg",
 
@@ -737,33 +815,63 @@ llm_router.register("google", {
         local skip = false
         if not supports_generate_content(entry) then skip = true end
         local lower = name:lower()
-        if lower:find("embedding") or lower:find("aqa") then skip = true end
+        -- Embedding models serve :embedContent instead of :generateContent;
+        -- they are listed below with the embeddings endpoint, not skipped.
+        local is_embedding = lower:find("embedding", 1, true) ~= nil
+        if is_embedding then
+          for _, m in ipairs(entry.supportedGenerationMethods or {}) do
+            if m == "embedContent" then skip = false end
+          end
+        end
+        if lower:find("aqa", 1, true) then skip = true end
         if not skip then
           local display = entry.displayName
           if display == nil or display == "" then display = name end
           -- Gemini vision/audio input is real for gemini-family models;
           -- gemma-4 takes images (audio unverified). Other families stay
           -- text-only. Output stays text: this adapter never requests
-          -- IMAGE/AUDIO response modalities.
+          -- IMAGE/AUDIO response modalities on chat completions.
           local in_modalities = { "text" }
           if lower:match("^gemini") then
             in_modalities = { "text", "image", "audio" }
           elseif lower:match("^gemma") then
             in_modalities = { "text", "image" }
           end
-          table.insert(infos, {
+          local out_modalities = { "text" }
+          local endpoints = nil
+          local params = {
+            "tools", "tool_choice", "response_format", "structured_outputs",
+            "temperature", "top_p", "max_tokens", "seed", "stop",
+            "reasoning", "reasoning_effort", "web_search",
+          }
+          if is_embedding then
+            -- Embedding models take text in and return vectors; no chat.
+            in_modalities = { "text" }
+            out_modalities = { "embedding" }
+            endpoints = { "embeddings" }
+            params = { "dimensions" }
+          elseif is_tts_model(name) then
+            -- TTS previews take text in and speak audio out; they do not chat.
+            in_modalities = { "text" }
+            out_modalities = { "audio" }
+            endpoints = { "audio/speech" }
+            params = { "temperature" }
+          elseif is_image_model(name) then
+            -- Nano Banana family chats and renders images.
+            out_modalities = { "text", "image" }
+            endpoints = { "chat/completions", "images/generations" }
+          end
+          local info = {
             name = name, display_name = display,
             rpm = estimate_rpm(name), tpm = estimate_tpm(name), rpd = estimate_rpd(name),
             context_window = entry.inputTokenLimit or 0,
             max_tokens = entry.outputTokenLimit or 0,
             input_modalities = in_modalities,
-            output_modalities = { "text" },
-            supported_parameters = {
-              "tools", "tool_choice", "response_format", "structured_outputs",
-              "temperature", "top_p", "max_tokens", "seed", "stop",
-              "reasoning", "reasoning_effort", "web_search",
-            },
-          })
+            output_modalities = out_modalities,
+            supported_parameters = params,
+          }
+          if endpoints then info.endpoints = endpoints end
+          table.insert(infos, info)
           if entry.thinking == true then
             infos[#infos].reasoning = {
               default_enabled = true,
@@ -898,5 +1006,125 @@ llm_router.register("google", {
     if stream_err then
       return classify_stream_error(stream_err)
     end
+  end,
+
+  speech = function(ctx, credential, request)
+    if type(request.input) ~= "string" or request.input == "" then
+      return nil, invalid_request("input is required")
+    end
+    local voice = request.voice
+    if type(voice) ~= "string" or voice == "" then voice = "Kore" end
+    -- Style control on Gemini TTS is prompt-based: "Say cheerfully: ...".
+    local text = request.input
+    if type(request.instructions) == "string" and request.instructions ~= "" then
+      text = request.instructions .. ": " .. text
+    end
+    local payload = {
+      contents = { { role = "user", parts = { { text = text } } } },
+      generationConfig = {
+        responseModalities = { "AUDIO" },
+        speechConfig = {
+          voiceConfig = { prebuiltVoiceConfig = { voiceName = voice } },
+        },
+      },
+    }
+    local client = llm_router.create_http_client({})
+    local resp, err = client:request({
+      method = "POST", url = BASE_URL .. "/models/" .. request_model_name(request.model) .. ":generateContent",
+      headers = { ["x-goog-api-key"] = api_key_of(credential), ["Content-Type"] = "application/json" },
+      body = json.encode(payload),
+    })
+    if err then return nil, err end
+    if resp.status ~= 200 then return classify_error(resp.status, resp.headers, resp.body) end
+    local g = json.decode(resp.body)
+    local inline = find_inline_data(g, "audio/")
+    if not inline then return blocked_error(g) end
+    -- Upstream audio is always PCM s16le (mimeType "audio/L16;...;rate=24000").
+    -- Only pcm and wav are servable without transcoding; every other
+    -- requested format gets wav, the lossless playable container.
+    local rate = tonumber(tostring(inline.mimeType):match("rate=(%d+)")) or 24000
+    local requested = request.response_format
+    if type(requested) ~= "string" or requested == "" then requested = "mp3" end
+    if requested == "pcm" then
+      return { audio_b64 = inline.data, format = "pcm" }
+    end
+    local pcm = llm_router.base64_decode(inline.data)
+    local wav = wrap_wav(pcm, rate, 1)
+    return { audio_b64 = llm_router.base64_encode(wav), format = "wav" }
+  end,
+
+  generate_image = function(ctx, credential, request)
+    if type(request.prompt) ~= "string" or request.prompt == "" then
+      return nil, invalid_request("prompt is required")
+    end
+    local n = 1
+    if type(request.n) == "number" and request.n >= 1 then n = math.min(math.floor(request.n), 10) end
+    local gen_config = { responseModalities = { "TEXT", "IMAGE" } }
+    local ratio = aspect_ratio_of(request.size)
+    if ratio then gen_config.imageConfig = { aspectRatio = ratio } end
+    local payload = {
+      contents = { { role = "user", parts = { { text = request.prompt } } } },
+      generationConfig = gen_config,
+    }
+    local client = llm_router.create_http_client({})
+    local data = {}
+    -- One upstream call per requested image; image models do not take
+    -- candidateCount.
+    for _ = 1, n do
+      local resp, err = client:request({
+        method = "POST", url = BASE_URL .. "/models/" .. request_model_name(request.model) .. ":generateContent",
+        headers = { ["x-goog-api-key"] = api_key_of(credential), ["Content-Type"] = "application/json" },
+        body = json.encode(payload),
+      })
+      if err then return nil, err end
+      if resp.status ~= 200 then return classify_error(resp.status, resp.headers, resp.body) end
+      local g = json.decode(resp.body)
+      local inline = find_inline_data(g, "image/")
+      if not inline then return blocked_error(g) end
+      table.insert(data, { b64_json = inline.data })
+    end
+    return { created = os.time(), data = data }
+  end,
+
+  embed = function(ctx, credential, request)
+    local input = request.input
+    if type(input) ~= "table" or #input == 0 then
+      return nil, invalid_request("input is required")
+    end
+    local model = request_model_name(request.model)
+    local requests = {}
+    for _, text in ipairs(input) do
+      if type(text) ~= "string" or text == "" then
+        return nil, invalid_request("input must not contain empty strings")
+      end
+      local entry = {
+        model = "models/" .. model,
+        content = { parts = { { text = text } } },
+      }
+      if type(request.dimensions) == "number" and request.dimensions > 0 then
+        entry.outputDimensionality = math.floor(request.dimensions)
+      end
+      table.insert(requests, entry)
+    end
+    local client = llm_router.create_http_client({})
+    local resp, err = client:request({
+      method = "POST", url = BASE_URL .. "/models/" .. model .. ":batchEmbedContents",
+      headers = { ["x-goog-api-key"] = api_key_of(credential), ["Content-Type"] = "application/json" },
+      body = json.encode({ requests = requests }),
+    })
+    if err then return nil, err end
+    if resp.status ~= 200 then return classify_error(resp.status, resp.headers, resp.body) end
+    local g = json.decode(resp.body)
+    local data = {}
+    for i, item in ipairs(g.embeddings or {}) do
+      if type(item.values) ~= "table" or #item.values == 0 then
+        return nil, { type = "upstream", message = "upstream returned an empty embedding vector" }
+      end
+      table.insert(data, { index = i - 1, embedding = item.values })
+    end
+    if #data ~= #input then
+      return nil, { type = "upstream", message = "upstream returned fewer embeddings than requested" }
+    end
+    return { data = data }
   end,
 })
