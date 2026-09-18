@@ -1,6 +1,6 @@
 --- @plugin Groq
 --- @author TheSlopMachine
---- @version 1.2.0
+--- @version 1.3.0
 --- @router_version 0.0.5
 --- @description Groq OpenAI-compatible API: fast Llama/Qwen/gpt-oss inference, Whisper speech-to-text
 --- @allow_host api.groq.com
@@ -43,8 +43,14 @@ local function classify_error(status, headers, body)
   if ok and parsed and parsed.error and type(parsed.error.message) == "string" and parsed.error.message ~= "" then
     message = parsed.error.message
   end
-  if status == 401 or status == 403 then
+  if status == 401 then
     return nil, { type = "auth", message = message }
+  elseif status == 403 then
+    -- Groq answers 401 for bad keys; 403 ("Forbidden", "Access denied.
+    -- Please check your network settings.") is the Cloudflare egress-IP
+    -- block: the exit is at fault, not the credential. Classify as geo so
+    -- the router rotates to the next pooled proxy instead of burning keys.
+    return nil, { type = "geo", message = message }
   elseif status == 429 then
     local wait = 60
     if headers and type(headers["retry-after"]) == "string" then
