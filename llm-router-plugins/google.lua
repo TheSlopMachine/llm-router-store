@@ -1,6 +1,6 @@
 --- @plugin Google AI Studio
 --- @author TheSlopMachine
---- @version 1.6.1
+--- @version 1.6.5
 --- @router_version 0.0.6
 --- @description Google Gemini models via AI Studio API
 --- @allow_host generativelanguage.googleapis.com
@@ -297,7 +297,19 @@ local function build_contents(messages)
           end
           local fc = { name = fn.name, args = args }
           if tc.id and tc.id ~= "" then fc.id = tc.id end
-          model_part({ functionCall = fc })
+          local part = { functionCall = fc }
+          -- Restore thought_signature from id if present (workaround for Crush not preserving extra_content)
+          if tc.id and tc.id ~= "" then
+            local pipe = tc.id:find("|")
+            if pipe then
+              local original_id = tc.id:sub(1, pipe - 1)
+              local signature = tc.id:sub(pipe + 1)
+              fc.id = original_id
+              part.thoughtSignature = signature
+              print("[google] restored thought_signature for " .. fn.name .. " from id")
+            end
+          end
+          model_part(part)
         end
       end
     elseif role == "tool" then
@@ -588,11 +600,21 @@ local function collect_parts(cand, out, tool_seq)
           args = json.encode(fc.args)
         end
         tool_seq.n = tool_seq.n + 1
-        table.insert(out.toolcalls, {
-          id = (fc.id and fc.id ~= "") and fc.id or string.format("call_%d_%d", cand.index or 0, tool_seq.n),
+        local call_id = (fc.id and fc.id ~= "") and fc.id or string.format("call_%d_%d", cand.index or 0, tool_seq.n)
+        local call = {
+          id = call_id,
           name = fc.name or "",
           arguments = args,
-        })
+        }
+        -- Preserve thought_signature for round-trip back to Gemini
+        -- Workaround: encode into id since Crush doesn't preserve extra_content
+        local sig = p.thoughtSignature or p.thought_signature
+        if type(sig) == "string" and sig ~= "" then
+          call.thought_signature = sig
+          call.id = call_id .. "|" .. sig
+          print("[google] encoded thought_signature into id: " .. call.id)
+        end
+        table.insert(out.toolcalls, call)
       elseif type(p.inlineData) == "table" then
         -- Image/audio output has no OpenAI field; expose it as a data-URL
         -- markdown image so the bytes are not silently dropped.
@@ -921,10 +943,18 @@ llm_router.register("google", {
       if #out.toolcalls > 0 then
         local calls = {}
         for _, tc in ipairs(out.toolcalls) do
-          table.insert(calls, {
+          local call = {
             id = tc.id, type = "function",
             ["function"] = { name = tc.name, arguments = tc.arguments },
-          })
+          }
+          -- Preserve thought_signature for round-trip back to Gemini
+          if tc.thought_signature then
+            print("[google] preserving thought_signature for " .. tc.name)
+            if call.extra_content == nil then call.extra_content = {} end
+            if call.extra_content.google == nil then call.extra_content.google = {} end
+            call.extra_content.google.thought_signature = tc.thought_signature
+          end
+          table.insert(calls, call)
         end
         message.tool_calls = calls
       end
