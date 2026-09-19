@@ -1,6 +1,6 @@
 --- @plugin Google AI Studio
 --- @author TheSlopMachine
---- @version 1.6.9
+--- @version 1.6.10
 --- @router_version 0.0.6
 --- @description Google Gemini models via AI Studio API
 --- @allow_host generativelanguage.googleapis.com
@@ -444,6 +444,11 @@ local function build_contents(messages)
     end
   end
   flush()
+  -- Gemini rejects histories ending with a model turn; nudge with a minimal
+  -- user part so fall-through and plain requests validate alike.
+  if #contents > 0 and contents[#contents].role == "model" then
+    table.insert(contents, { role = "user", parts = { { text = " " } } })
+  end
   if #contents == 0 then
     return nil, nil, invalid_request("messages produced no content")
   end
