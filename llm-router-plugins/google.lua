@@ -1,6 +1,6 @@
 --- @plugin Google AI Studio
 --- @author TheSlopMachine
---- @version 1.6.7
+--- @version 1.6.9
 --- @router_version 0.0.6
 --- @description Google Gemini models via AI Studio API
 --- @allow_host generativelanguage.googleapis.com
@@ -13,6 +13,18 @@ local BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 -- per credential+model in plugin storage. Blocked pairs fail fast without
 -- another upstream hit; the router still rotates to the next candidate.
 local QUOTA_SCOPE = "model_quota"
+
+-- Cooldown for transient upstream/timeout failures without a retry hint.
+local UPSTREAM_COOLDOWN = 120
+
+-- "[model key abc123] " prefix so router logs show provider, model and key.
+local function err_prefix(credential, model)
+  if model == nil then return "" end
+  local cid = (credential and credential.id) or ""
+  if #cid > 8 then cid = cid:sub(1, 8) end
+  if cid == "" then cid = "?" end
+  return "[" .. tostring(model) .. " key " .. cid .. "] "
+end
 
 local function quota_storage()
   if llm_router == nil or llm_router.storage == nil then return nil end
@@ -50,12 +62,41 @@ local function quota_remember(credential, model, wait)
   pcall(st.set, QUOTA_SCOPE, key, os.time() + (wait or 60))
 end
 
--- Fail-fast error when the pair is still blocked, else nil.
+-- Model-wide cooldown: overload is a property of the upstream model, not the
+-- key, so one hot model blocks all keys at once.
+local MODEL_SCOPE = "model_cooldown"
+
+local function model_remember(model, wait)
+  local st = quota_storage()
+  if st == nil or model == nil then return end
+  pcall(st.set, MODEL_SCOPE, tostring(model), os.time() + (wait or UPSTREAM_COOLDOWN))
+end
+
+-- Remaining model-wide block seconds, else nil.
+local function model_blocked(model)
+  local st = quota_storage()
+  if st == nil or model == nil then return nil end
+  local ok, reset_at = pcall(st.get, MODEL_SCOPE, tostring(model))
+  if not ok or reset_at == nil then return nil end
+  local reset_n = tonumber(reset_at)
+  if reset_n == nil then
+    pcall(st.delete, MODEL_SCOPE, tostring(model))
+    return nil
+  end
+  local now = os.time()
+  if reset_n > now then return reset_n - now end
+  pcall(st.delete, MODEL_SCOPE, tostring(model))
+  return nil
+end
+
+-- Fail-fast error when the model or the pair is still blocked, else nil.
+-- Model-wide cooldown wins: it covers every key at once.
 local function quota_fail_fast(credential, model)
-  local blocked = quota_blocked(credential, model)
+  local blocked = model_blocked(model)
+  if blocked == nil then blocked = quota_blocked(credential, model) end
   if blocked == nil then return nil end
   return { type = "quota_exceeded",
-    message = "quota remembered for model " .. tostring(model) .. ", retry in " .. blocked .. "s",
+    message = err_prefix(credential, model) .. "cooling down, retry in " .. blocked .. "s",
     retry_after = os.time() + blocked }
 end
 
@@ -65,6 +106,7 @@ local function classify_error(status, headers, body, credential, model)
   if ok and parsed and parsed.error and type(parsed.error.message) == "string" and parsed.error.message ~= "" then
     message = parsed.error.message
   end
+  message = err_prefix(credential, model) .. message
   if status == 401 or status == 403 then
     return nil, { type = "auth", message = message }
   elseif status == 400 then
@@ -100,10 +142,13 @@ local function classify_error(status, headers, body, credential, model)
       quota_remember(credential, model, wait)
       return nil, { type = "quota_exceeded", message = message, retry_after = os.time() + wait }
     end
+    quota_remember(credential, model, wait)
     return nil, { type = "rate_limit", message = message, retry_after = os.time() + wait }
   elseif status == 408 or status == 504 then
+    model_remember(model, UPSTREAM_COOLDOWN)
     return nil, { type = "timeout", message = message }
   elseif status >= 500 then
+    model_remember(model, UPSTREAM_COOLDOWN)
     return nil, { type = "upstream", message = message }
   end
   return nil, { type = "invalid_request", message = message }
@@ -367,7 +412,6 @@ local function build_contents(messages)
               local signature = tc.id:sub(pipe + 1)
               fc.id = original_id
               part.thoughtSignature = signature
-              print("[google] restored thought_signature for " .. fn.name .. " from id")
             end
           end
           model_part(part)
@@ -673,7 +717,6 @@ local function collect_parts(cand, out, tool_seq)
         if type(sig) == "string" and sig ~= "" then
           call.thought_signature = sig
           call.id = call_id .. "|" .. sig
-          print("[google] encoded thought_signature into id: " .. call.id)
         end
         table.insert(out.toolcalls, call)
       elseif type(p.inlineData) == "table" then
@@ -1012,7 +1055,6 @@ llm_router.register("google", {
           }
           -- Preserve thought_signature for round-trip back to Gemini
           if tc.thought_signature then
-            print("[google] preserving thought_signature for " .. tc.name)
             if call.extra_content == nil then call.extra_content = {} end
             if call.extra_content.google == nil then call.extra_content.google = {} end
             call.extra_content.google.thought_signature = tc.thought_signature
