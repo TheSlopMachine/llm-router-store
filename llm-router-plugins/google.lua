@@ -1,6 +1,6 @@
 --- @plugin Google AI Studio
 --- @author TheSlopMachine
---- @version 1.6.0
+--- @version 1.6.1
 --- @router_version 0.0.6
 --- @description Google Gemini models via AI Studio API
 --- @allow_host generativelanguage.googleapis.com
@@ -360,6 +360,11 @@ local function sanitize_schema(s)
         local anys = {}
         for _, sub in ipairs(v) do table.insert(anys, sanitize_schema(sub)) end
         out[k] = anys
+      elseif k == "required" then
+        -- Skip empty required array to avoid Gemini API validation error
+        if type(v) == "table" and next(v) ~= nil then
+          out[k] = v
+        end
       else
         out[k] = v
       end
