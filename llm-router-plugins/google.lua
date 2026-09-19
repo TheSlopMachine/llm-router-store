@@ -1,6 +1,6 @@
 --- @plugin Google AI Studio
 --- @author TheSlopMachine
---- @version 1.6.5
+--- @version 1.6.7
 --- @router_version 0.0.6
 --- @description Google Gemini models via AI Studio API
 --- @allow_host generativelanguage.googleapis.com
@@ -9,7 +9,57 @@
 
 local BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
-local function classify_error(status, headers, body)
+-- Per-model quota memory: an upstream 429 with quota wording is remembered
+-- per credential+model in plugin storage. Blocked pairs fail fast without
+-- another upstream hit; the router still rotates to the next candidate.
+local QUOTA_SCOPE = "model_quota"
+
+local function quota_storage()
+  if llm_router == nil or llm_router.storage == nil then return nil end
+  return llm_router.storage
+end
+
+local function quota_key(credential, model)
+  local cid = (credential and credential.id) or ""
+  if cid == "" or model == nil then return nil end
+  return cid .. "|" .. tostring(model)
+end
+
+-- Remaining block seconds when the pair is still exhausted, else nil.
+local function quota_blocked(credential, model)
+  local st = quota_storage()
+  local key = quota_key(credential, model)
+  if st == nil or key == nil then return nil end
+  local ok, reset_at = pcall(st.get, QUOTA_SCOPE, key)
+  if not ok or reset_at == nil then return nil end
+  local reset_n = tonumber(reset_at)
+  if reset_n == nil then
+    pcall(st.delete, QUOTA_SCOPE, key)
+    return nil
+  end
+  local now = os.time()
+  if reset_n > now then return reset_n - now end
+  pcall(st.delete, QUOTA_SCOPE, key)
+  return nil
+end
+
+local function quota_remember(credential, model, wait)
+  local st = quota_storage()
+  local key = quota_key(credential, model)
+  if st == nil or key == nil then return end
+  pcall(st.set, QUOTA_SCOPE, key, os.time() + (wait or 60))
+end
+
+-- Fail-fast error when the pair is still blocked, else nil.
+local function quota_fail_fast(credential, model)
+  local blocked = quota_blocked(credential, model)
+  if blocked == nil then return nil end
+  return { type = "quota_exceeded",
+    message = "quota remembered for model " .. tostring(model) .. ", retry in " .. blocked .. "s",
+    retry_after = os.time() + blocked }
+end
+
+local function classify_error(status, headers, body, credential, model)
   local message = body
   local ok, parsed = pcall(json.decode, body)
   if ok and parsed and parsed.error and type(parsed.error.message) == "string" and parsed.error.message ~= "" then
@@ -33,10 +83,21 @@ local function classify_error(status, headers, body)
     if headers and type(headers["retry-after"]) == "string" then
       local n = tonumber(headers["retry-after"])
       if n and n > 0 then wait = math.ceil(n) end
+    else
+      -- Google embeds the delay in the body ("Please retry in 54.74s").
+      local lower_msg = message:lower()
+      local secs = lower_msg:match("retry in ([%d%.]+)%s*s")
+        or lower_msg:match("retry after ([%d%.]+)%s*s")
+      local n = secs and tonumber(secs)
+      if n and n > 0 then wait = math.ceil(n) end
     end
-    -- Daily-quota exhaustion rotates the credential; minute limits just back off.
+    -- Any quota wording deprioritizes the credential; pure rate limits just back off.
     local lower = message:lower()
-    if lower:find("per day") or lower:find("perday") or lower:find("daily") then
+    if lower:find("per day", 1, true) or lower:find("perday", 1, true)
+        or lower:find("daily", 1, true) or lower:find("quota", 1, true)
+        or lower:find("free_tier", 1, true) or lower:find("free tier", 1, true)
+        or lower:find("billing", 1, true) then
+      quota_remember(credential, model, wait)
       return nil, { type = "quota_exceeded", message = message, retry_after = os.time() + wait }
     end
     return nil, { type = "rate_limit", message = message, retry_after = os.time() + wait }
@@ -49,12 +110,12 @@ local function classify_error(status, headers, body)
 end
 
 -- Re-classify transport-wrapped stream errors ("unexpected status N: body").
-local function classify_stream_error(stream_err)
+local function classify_stream_error(stream_err, credential, model)
   local msg = tostring((type(stream_err) == "table" and stream_err.message) or stream_err)
   local status = tonumber(msg:match("unexpected status (%d+)"))
   if status then
     local body = msg:match("unexpected status %d+: (.*)$") or ""
-    return classify_error(status, nil, body)
+    return classify_error(status, nil, body, credential, model)
   end
   return nil, stream_err
 end
@@ -917,6 +978,8 @@ llm_router.register("google", {
   end,
 
   complete = function(ctx, credential, request)
+    local blocked_err = quota_fail_fast(credential, request.model)
+    if blocked_err then return nil, blocked_err end
     local client = llm_router.create_http_client({})
     local payload, perr = build_payload(request, ctx.provider_config)
     if perr then return nil, perr end
@@ -926,7 +989,7 @@ llm_router.register("google", {
       body = json.encode(payload),
     })
     if err then return nil, err end
-    if resp.status ~= 200 then return classify_error(resp.status, resp.headers, resp.body) end
+    if resp.status ~= 200 then return classify_error(resp.status, resp.headers, resp.body, credential, request.model) end
     local g = json.decode(resp.body)
     if (not g.candidates or #g.candidates == 0) and g.promptFeedback and g.promptFeedback.blockReason then
       return nil, { type = "invalid_request", message = "prompt blocked: " .. tostring(g.promptFeedback.blockReason) }
@@ -975,6 +1038,8 @@ llm_router.register("google", {
   end,
 
   complete_stream = function(ctx, credential, request, emit)
+    local blocked_err = quota_fail_fast(credential, request.model)
+    if blocked_err then return nil, blocked_err end
     local client = llm_router.create_http_client({})
     local payload, perr = build_payload(request, ctx.provider_config)
     if perr then return nil, perr end
@@ -1039,7 +1104,7 @@ llm_router.register("google", {
       end,
     })
     if stream_err then
-      return classify_stream_error(stream_err)
+      return classify_stream_error(stream_err, credential, request.model)
     end
   end,
 
@@ -1111,9 +1176,9 @@ llm_router.register("google", {
         headers = { ["x-goog-api-key"] = api_key_of(credential), ["Content-Type"] = "application/json" },
         body = json.encode(payload),
       })
-      if err then return nil, err end
-      if resp.status ~= 200 then return classify_error(resp.status, resp.headers, resp.body) end
-      local g = json.decode(resp.body)
+    if err then return nil, err end
+    if resp.status ~= 200 then return classify_error(resp.status, resp.headers, resp.body) end
+    local g = json.decode(resp.body)
       local inline = find_inline_data(g, "image/")
       if not inline then return blocked_error(g) end
       table.insert(data, { b64_json = inline.data })
