@@ -1,6 +1,6 @@
 --- @plugin Google AI Studio
 --- @author TheSlopMachine
---- @version 1.6.10
+--- @version 1.6.11
 --- @router_version 0.0.6
 --- @description Google Gemini models via AI Studio API
 --- @allow_host generativelanguage.googleapis.com
@@ -126,12 +126,19 @@ local function classify_error(status, headers, body, credential, model)
       local n = tonumber(headers["retry-after"])
       if n and n > 0 then wait = math.ceil(n) end
     else
-      -- Google embeds the delay in the body ("Please retry in 54.74s").
+      -- Google embeds the delay in the body ("Please retry in 54.74s",
+      -- sometimes milliseconds: "retry in 702.14ms").
       local lower_msg = message:lower()
-      local secs = lower_msg:match("retry in ([%d%.]+)%s*s")
-        or lower_msg:match("retry after ([%d%.]+)%s*s")
-      local n = secs and tonumber(secs)
-      if n and n > 0 then wait = math.ceil(n) end
+      local wait_ms = lower_msg:match("retry in ([%d%.]+)%s*ms")
+      if wait_ms then
+        local n = tonumber(wait_ms)
+        if n and n > 0 then wait = math.max(1, math.ceil(n / 1000)) end
+      else
+        local secs = lower_msg:match("retry in ([%d%.]+)%s*s")
+          or lower_msg:match("retry after ([%d%.]+)%s*s")
+        local n = secs and tonumber(secs)
+        if n and n > 0 then wait = math.ceil(n) end
+      end
     end
     -- Any quota wording deprioritizes the credential; pure rate limits just back off.
     local lower = message:lower()
