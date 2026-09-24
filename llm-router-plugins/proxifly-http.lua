@@ -1,8 +1,8 @@
---- @plugin Proxifly Proxy List
+--- @plugin Proxifly HTTP Proxy List
 --- @author TheSlopMachine
 --- @version 1.0.0
 --- @router_version 0.0.4
---- @description Free proxy list from proxifly (proxies/all/data.json)
+--- @description Free HTTP proxy list from proxifly (proxies/all/data.json)
 --- @allow_host raw.githubusercontent.com
 --- @proxy_source true
 
