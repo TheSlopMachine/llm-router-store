@@ -1,6 +1,6 @@
 --- @plugin OpenCode Zen
 --- @author TheSlopMachine
---- @version 1.0.9
+--- @version 1.0.10
 --- @router_version 0.0.4
 --- @description OpenAI/Anthropic/Google compatible free provider OpenCode Zen
 --- @allow_host opencode.ai
@@ -15,6 +15,18 @@ local function endpoint_for_model(model)
     return "/responses"
   end
   return "/chat/completions"
+end
+
+local MUSE_SPARK_MIN_OUTPUT_TOKENS = 512
+
+local function responses_max_output_tokens(request, model)
+  local value = tonumber(request.max_completion_tokens)
+  if value == nil or value <= 0 then value = tonumber(request.max_tokens) end
+  if value == nil or value <= 0 then return 32000 end
+  if model:lower():match("^muse%-spark") and value < MUSE_SPARK_MIN_OUTPUT_TOKENS then
+    return MUSE_SPARK_MIN_OUTPUT_TOKENS
+  end
+  return value
 end
 
 -- Anonymous free-tier requests must carry the exact wire shape of the
@@ -170,11 +182,15 @@ local function message_text(m)
   return table.concat(parts, "\n")
 end
 
-local function classify_error(status, body)
+local function classify_error(status, headers, body)
   local message = body
+  local error_type = ""
   local ok, parsed = pcall(json.decode, body)
-  if ok and parsed and parsed.error and parsed.error.message then
-    message = parsed.error.message
+  if ok and parsed and type(parsed.error) == "table" then
+    if type(parsed.error.message) == "string" and parsed.error.message ~= "" then
+      message = parsed.error.message
+    end
+    if type(parsed.error.type) == "string" then error_type = parsed.error.type end
   elseif ok and parsed and type(parsed.message) == "string" and parsed.message ~= "" then
     message = parsed.message
   elseif ok and parsed and type(parsed.error) == "string" and parsed.error ~= "" then
@@ -183,8 +199,21 @@ local function classify_error(status, body)
   if status == 401 or status == 403 or status == 426 then
     return nil, { type = "auth", message = message }
   elseif status == 429 then
-    local t = message:lower():find("quota")
-    return nil, { type = t and "quota_exceeded" or "rate_limit", message = message, retry_after = os.time() + 60 }
+    local wait = 60
+    if headers and type(headers["retry-after"]) == "string" then
+      local retry_after = tonumber(headers["retry-after"])
+      if retry_after and retry_after > 0 then wait = math.ceil(retry_after) end
+    end
+    local lower_message = message:lower()
+    local lower_type = error_type:lower()
+    local quota = lower_type == "freeusagelimiterror"
+      or lower_message:find("quota", 1, true) ~= nil
+      or lower_message:find("free usage", 1, true) ~= nil
+    return nil, {
+      type = quota and "quota_exceeded" or "rate_limit",
+      message = message,
+      retry_after = os.time() + wait,
+    }
   elseif status == 408 or status == 504 then
     return nil, { type = "timeout", message = message }
   elseif status >= 500 then
@@ -448,11 +477,7 @@ local function build_anon_responses_payload(request, model)
     input = input,
     stream = true,
   }
-  if request.max_tokens and request.max_tokens > 0 then
-    payload.max_output_tokens = request.max_tokens
-  else
-    payload.max_output_tokens = 32000
-  end
+  payload.max_output_tokens = responses_max_output_tokens(request, model)
   payload.store = false
   local effort = request.reasoning_effort
   if effort == "low" or effort == "medium" or effort == "high" or effort == "xhigh"
@@ -499,6 +524,7 @@ local function assemble_responses_stream(body, model)
   local fn_order = {}
   local prompt_tokens, completion_tokens, total_tokens = 0, 0, 0
   local out_model = model
+  local terminal_finish = nil
   local function fn_slot(index)
     local acc = fn_by_index[index]
     if not acc then
@@ -529,13 +555,18 @@ local function assemble_responses_stream(body, model)
             end
           elseif et == "response.function_call_arguments.delta" and type(ev.delta) == "string" then
             table.insert(fn_slot(ev.output_index or 0).args, ev.delta)
-          elseif et == "response.completed" and type(ev.response) == "table" then
+          elseif (et == "response.completed" or et == "response.incomplete")
+              and type(ev.response) == "table" then
             local r = ev.response
             if type(r.model) == "string" and r.model ~= "" then out_model = r.model end
             if type(r.usage) == "table" then
               prompt_tokens = r.usage.input_tokens or 0
               completion_tokens = r.usage.output_tokens or 0
               total_tokens = r.usage.total_tokens or (prompt_tokens + completion_tokens)
+            end
+            if et == "response.incomplete" and type(r.incomplete_details) == "table"
+                and r.incomplete_details.reason == "max_output_tokens" then
+              terminal_finish = "length"
             end
           end
         end
@@ -553,7 +584,7 @@ local function assemble_responses_stream(body, model)
       })
     end
   end
-  local finish = "stop"
+  local finish = terminal_finish or "stop"
   if #tool_calls > 0 then finish = "tool_calls" end
   local message = { role = "assistant", content = table.concat(text_parts), tool_calls = tool_calls }
   local reasoning = table.concat(reasoning_parts)
@@ -732,7 +763,7 @@ llm_router.register("opencode-zen", {
 
     if endpoint == "/responses" and not anonymous then
       local payload = { model = model, input = build_responses_input(request.messages), stream = false }
-      if request.max_tokens and request.max_tokens > 0 then payload.max_output_tokens = request.max_tokens end
+      payload.max_output_tokens = responses_max_output_tokens(request, model)
       if request.temperature and request.temperature > 0 then payload.temperature = request.temperature end
       if request.top_p and request.top_p > 0 then payload.top_p = request.top_p end
       local effort = request.reasoning_effort
@@ -759,12 +790,16 @@ llm_router.register("opencode-zen", {
         headers = headers, body = json.encode(payload),
       })
       if err then return nil, err end
-      if resp.status ~= 200 then return classify_error(resp.status, resp.body) end
+      if resp.status ~= 200 then return classify_error(resp.status, resp.headers, resp.body) end
       local raw = json.decode(resp.body)
       local text = extract_responses_text(raw)
       local reasoning = extract_responses_reasoning(raw)
       local tool_calls = extract_responses_tool_calls(raw)
       local finish = "stop"
+      if type(raw.incomplete_details) == "table"
+          and raw.incomplete_details.reason == "max_output_tokens" then
+        finish = "length"
+      end
       if #tool_calls > 0 then finish = "tool_calls" end
       local usage = { prompt_tokens = 0, completion_tokens = 0, total_tokens = 0 }
       if type(raw.usage) == "table" then
@@ -794,7 +829,7 @@ llm_router.register("opencode-zen", {
         headers = headers, body = json.encode(payload),
       })
       if err then return nil, err end
-      if resp.status ~= 200 then return classify_error(resp.status, resp.body) end
+      if resp.status ~= 200 then return classify_error(resp.status, resp.headers, resp.body) end
       return assemble_responses_stream(resp.body, request.model)
     end
 
@@ -814,7 +849,7 @@ llm_router.register("opencode-zen", {
         body = json.encode(payload),
       })
       if err then return nil, err end
-      if resp.status ~= 200 then return classify_error(resp.status, resp.body) end
+      if resp.status ~= 200 then return classify_error(resp.status, resp.headers, resp.body) end
       local out = json.decode(resp.body)
       if out.model == nil or out.model == "" then out.model = request.model end
       return out
@@ -831,7 +866,7 @@ llm_router.register("opencode-zen", {
       body = json.encode(payload),
     })
     if err then return nil, err end
-    if resp.status ~= 200 then return classify_error(resp.status, resp.body) end
+    if resp.status ~= 200 then return classify_error(resp.status, resp.headers, resp.body) end
     return assemble_chat_response(resp.body, request.model)
   end,
 
@@ -865,7 +900,7 @@ llm_router.register("opencode-zen", {
         local status = tonumber(tostring(stream_err.message):match("unexpected status (%d+)"))
         if status then
           local inner = tostring(stream_err.message):match("unexpected status %d+: (.*)$") or ""
-          return classify_error(status, inner)
+          return classify_error(status, nil, inner)
         end
         return nil, stream_err
       end
@@ -876,7 +911,7 @@ llm_router.register("opencode-zen", {
     local endpoint = endpoint_for_model(model)
     if endpoint == "/responses" and api_key ~= "" then
       local payload = { model = model, input = build_responses_input(request.messages), stream = true }
-      if request.max_tokens and request.max_tokens > 0 then payload.max_output_tokens = request.max_tokens end
+      payload.max_output_tokens = responses_max_output_tokens(request, model)
       if request.temperature and request.temperature > 0 then payload.temperature = request.temperature end
       if request.top_p and request.top_p > 0 then payload.top_p = request.top_p end
       local effort = request.reasoning_effort
@@ -907,7 +942,7 @@ llm_router.register("opencode-zen", {
         local status = tonumber(tostring(stream_err.message):match("unexpected status (%d+)"))
         if status then
           local inner = tostring(stream_err.message):match("unexpected status %d+: (.*)$") or ""
-          return classify_error(status, inner)
+          return classify_error(status, nil, inner)
         end
         return nil, stream_err
       end
@@ -935,7 +970,7 @@ llm_router.register("opencode-zen", {
         local status = tonumber(tostring(stream_err.message):match("unexpected status (%d+)"))
         if status then
           local inner = tostring(stream_err.message):match("unexpected status %d+: (.*)$") or ""
-          return classify_error(status, inner)
+          return classify_error(status, nil, inner)
         end
         return nil, stream_err
       end
@@ -970,7 +1005,7 @@ llm_router.register("opencode-zen", {
       local status = tonumber(tostring(stream_err.message):match("unexpected status (%d+)"))
       if status then
         local inner = tostring(stream_err.message):match("unexpected status %d+: (.*)$") or ""
-        return classify_error(status, inner)
+        return classify_error(status, nil, inner)
       end
       return nil, stream_err
     end
