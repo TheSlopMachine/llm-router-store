@@ -1,6 +1,6 @@
 --- @plugin OpenCode Free
 --- @author TheSlopMachine
---- @version 1.1
+--- @version 1.1.0
 --- @router_version 0.0.4
 --- @description OpenAI/Anthropic/Google compatible free provider OpenCode Zen
 --- @allow_host opencode.ai
