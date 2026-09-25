@@ -1,7 +1,7 @@
 --- @plugin Kiro AI
 --- @author TheSlopMachine
---- @version 1.0.7
---- @router_version 0.0.4
+--- @version 2.0.0
+--- @router_version 0.1.1
 --- @description AWS Kiro models via device login (OAuth2 with proactive refresh)
 --- @allow_host codewhisperer.us-east-1.amazonaws.com
 --- @allow_host oidc.us-east-1.amazonaws.com
@@ -24,29 +24,6 @@ local function region_of(credential, provider_config)
     return provider_config.region
   end
   return DEFAULT_REGION
-end
-
-local function classify_error(status, body)
-  local message = body
-  local ok, parsed = pcall(json.decode, body)
-  if ok and type(parsed) == "table" then
-    if type(parsed.message) == "string" and parsed.message ~= "" then
-      message = parsed.message
-    elseif type(parsed.error) == "table" and type(parsed.error.message) == "string" and parsed.error.message ~= "" then
-      message = parsed.error.message
-    end
-  end
-  if status == 401 or status == 403 then
-    return nil, { type = "auth", message = message }
-  elseif status == 429 then
-    local t = message:lower():find("quota")
-    return nil, { type = t and "quota_exceeded" or "rate_limit", message = message, retry_after = os.time() + 60 }
-  elseif status == 408 or status == 504 then
-    return nil, { type = "timeout", message = message }
-  elseif status >= 500 then
-    return nil, { type = "upstream", message = message }
-  end
-  return nil, { type = "invalid_request", message = message }
 end
 
 -- ── Binary AWS event-stream framing ──
@@ -443,6 +420,18 @@ end
 llm_router.register("kiro", {
   icon = "https://kiro.dev/favicon.ico",
 
+  classify_error = function(raw, default_err)
+    if raw.status ~= 429 then return nil end
+    local err = default_err or { type = "rate_limit", message = tostring(raw.body) }
+    local lower = string.lower(err.message or "")
+    if string.find(lower, "quota", 1, true) then
+      err.type = "quota_exceeded"
+    end
+    -- Kiro limits bind to the OAuth account, never to the exit IP.
+    err.scope = { "account" }
+    return err
+  end,
+
   config_schema = function()
     return {
       { type = "select", name = "region", label = "Region", options = { "us-east-1" } },
@@ -513,7 +502,7 @@ llm_router.register("kiro", {
     local data = credential.data or {}
     local region = data.region
     if not region or region == "" then region = DEFAULT_REGION end
-    local client = llm_router.create_http_client({})
+    local client = llm_router.http_client({})
     local resp, err = client:request({
       method = "POST", url = oidc_url(region, "token"),
       headers = { ["Content-Type"] = "application/json", ["Accept"] = "application/json" },
@@ -523,7 +512,9 @@ llm_router.register("kiro", {
       }),
     })
     if err then return nil, err end
-    if resp.status ~= 200 then return classify_error(resp.status, resp.body) end
+    if resp.status ~= 200 then
+      return nil, llm_router.classify_error({ status = resp.status, headers = resp.headers, body = resp.body })
+    end
     local out = json.decode(resp.body)
     if not out.accessToken or out.accessToken == "" then
       return nil, { type = "auth", message = "refresh response did not include an access token" }
@@ -578,7 +569,7 @@ llm_router.register("kiro", {
       end
       if method == "builder-id" then start_url = BUILDER_START_URL end
 
-      local client = llm_router.create_http_client({})
+      local client = llm_router.http_client({})
       local reg_resp, reg_err = client:request({        method = "POST", url = oidc_url(region, "client/register"),
         headers = { ["Content-Type"] = "application/json" },
         body = json.encode({
@@ -628,7 +619,7 @@ llm_router.register("kiro", {
         llm_router.storage.delete(scope, "device")
         return start_page("Device login expired. Start again.", state.region, state.start_url, state.method)
       end
-      local client = llm_router.create_http_client({})
+      local client = llm_router.http_client({})
       local resp, err = client:request({
         method = "POST", url = oidc_url(state.region, "token"),
         headers = { ["Content-Type"] = "application/json", ["Accept"] = "application/json" },
@@ -664,15 +655,17 @@ llm_router.register("kiro", {
   end,
 
   complete = function(ctx, credential, request)
-    local model = request.model:match("([^/]+)$")
-    local client = llm_router.create_http_client({})
+    local model = request.model_name
+    local client = llm_router.http_client({})
     local resp, err = client:request({
       method = "POST", url = GENERATE_URL,
       headers = generate_headers(credential),
       body = json.encode(build_payload(request, model)),
     })
     if err then return nil, err end
-    if resp.status ~= 200 then return classify_error(resp.status, resp.body) end
+    if resp.status ~= 200 then
+      return nil, llm_router.classify_error({ status = resp.status, headers = resp.headers, body = resp.body })
+    end
     local state = aggregate_response(resp.body)
     local text = table.concat(state.content, "")
     local finish = state.finish_reason
@@ -698,7 +691,7 @@ llm_router.register("kiro", {
 
   complete_stream = function(ctx, credential, request, emit)
     local model = request.model
-    local short_model = request.model:match("([^/]+)$")
+    local short_model = request.model_name
     local response_id = "kiro-" .. tostring(os.time())
     local created = os.time()
     local buffer = ""
@@ -707,7 +700,7 @@ llm_router.register("kiro", {
     local first = true
     local stream_usage = nil
     local payload = build_payload(request, short_model)
-    local stream_err = client_stream_raw(generate_headers(credential), payload, function(bytes)
+    local _, stream_err = client_stream_raw(generate_headers(credential), payload, function(bytes)
       buffer = buffer .. bytes
       while true do
         if #buffer < 16 then break end
@@ -777,10 +770,15 @@ llm_router.register("kiro", {
 -- Raw event-stream POST with chunked delivery. Declared after register so
 -- the closure above resolves it at call time, not at load time.
 function client_stream_raw(headers, payload, on_bytes)
-  local client = llm_router.create_http_client({})
+  local client = llm_router.http_client({})
   return client:stream({
     method = "POST", url = GENERATE_URL,
     headers = headers, body = json.encode(payload),
+    on_response = function(r)
+      if r.status ~= 200 then
+        return llm_router.classify_error({ status = r.status, headers = r.headers, body = r.body })
+      end
+    end,
     on_chunk = function(bytes) on_bytes(bytes) end,
   })
 end

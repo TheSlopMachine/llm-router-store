@@ -1,7 +1,7 @@
 --- @plugin Groq
 --- @author TheSlopMachine
---- @version 1.3.0
---- @router_version 0.0.5
+--- @version 2.0.0
+--- @router_version 0.1.1
 --- @description Groq OpenAI-compatible API: fast Llama/Qwen/gpt-oss inference, Whisper speech-to-text
 --- @allow_host api.groq.com
 
@@ -32,42 +32,24 @@ local function api_key_of(credential)
   return credential.data.api_key or ""
 end
 
--- Strip the router provider prefix: "groq/openai/gpt-oss-20b" -> "openai/gpt-oss-20b".
-local function bare_model(model_id)
-  return (tostring(model_id):gsub("^[^/]+/", ""))
-end
-
-local function classify_error(status, headers, body)
-  local message = body
-  local ok, parsed = pcall(json.decode, body)
-  if ok and parsed and parsed.error and type(parsed.error.message) == "string" and parsed.error.message ~= "" then
-    message = parsed.error.message
-  end
-  if status == 401 then
-    return nil, { type = "auth", message = message }
-  elseif status == 403 then
+local function classify_extension(raw, default_err)
+  if raw.status == 403 then
     -- Groq answers 401 for bad keys; 403 ("Forbidden", "Access denied.
     -- Please check your network settings.") is the Cloudflare egress-IP
-    -- block: the exit is at fault, not the credential. Classify as geo so
-    -- the router rotates to the next pooled proxy instead of burning keys.
-    return nil, { type = "geo", message = message }
-  elseif status == 429 then
-    local wait = 60
-    if headers and type(headers["retry-after"]) == "string" then
-      local n = tonumber(headers["retry-after"])
-      if n and n > 0 then wait = math.ceil(n) end
-    end
-    -- Daily-quota exhaustion (RPD) rotates the credential; minute limits just back off.
-    if message:find("per day") then
-      return nil, { type = "quota_exceeded", message = message, retry_after = os.time() + wait }
-    end
-    return nil, { type = "rate_limit", message = message, retry_after = os.time() + wait }
-  elseif status == 408 or status == 504 then
-    return nil, { type = "timeout", message = message }
-  elseif status >= 500 then
-    return nil, { type = "upstream", message = message }
+    -- block: the exit is at fault, not the credential.
+    local message = default_err and default_err.message or tostring(raw.body)
+    return { type = "geo", message = message }
   end
-  return nil, { type = "invalid_request", message = message }
+  if raw.status ~= 429 then return nil end
+  local err = default_err or { type = "rate_limit", message = tostring(raw.body) }
+  -- Daily-quota exhaustion (RPD) is account-scoped; minute limits stay
+  -- account-scoped too: Groq limits bind to the key, never to the IP.
+  local lower = string.lower(err.message or "")
+  if string.find(lower, "per day", 1, true) then
+    err.type = "quota_exceeded"
+  end
+  err.scope = { "account" }
+  return err
 end
 
 -- Build the upstream payload from the OpenAI-shaped request table:
@@ -77,7 +59,7 @@ local function build_payload(request, stream)
   for k, v in pairs(request) do
     payload[k] = v
   end
-  payload.model = bare_model(request.model)
+  payload.model = request.model_name
   payload.stream = stream
   if not stream then
     payload.stream_options = nil
@@ -87,6 +69,8 @@ end
 
 llm_router.register("groq", {
   icon = "https://console.groq.com/favicon.ico",
+
+  classify_error = classify_extension,
 
   credential_schema = function()
     return {
@@ -112,13 +96,15 @@ llm_router.register("groq", {
   end,
 
   get_model_infos = function(ctx, credential, provider_config)
-    local client = llm_router.create_http_client({})
+    local client = llm_router.http_client({})
     local resp, err = client:request({
       method = "GET", url = BASE_URL .. "/models",
       headers = { ["Authorization"] = "Bearer " .. api_key_of(credential) },
     })
     if err then return nil, err end
-    if resp.status ~= 200 then return classify_error(resp.status, resp.headers, resp.body) end
+    if resp.status ~= 200 then
+      return nil, llm_router.classify_error({ status = resp.status, headers = resp.headers, body = resp.body })
+    end
     local page = json.decode(resp.body)
     local infos = {}
     for _, m in ipairs(page.data or {}) do
@@ -191,26 +177,33 @@ llm_router.register("groq", {
   end,
 
   complete = function(ctx, credential, request)
-    local client = llm_router.create_http_client({})
+    local client = llm_router.http_client({})
     local resp, err = client:request({
       method = "POST", url = BASE_URL .. "/chat/completions",
       headers = { ["Authorization"] = "Bearer " .. api_key_of(credential), ["Content-Type"] = "application/json" },
       body = json.encode(build_payload(request, false)),
     })
     if err then return nil, err end
-    if resp.status ~= 200 then return classify_error(resp.status, resp.headers, resp.body) end
+    if resp.status ~= 200 then
+      return nil, llm_router.classify_error({ status = resp.status, headers = resp.headers, body = resp.body })
+    end
     local out = json.decode(resp.body)
     out.model = request.model
     return out
   end,
 
   complete_stream = function(ctx, credential, request, emit)
-    local client = llm_router.create_http_client({})
+    local client = llm_router.http_client({})
     local full_model = request.model
-    local stream_err = client:stream({
+    local resp, stream_err = client:stream({
       method = "POST", url = BASE_URL .. "/chat/completions",
       headers = { ["Authorization"] = "Bearer " .. api_key_of(credential), ["Content-Type"] = "application/json" },
       body = json.encode(build_payload(request, true)),
+      on_response = function(r)
+        if r.status ~= 200 then
+          return llm_router.classify_error({ status = r.status, headers = r.headers, body = r.body })
+        end
+      end,
       on_line = function(line)
         if line:sub(1, 6) ~= "data: " then return end
         local data = line:sub(7)
@@ -226,13 +219,6 @@ llm_router.register("groq", {
       end,
     })
     if stream_err then
-      -- client:stream wraps non-2xx as "unexpected status N: body"; re-classify.
-      local status = tonumber(tostring(stream_err.message):match("unexpected status (%d+)"))
-      if status then
-        local body = tostring(stream_err.message)
-        local inner = body:match("unexpected status %d+: (.*)$") or ""
-        return classify_error(status, nil, inner)
-      end
       return nil, stream_err
     end
   end,
@@ -241,9 +227,9 @@ llm_router.register("groq", {
   -- the client's response_format (json/text/srt/vtt) from the normalized
   -- response, so segments must be present when the client asked for them.
   transcribe = function(ctx, credential, request)
-    local client = llm_router.create_http_client({ timeout_ms = 300000 })
+    local client = llm_router.http_client({ timeout_ms = 300000 })
     local parts = {
-      { name = "model", value = bare_model(request.model) },
+      { name = "model", value = request.model_name },
       { name = "file", filename = request.file_name, content_type = request.content_type, data = request.file },
       { name = "response_format", value = "verbose_json" },
     }
@@ -267,7 +253,9 @@ llm_router.register("groq", {
       body = body,
     })
     if err then return nil, err end
-    if resp.status ~= 200 then return classify_error(resp.status, resp.headers, resp.body) end
+    if resp.status ~= 200 then
+      return nil, llm_router.classify_error({ status = resp.status, headers = resp.headers, body = resp.body })
+    end
     return json.decode(resp.body)
   end,
 })

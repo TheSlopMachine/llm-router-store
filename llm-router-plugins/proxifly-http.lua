@@ -1,7 +1,7 @@
 --- @plugin Proxifly HTTP Proxy List
 --- @author TheSlopMachine
---- @version 1.0.0
---- @router_version 0.0.4
+--- @version 2.0.0
+--- @router_version 0.1.1
 --- @description Free HTTP proxy list from proxifly (proxies/all/data.json)
 --- @allow_host raw.githubusercontent.com
 --- @proxy_source true
@@ -10,7 +10,7 @@ local LIST_URL = "https://raw.githubusercontent.com/proxifly/free-proxy-list/ref
 
 llm_router.register_proxy_source("proxifly", {
   fetch_proxies = function(ctx)
-    local client = llm_router.create_http_client({ timeout_ms = 30000 })
+    local client = llm_router.http_client({ timeout_ms = 30000 })
     local resp, err = client:request({ method = "GET", url = LIST_URL })
     if err then return nil, err end
     if resp.status ~= 200 then

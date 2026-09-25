@@ -1,8 +1,8 @@
 --- @plugin OpenCode Free
 --- @author TheSlopMachine
---- @version 1.1.1
---- @router_version 0.0.4
---- @description OpenAI/Anthropic/Google compatible free provider OpenCode Zen
+--- @version 2.0.0
+--- @router_version 0.1.1
+--- @description OpenAI/Anthropic/Google compatible free provider OpenCode Free
 --- @allow_host opencode.ai
 
 local BASE_URL = "https://opencode.ai/zen/v1"
@@ -182,44 +182,34 @@ local function message_text(m)
   return table.concat(parts, "\n")
 end
 
-local function classify_error(status, headers, body)
-  local message = body
-  local error_type = ""
-  local ok, parsed = pcall(json.decode, body)
-  if ok and parsed and type(parsed.error) == "table" then
-    if type(parsed.error.message) == "string" and parsed.error.message ~= "" then
-      message = parsed.error.message
-    end
-    if type(parsed.error.type) == "string" then error_type = parsed.error.type end
-  elseif ok and parsed and type(parsed.message) == "string" and parsed.message ~= "" then
-    message = parsed.message
-  elseif ok and parsed and type(parsed.error) == "string" and parsed.error ~= "" then
-    message = parsed.error
+-- Free-tier limit semantics: quota wording binds to the account, plain rate
+-- limits bind to the exit IP (anonymous paths carry no key, so proxy
+-- rotation is the only bypass). Delay parsing lives in the core helper.
+local function classify_extension(raw, default_err)
+  if raw.status == 426 then
+    local message = default_err and default_err.message or tostring(raw.body)
+    return { type = "auth", message = message }
   end
-  if status == 401 or status == 403 or status == 426 then
-    return nil, { type = "auth", message = message }
-  elseif status == 429 then
-    local wait = 60
-    if headers and type(headers["retry-after"]) == "string" then
-      local retry_after = tonumber(headers["retry-after"])
-      if retry_after and retry_after > 0 then wait = math.ceil(retry_after) end
+  if raw.status ~= 429 then return nil end
+  local err = default_err or { type = "rate_limit", message = tostring(raw.body) }
+  local etype = ""
+  do
+    local ok, parsed = pcall(json.decode, tostring(raw.body))
+    if ok and parsed and type(parsed.error) == "table" and type(parsed.error.type) == "string" then
+      etype = parsed.error.type
     end
-    local lower_message = message:lower()
-    local lower_type = error_type:lower()
-    local quota = lower_type == "freeusagelimiterror"
-      or lower_message:find("quota", 1, true) ~= nil
-      or lower_message:find("free usage", 1, true) ~= nil
-    return nil, {
-      type = quota and "quota_exceeded" or "rate_limit",
-      message = message,
-      retry_after = os.time() + wait,
-    }
-  elseif status == 408 or status == 504 then
-    return nil, { type = "timeout", message = message }
-  elseif status >= 500 then
-    return nil, { type = "upstream", message = message }
   end
-  return nil, { type = "invalid_request", message = message }
+  local lower_message = string.lower(err.message or "")
+  local quota = string.lower(etype) == "freeusagelimiterror"
+    or string.find(lower_message, "quota", 1, true) ~= nil
+    or string.find(lower_message, "free usage", 1, true) ~= nil
+  if quota then
+    err.type = "quota_exceeded"
+    err.scope = { "account" }
+  else
+    err.scope = { "proxy" }
+  end
+  return err
 end
 
 local function api_key_of(credential)
@@ -697,9 +687,11 @@ end
 llm_router.register("opencode-free", {
   icon = "https://opencode.ai/favicon.ico",
 
+  classify_error = classify_extension,
+
   credential_schema = function()
     return {
-      { type = "section", title = "OpenCode Zen",
+      { type = "section", title = "OpenCode Free",
         content = {
           { type = "banner", variant = "info",
             text = "Leave the key empty for free models. Add a Zen API key for paid models." },
@@ -721,7 +713,7 @@ llm_router.register("opencode-free", {
   end,
 
   get_model_infos = function(ctx, credential, provider_config)
-    local client = llm_router.create_http_client({})
+    local client = llm_router.http_client({})
     local key = api_key_of(credential)
     local ses, msg = mint_ids()
     local headers = opencode_headers(key, ses, msg)
@@ -753,9 +745,9 @@ llm_router.register("opencode-free", {
   end,
 
   complete = function(ctx, credential, request)
-    local model = request.model:match("([^/]+)$")
+    local model = request.model_name
     local endpoint = endpoint_for_model(model)
-    local client = llm_router.create_http_client({})
+    local client = llm_router.http_client({})
 
     local api_key = api_key_of(credential)
     local ses, msg = mint_ids()
@@ -790,7 +782,9 @@ llm_router.register("opencode-free", {
         headers = headers, body = json.encode(payload),
       })
       if err then return nil, err end
-      if resp.status ~= 200 then return classify_error(resp.status, resp.headers, resp.body) end
+      if resp.status ~= 200 then
+        return nil, llm_router.classify_error({ status = resp.status, headers = resp.headers, body = resp.body })
+      end
       local raw = json.decode(resp.body)
       local text = extract_responses_text(raw)
       local reasoning = extract_responses_reasoning(raw)
@@ -829,7 +823,9 @@ llm_router.register("opencode-free", {
         headers = headers, body = json.encode(payload),
       })
       if err then return nil, err end
-      if resp.status ~= 200 then return classify_error(resp.status, resp.headers, resp.body) end
+      if resp.status ~= 200 then
+        return nil, llm_router.classify_error({ status = resp.status, headers = resp.headers, body = resp.body })
+      end
       return assemble_responses_stream(resp.body, request.model)
     end
 
@@ -847,9 +843,16 @@ llm_router.register("opencode-free", {
         method = "POST", url = BASE_URL .. endpoint,
         headers = headers,
         body = json.encode(payload),
+        on_response = function(r)
+          if r.status ~= 200 then
+            return llm_router.classify_error({ status = r.status, headers = r.headers, body = r.body })
+          end
+        end,
       })
       if err then return nil, err end
-      if resp.status ~= 200 then return classify_error(resp.status, resp.headers, resp.body) end
+      if resp.status ~= 200 then
+        return nil, llm_router.classify_error({ status = resp.status, headers = resp.headers, body = resp.body })
+      end
       local out = json.decode(resp.body)
       if out.model == nil or out.model == "" then out.model = request.model end
       return out
@@ -866,24 +869,31 @@ llm_router.register("opencode-free", {
       body = json.encode(payload),
     })
     if err then return nil, err end
-    if resp.status ~= 200 then return classify_error(resp.status, resp.headers, resp.body) end
+    if resp.status ~= 200 then
+      return nil, llm_router.classify_error({ status = resp.status, headers = resp.headers, body = resp.body })
+    end
     return assemble_chat_response(resp.body, request.model)
   end,
 
   complete_stream = function(ctx, credential, request, emit)
-    local model = request.model:match("([^/]+)$")
+    local model = request.model_name
     local api_key = api_key_of(credential)
     local ses, msg = mint_ids()
-    local client = llm_router.create_http_client({})
+    local client = llm_router.http_client({})
     local full_model = request.model
 
     if api_key == "" and endpoint_for_model(model) == "/chat/completions" then
       local payload = build_anon_chat_payload(request, model)
       local headers = opencode_headers(api_key, ses, msg)
-      local stream_err = client:stream({
+      local _, stream_err = client:stream({
         method = "POST", url = BASE_URL .. "/chat/completions",
         headers = headers,
         body = json.encode(payload),
+        on_response = function(r)
+          if r.status ~= 200 then
+            return llm_router.classify_error({ status = r.status, headers = r.headers, body = r.body })
+          end
+        end,
         on_line = function(line)
           if line:sub(1, 6) ~= "data: " then return end
           local data = line:sub(7)
@@ -897,11 +907,6 @@ llm_router.register("opencode-free", {
         end,
       })
       if stream_err then
-        local status = tonumber(tostring(stream_err.message):match("unexpected status (%d+)"))
-        if status then
-          local inner = tostring(stream_err.message):match("unexpected status %d+: (.*)$") or ""
-          return classify_error(status, nil, inner)
-        end
         return nil, stream_err
       end
       return
@@ -925,10 +930,15 @@ llm_router.register("opencode-free", {
         if request.tool_choice then payload.tool_choice = request.tool_choice end
       end
       local headers = opencode_headers(api_key, ses, msg)
-      local stream_err = client:stream({
+      local _, stream_err = client:stream({
         method = "POST", url = BASE_URL .. "/responses",
         headers = headers,
         body = json.encode(payload),
+        on_response = function(r)
+          if r.status ~= 200 then
+            return llm_router.classify_error({ status = r.status, headers = r.headers, body = r.body })
+          end
+        end,
         on_line = function(line)
           if line:sub(1, 6) ~= "data: " then return end
           local data = line:sub(7)
@@ -939,11 +949,6 @@ llm_router.register("opencode-free", {
         end,
       })
       if stream_err then
-        local status = tonumber(tostring(stream_err.message):match("unexpected status (%d+)"))
-        if status then
-          local inner = tostring(stream_err.message):match("unexpected status %d+: (.*)$") or ""
-          return classify_error(status, nil, inner)
-        end
         return nil, stream_err
       end
       return
@@ -953,10 +958,15 @@ llm_router.register("opencode-free", {
       -- Anonymous Responses relay: forward event lines as-is.
       local payload = build_anon_responses_payload(request, model)
       local headers = opencode_headers(api_key, ses, msg)
-      local stream_err = client:stream({
+      local _, stream_err = client:stream({
         method = "POST", url = BASE_URL .. "/responses",
         headers = headers,
         body = json.encode(payload),
+        on_response = function(r)
+          if r.status ~= 200 then
+            return llm_router.classify_error({ status = r.status, headers = r.headers, body = r.body })
+          end
+        end,
         on_line = function(line)
           if line:sub(1, 6) ~= "data: " then return end
           local data = line:sub(7)
@@ -967,11 +977,6 @@ llm_router.register("opencode-free", {
         end,
       })
       if stream_err then
-        local status = tonumber(tostring(stream_err.message):match("unexpected status (%d+)"))
-        if status then
-          local inner = tostring(stream_err.message):match("unexpected status %d+: (.*)$") or ""
-          return classify_error(status, nil, inner)
-        end
         return nil, stream_err
       end
       return
@@ -985,7 +990,7 @@ llm_router.register("opencode-free", {
     if request.tool_choice then payload.tool_choice = request.tool_choice end
     if type(request.response_format) == "table" then payload.response_format = request.response_format end
     local headers = opencode_headers(api_key, ses, msg)
-    local stream_err = client:stream({
+    local _, stream_err = client:stream({
       method = "POST", url = BASE_URL .. endpoint,
       headers = headers,
       body = json.encode(payload),
@@ -1002,11 +1007,6 @@ llm_router.register("opencode-free", {
       end,
     })
     if stream_err then
-      local status = tonumber(tostring(stream_err.message):match("unexpected status (%d+)"))
-      if status then
-        local inner = tostring(stream_err.message):match("unexpected status %d+: (.*)$") or ""
-        return classify_error(status, nil, inner)
-      end
       return nil, stream_err
     end
   end,
