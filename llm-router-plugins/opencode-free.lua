@@ -1,8 +1,8 @@
 --- @plugin OpenCode Free
 --- @author TheSlopMachine
---- @version 2.0.0
+--- @version 3.0.0
 --- @router_version 0.1.1
---- @description OpenAI/Anthropic/Google compatible free provider OpenCode Free
+--- @description OpenAI/Anthropic/Google compatible free provider OpenCode Free (no key required)
 --- @allow_host opencode.ai
 
 local BASE_URL = "https://opencode.ai/zen/v1"
@@ -150,14 +150,13 @@ local function mint_ids()
   return ses, msg
 end
 
-local function opencode_headers(api_key, ses, msg)
-  local auth = "Bearer public"
-  if api_key and api_key ~= "" then auth = "Bearer " .. api_key end
+-- Free tier is anonymous: every request carries Bearer public.
+local function opencode_headers(ses, msg)
   return {
     ["User-Agent"] = GOOD_UA,
     ["Content-Type"] = "application/json",
     ["Accept"] = "application/json",
-    ["Authorization"] = auth,
+    ["Authorization"] = "Bearer public",
     ["x-opencode-client"] = "cli",
     ["x-opencode-project"] = "global",
     ["x-opencode-session"] = ses,
@@ -212,11 +211,8 @@ local function classify_extension(raw, default_err)
   return err
 end
 
-local function api_key_of(credential)
-  if credential == nil or credential.data == nil then return "" end
-  return credential.data.api_key or credential.data.access_token or ""
-end
-
+-- Free models only: the anonymous /models listing serves the free tier.
+-- This fallback mirrors it when the listing fails.
 local FALLBACK_MODELS = {
   { name = "nemotron-3-ultra-free", display_name = "Nemotron 3 Ultra Free" },
   { name = "nemotron-3.5-lightning-free", display_name = "Nemotron 3.5 Lightning Free" },
@@ -225,9 +221,6 @@ local FALLBACK_MODELS = {
   { name = "ling-3.0-flash-fin-free", display_name = "Ling 3.0 Flash Fin Free" },
   { name = "muse-spark-1.2-contributor-free", display_name = "Muse Spark 1.2 Contributor Free" },
   { name = "muse-spark-1.3-contributor-free", display_name = "Muse Spark 1.3 Contributor Free" },
-  { name = "gpt-5", display_name = "GPT-5" },
-  { name = "claude-sonnet-4.5", display_name = "Claude Sonnet 4.5" },
-  { name = "gemini-3-flash", display_name = "Gemini 3 Flash" },
 }
 
 -- Upstream /models carries no capability metadata, so reasoning support
@@ -310,56 +303,6 @@ local function build_responses_tools(tools)
     if name ~= "" then
       if params == nil then params = { type = "object", properties = {} } end
       table.insert(out, { type = "function", name = name, description = desc, parameters = params })
-    end
-  end
-  return out
-end
-
-local function extract_responses_text(raw)
-  local output = raw.output
-  if type(output) == "table" then
-    for _, item in ipairs(output) do
-      if type(item) == "table" and item.type == "message" and type(item.content) == "table" then
-        for _, c in ipairs(item.content) do
-          if type(c) == "table" then
-            if type(c.text) == "string" and c.text ~= "" then return c.text end
-            if type(c.output_text) == "string" and c.output_text ~= "" then return c.output_text end
-          end
-        end
-      end
-    end
-  end
-  if type(raw.output_text) == "string" then return raw.output_text end
-  return ""
-end
-
-local function extract_responses_reasoning(raw)
-  local output = raw.output
-  if type(output) ~= "table" then return "" end
-  local parts = {}
-  for _, item in ipairs(output) do
-    if type(item) == "table" and item.type == "reasoning" and type(item.summary) == "table" then
-      for _, s in ipairs(item.summary) do
-        if type(s) == "table" and type(s.text) == "string" and s.text ~= "" then
-          table.insert(parts, s.text)
-        end
-      end
-    end
-  end
-  return table.concat(parts, "\n")
-end
-
-local function extract_responses_tool_calls(raw)
-  local out = {}
-  local output = raw.output
-  if type(output) ~= "table" then return out end
-  for _, item in ipairs(output) do
-    if type(item) == "table" and item.type == "function_call" and type(item.name) == "string" and item.name ~= "" then
-      local args = item.arguments or "{}"
-      if type(args) == "table" then args = json.encode(args) end
-      if args == "" then args = "{}" end
-      local id = item.call_id or item.id or ""
-      table.insert(out, { id = id, type = "function", ["function"] = { name = item.name, arguments = args } })
     end
   end
   return out
@@ -694,29 +637,21 @@ llm_router.register("opencode-free", {
       { type = "section", title = "OpenCode Free",
         content = {
           { type = "banner", variant = "info",
-            text = "Leave the key empty for free models. Add a Zen API key for paid models." },
-          { type = "secret", name = "api_key", label = "API Key" },
+            text = "No key needed. Free models only." },
           { type = "button", text = "Save", form_action = "submit" },
         } },
     }
   end,
 
+  -- Free tier carries no key: legacy stored keys validate as-is and are ignored.
   validate_credentials = function(data)
-    local key = data.api_key
-    if key == nil or key == "" then
-      return true
-    end
-    if #key < 20 then
-      return false, { type = "invalid_request", message = "api_key: minimum 20 characters" }
-    end
     return true
   end,
 
   get_model_infos = function(ctx, credential, provider_config)
     local client = llm_router.http_client({})
-    local key = api_key_of(credential)
     local ses, msg = mint_ids()
-    local headers = opencode_headers(key, ses, msg)
+    local headers = opencode_headers(ses, msg)
     local resp, err = client:request({
       method = "GET", url = BASE_URL .. "/models",
       headers = headers,
@@ -749,75 +684,14 @@ llm_router.register("opencode-free", {
     local endpoint = endpoint_for_model(model)
     local client = llm_router.http_client({})
 
-    local api_key = api_key_of(credential)
+    -- Free tier ignores stored keys: legacy credentials may still carry one.
     local ses, msg = mint_ids()
-    local anonymous = api_key == ""
-
-    if endpoint == "/responses" and not anonymous then
-      local payload = { model = model, input = build_responses_input(request.messages), stream = false }
-      payload.max_output_tokens = responses_max_output_tokens(request, model)
-      if request.temperature and request.temperature > 0 then payload.temperature = request.temperature end
-      if request.top_p and request.top_p > 0 then payload.top_p = request.top_p end
-      local effort = request.reasoning_effort
-      if effort == "low" or effort == "medium" or effort == "high" or effort == "xhigh" then
-        payload.reasoning = { effort = effort, summary = "auto" }
-      end
-      local rf = request.response_format
-      if type(rf) == "table" and type(rf.type) == "string" then
-        if rf.type == "json_object" then
-          payload.text = { format = { type = "json_object" } }
-        elseif rf.type == "json_schema" and type(rf.json_schema) == "table" then
-          local fmt = { type = "json_schema", strict = true }
-          if type(rf.json_schema.name) == "string" then fmt.name = rf.json_schema.name end
-          if type(rf.json_schema.schema) == "table" then fmt.schema = rf.json_schema.schema end
-          payload.text = { format = fmt }
-        end
-      end
-      local tools = build_responses_tools(request.tools)
-      if #tools > 0 then payload.tools = tools end
-
-      local headers = opencode_headers(api_key, ses, msg)
-      local resp, err = client:request({
-        method = "POST", url = BASE_URL .. "/responses",
-        headers = headers, body = json.encode(payload),
-      })
-      if err then return nil, err end
-      if resp.status ~= 200 then
-        return nil, llm_router.classify_error({ status = resp.status, headers = resp.headers, body = resp.body })
-      end
-      local raw = json.decode(resp.body)
-      local text = extract_responses_text(raw)
-      local reasoning = extract_responses_reasoning(raw)
-      local tool_calls = extract_responses_tool_calls(raw)
-      local finish = "stop"
-      if type(raw.incomplete_details) == "table"
-          and raw.incomplete_details.reason == "max_output_tokens" then
-        finish = "length"
-      end
-      if #tool_calls > 0 then finish = "tool_calls" end
-      local usage = { prompt_tokens = 0, completion_tokens = 0, total_tokens = 0 }
-      if type(raw.usage) == "table" then
-        usage.prompt_tokens = raw.usage.input_tokens or 0
-        usage.completion_tokens = raw.usage.output_tokens or 0
-        usage.total_tokens = raw.usage.total_tokens or (usage.prompt_tokens + usage.completion_tokens)
-      end
-      local message = { role = "assistant", content = text, tool_calls = tool_calls }
-      if reasoning ~= "" then message.reasoning_content = reasoning end
-      return {
-        id = "zen-" .. tostring(os.time()), object = "chat.completion", created = os.time(),
-        model = request.model,
-        choices = {
-          { index = 0, message = message, finish_reason = finish },
-        },
-        usage = usage,
-      }
-    end
 
     if endpoint == "/responses" then
       -- Anonymous Responses path: stream upstream like the genuine
       -- client and assemble the event stream into one completion.
       local payload = build_anon_responses_payload(request, model)
-      local headers = opencode_headers(api_key, ses, msg)
+      local headers = opencode_headers(ses, msg)
       local resp, err = client:request({
         method = "POST", url = BASE_URL .. "/responses",
         headers = headers, body = json.encode(payload),
@@ -829,40 +703,11 @@ llm_router.register("opencode-free", {
       return assemble_responses_stream(resp.body, request.model)
     end
 
-    if not anonymous then
-      local payload = { model = model, messages = request.messages, stream = false }
-      if request.max_tokens and request.max_tokens > 0 then payload.max_tokens = request.max_tokens end
-      if request.temperature and request.temperature > 0 then payload.temperature = request.temperature end
-      if request.top_p and request.top_p > 0 then payload.top_p = request.top_p end
-      if request.tools then payload.tools = request.tools end
-      if request.tool_choice then payload.tool_choice = request.tool_choice end
-      if type(request.response_format) == "table" then payload.response_format = request.response_format end
-
-      local headers = opencode_headers(api_key, ses, msg)
-      local resp, err = client:request({
-        method = "POST", url = BASE_URL .. endpoint,
-        headers = headers,
-        body = json.encode(payload),
-        on_response = function(r)
-          if r.status ~= 200 then
-            return llm_router.classify_error({ status = r.status, headers = r.headers, body = r.body })
-          end
-        end,
-      })
-      if err then return nil, err end
-      if resp.status ~= 200 then
-        return nil, llm_router.classify_error({ status = resp.status, headers = resp.headers, body = resp.body })
-      end
-      local out = json.decode(resp.body)
-      if out.model == nil or out.model == "" then out.model = request.model end
-      return out
-    end
-
     -- Anonymous chat path: the free-tier gate only serves stream:true
     -- requests shaped like the genuine client, so always stream upstream
     -- and assemble the SSE body into one completion here.
     local payload = build_anon_chat_payload(request, model)
-    local headers = opencode_headers(api_key, ses, msg)
+    local headers = opencode_headers(ses, msg)
     local resp, err = client:request({
       method = "POST", url = BASE_URL .. "/chat/completions",
       headers = headers,
@@ -877,14 +722,13 @@ llm_router.register("opencode-free", {
 
   complete_stream = function(ctx, credential, request, emit)
     local model = request.model_name
-    local api_key = api_key_of(credential)
     local ses, msg = mint_ids()
     local client = llm_router.http_client({})
     local full_model = request.model
 
-    if api_key == "" and endpoint_for_model(model) == "/chat/completions" then
+    if endpoint_for_model(model) == "/chat/completions" then
       local payload = build_anon_chat_payload(request, model)
-      local headers = opencode_headers(api_key, ses, msg)
+      local headers = opencode_headers(ses, msg)
       local _, stream_err = client:stream({
         method = "POST", url = BASE_URL .. "/chat/completions",
         headers = headers,
@@ -912,52 +756,12 @@ llm_router.register("opencode-free", {
       return
     end
 
-    -- Keyed chat path: relay the client's shape.
     local endpoint = endpoint_for_model(model)
-    if endpoint == "/responses" and api_key ~= "" then
-      local payload = { model = model, input = build_responses_input(request.messages), stream = true }
-      payload.max_output_tokens = responses_max_output_tokens(request, model)
-      if request.temperature and request.temperature > 0 then payload.temperature = request.temperature end
-      if request.top_p and request.top_p > 0 then payload.top_p = request.top_p end
-      local effort = request.reasoning_effort
-      if effort == "low" or effort == "medium" or effort == "high" or effort == "xhigh"
-          or effort == "minimal" or effort == "max" then
-        payload.reasoning = { effort = effort, summary = "auto" }
-      end
-      local tools = build_responses_tools(request.tools)
-      if #tools > 0 then
-        payload.tools = tools
-        if request.tool_choice then payload.tool_choice = request.tool_choice end
-      end
-      local headers = opencode_headers(api_key, ses, msg)
-      local _, stream_err = client:stream({
-        method = "POST", url = BASE_URL .. "/responses",
-        headers = headers,
-        body = json.encode(payload),
-        on_response = function(r)
-          if r.status ~= 200 then
-            return llm_router.classify_error({ status = r.status, headers = r.headers, body = r.body })
-          end
-        end,
-        on_line = function(line)
-          if line:sub(1, 6) ~= "data: " then return end
-          local data = line:sub(7)
-          if data == "[DONE]" or data == "" then return end
-          local ok, chunk = pcall(json.decode, data)
-          if not ok or type(chunk) ~= "table" then return end
-          emit(chunk)
-        end,
-      })
-      if stream_err then
-        return nil, stream_err
-      end
-      return
-    end
 
-    if api_key == "" and endpoint == "/responses" then
+    if endpoint == "/responses" then
       -- Anonymous Responses relay: forward event lines as-is.
       local payload = build_anon_responses_payload(request, model)
-      local headers = opencode_headers(api_key, ses, msg)
+      local headers = opencode_headers(ses, msg)
       local _, stream_err = client:stream({
         method = "POST", url = BASE_URL .. "/responses",
         headers = headers,
@@ -980,34 +784,6 @@ llm_router.register("opencode-free", {
         return nil, stream_err
       end
       return
-    end
-
-    local payload = { model = model, messages = request.messages, stream = true }
-    if request.max_tokens and request.max_tokens > 0 then payload.max_tokens = request.max_tokens end
-    if request.temperature and request.temperature > 0 then payload.temperature = request.temperature end
-    if request.top_p and request.top_p > 0 then payload.top_p = request.top_p end
-    if request.tools then payload.tools = request.tools end
-    if request.tool_choice then payload.tool_choice = request.tool_choice end
-    if type(request.response_format) == "table" then payload.response_format = request.response_format end
-    local headers = opencode_headers(api_key, ses, msg)
-    local _, stream_err = client:stream({
-      method = "POST", url = BASE_URL .. endpoint,
-      headers = headers,
-      body = json.encode(payload),
-      on_line = function(line)
-        if line:sub(1, 6) ~= "data: " then return end
-        local data = line:sub(7)
-        if data == "[DONE]" or data == "" then return end
-        local ok, chunk = pcall(json.decode, data)
-        if not ok or type(chunk) ~= "table" then return end
-        local has_choices = type(chunk.choices) == "table" and #chunk.choices > 0
-        if not has_choices and chunk.usage == nil then return end
-        chunk.model = full_model
-        emit(chunk)
-      end,
-    })
-    if stream_err then
-      return nil, stream_err
     end
   end,
 
