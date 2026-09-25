@@ -1,6 +1,6 @@
 --- @plugin Kiro AI
 --- @author TheSlopMachine
---- @version 2.0.0
+--- @version 2.0.1
 --- @router_version 0.1.1
 --- @description AWS Kiro models via device login (OAuth2 with proactive refresh)
 --- @allow_host codewhisperer.us-east-1.amazonaws.com
@@ -467,12 +467,14 @@ llm_router.register("kiro", {
 
   get_model_infos = function(ctx, credential, provider_config)
     local tools = { "tools" }
+    -- Cheapest first: credential probes and smoke matrices take the first
+    -- listed model.
     return {
+      { name = "claude-haiku-4.5", display_name = "Claude Haiku 4.5", context_window = 200000, max_tokens = 32000, supported_parameters = tools },
       { name = "claude-opus-4.7", display_name = "Claude Opus 4.7", context_window = 200000, max_tokens = 32000, supported_parameters = tools },
       { name = "claude-opus-4.6", display_name = "Claude Opus 4.6", context_window = 200000, max_tokens = 32000, supported_parameters = tools },
       { name = "claude-sonnet-4.6", display_name = "Claude Sonnet 4.6", context_window = 200000, max_tokens = 32000, supported_parameters = tools },
       { name = "claude-sonnet-4.5", display_name = "Claude Sonnet 4.5", context_window = 200000, max_tokens = 32000, supported_parameters = tools },
-      { name = "claude-haiku-4.5", display_name = "Claude Haiku 4.5", context_window = 200000, max_tokens = 32000, supported_parameters = tools },
     }
   end,
 
