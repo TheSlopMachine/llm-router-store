@@ -207,7 +207,7 @@ local function classify_extension(raw, default_err)
     or string.find(lower_message, "free usage", 1, true) ~= nil
   if quota then
     err.type = "quota_exceeded"
-    err.scope = { "account" }
+    err.scope = { "proxy" }
   else
     err.scope = { "proxy" }
   end
