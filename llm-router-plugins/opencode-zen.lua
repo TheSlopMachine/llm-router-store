@@ -1,7 +1,7 @@
 --- @plugin OpenCode Zen
 --- @author TheSlopMachine
---- @version 3.0.0
---- @router_version 0.1.1
+--- @version 4.0.0
+--- @router_version 0.3.0
 --- @description OpenAI/Anthropic/Google compatible paid provider OpenCode Zen (API key required)
 --- @allow_host opencode.ai
 
@@ -119,10 +119,13 @@ end
 local function classify_extension(raw, default_err)
   if raw.status == 426 then
     local message = default_err and default_err.message or tostring(raw.body)
-    return { type = "auth", message = message }
+    return { type = "auth", message = message, upstream_status = raw.status, upstream_body = tostring(raw.body) }
   end
   if raw.status ~= 429 then return nil end
-  local err = default_err or { type = "rate_limit", message = tostring(raw.body) }
+  -- 0.3.0 contract: rate/quota tables require a future retry_after.
+  -- default_err always carries one (core fallback); the literal fallback
+  -- below only fires when the core has nothing to say.
+  local err = default_err or { type = "rate_limit", message = tostring(raw.body), retry_after = os.time() + 60 }
   local etype = ""
   do
     local ok, parsed = pcall(json.decode, tostring(raw.body))

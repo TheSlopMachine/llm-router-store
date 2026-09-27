@@ -1,7 +1,7 @@
 --- @plugin Groq
 --- @author TheSlopMachine
---- @version 2.0.1
---- @router_version 0.1.1
+--- @version 3.0.0
+--- @router_version 0.3.0
 --- @description Groq OpenAI-compatible API: fast Llama/Qwen/gpt-oss inference, Whisper speech-to-text
 --- @allow_host api.groq.com
 
@@ -38,10 +38,13 @@ local function classify_extension(raw, default_err)
     -- Please check your network settings.") is the Cloudflare egress-IP
     -- block: the exit is at fault, not the credential.
     local message = default_err and default_err.message or tostring(raw.body)
-    return { type = "geo", message = message }
+    return { type = "geo", message = message, upstream_status = raw.status, upstream_body = tostring(raw.body) }
   end
   if raw.status ~= 429 then return nil end
-  local err = default_err or { type = "rate_limit", message = tostring(raw.body) }
+  -- 0.3.0 contract: rate/quota tables require a future retry_after.
+  -- default_err always carries one (core fallback); the literal fallback
+  -- below only fires when the core has nothing to say.
+  local err = default_err or { type = "rate_limit", message = tostring(raw.body), retry_after = os.time() + 60 }
   -- Daily-quota exhaustion (RPD) is account-scoped; minute limits stay
   -- account-scoped too: Groq limits bind to the key, never to the IP.
   local lower = string.lower(err.message or "")

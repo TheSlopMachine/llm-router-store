@@ -1,7 +1,7 @@
 --- @plugin Google AI Studio
 --- @author TheSlopMachine
---- @version 2.0.0
---- @router_version 0.1.1
+--- @version 3.0.0
+--- @router_version 0.3.0
 --- @description Google Gemini models via AI Studio API
 --- @allow_host generativelanguage.googleapis.com
 --- @proxy_location US
@@ -17,18 +17,21 @@ local function classify_extension(raw, default_err)
     local lower = string.lower(message)
     if string.find(lower, "location is not supported", 1, true) then
       -- Geo-blocked: the proxy exit is at fault, not the request.
-      return { type = "geo", message = message }
+      return { type = "geo", message = message, upstream_status = raw.status, upstream_body = tostring(raw.body) }
     end
     if string.find(lower, "api key not valid", 1, true)
         or string.find(lower, "api_key_invalid", 1, true)
         or string.find(lower, "invalid api key", 1, true)
         or string.find(lower, "unauthenticated", 1, true) then
-      return { type = "auth", message = message }
+      return { type = "auth", message = message, upstream_status = raw.status, upstream_body = tostring(raw.body) }
     end
     return nil
   end
   if raw.status ~= 429 then return nil end
-  local err = default_err or { type = "rate_limit", message = tostring(raw.body) }
+  -- 0.3.0 contract: rate/quota tables require a future retry_after.
+  -- default_err always carries one (core fallback); the literal fallback
+  -- below only fires when the core has nothing to say.
+  local err = default_err or { type = "rate_limit", message = tostring(raw.body), retry_after = os.time() + 60 }
   -- Gemini quotas bind to the key+model pair; other models on the key serve on.
   err.scope = { "account", "model" }
   return err
@@ -772,7 +775,8 @@ end
 
 local function blocked_error(g)
   if g and g.promptFeedback and g.promptFeedback.blockReason then
-    return nil, { type = "invalid_request", message = "prompt blocked: " .. tostring(g.promptFeedback.blockReason) }
+    -- Content rejected by upstream policy, not a malformed request.
+    return nil, { type = "content_policy", message = "prompt blocked: " .. tostring(g.promptFeedback.blockReason) }
   end
   return nil, { type = "upstream", message = "upstream returned no generated content" }
 end
@@ -914,7 +918,7 @@ llm_router.register("google", {
     end
     local g = json.decode(resp.body)
     if (not g.candidates or #g.candidates == 0) and g.promptFeedback and g.promptFeedback.blockReason then
-      return nil, { type = "invalid_request", message = "prompt blocked: " .. tostring(g.promptFeedback.blockReason) }
+      return nil, { type = "content_policy", message = "prompt blocked: " .. tostring(g.promptFeedback.blockReason) }
     end
     local choices = {}
     if g.candidates and #g.candidates > 0 then

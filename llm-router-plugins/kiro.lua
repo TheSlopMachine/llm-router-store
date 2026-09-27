@@ -1,7 +1,7 @@
 --- @plugin Kiro AI
 --- @author TheSlopMachine
---- @version 2.0.1
---- @router_version 0.1.1
+--- @version 3.0.0
+--- @router_version 0.3.0
 --- @description AWS Kiro models via device login (OAuth2 with proactive refresh)
 --- @allow_host codewhisperer.us-east-1.amazonaws.com
 --- @allow_host oidc.us-east-1.amazonaws.com
@@ -422,7 +422,10 @@ llm_router.register("kiro", {
 
   classify_error = function(raw, default_err)
     if raw.status ~= 429 then return nil end
-    local err = default_err or { type = "rate_limit", message = tostring(raw.body) }
+    -- 0.3.0 contract: rate/quota tables require a future retry_after.
+    -- default_err always carries one (core fallback); the literal fallback
+    -- below only fires when the core has nothing to say.
+    local err = default_err or { type = "rate_limit", message = tostring(raw.body), retry_after = os.time() + 60 }
     local lower = string.lower(err.message or "")
     if string.find(lower, "quota", 1, true) then
       err.type = "quota_exceeded"
