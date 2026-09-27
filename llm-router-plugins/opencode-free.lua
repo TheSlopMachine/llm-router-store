@@ -1,6 +1,6 @@
 --- @plugin OpenCode Free
 --- @author TheSlopMachine
---- @version 4.0.12
+--- @version 4.1
 --- @router_version 0.3.0
 --- @description OpenAI/Anthropic/Google compatible free provider OpenCode Free (no key required)
 --- @allow_host opencode.ai
@@ -18,6 +18,64 @@ local function endpoint_for_model(model)
 end
 
 local MUSE_SPARK_MIN_OUTPUT_TOKENS = 512
+
+local function debug_json(value)
+  local ok, encoded = pcall(json.encode, value)
+  if ok and type(encoded) == "string" then return encoded end
+  return "<json.encode failed: " .. tostring(encoded) .. ">"
+end
+
+local function debug_log(tag, message)
+  local ok = pcall(print, "[opencode-free][" .. tostring(tag) .. "] " .. tostring(message))
+  if not ok then end
+end
+
+local function table_shape(value)
+  if type(value) ~= "table" then return type(value) end
+  local numeric = 0
+  local other = 0
+  local max_index = 0
+  for k, _ in pairs(value) do
+    if type(k) == "number" and k >= 1 and k % 1 == 0 then
+      numeric = numeric + 1
+      if k > max_index then max_index = k end
+    else
+      other = other + 1
+    end
+  end
+  if other == 0 and numeric == 0 then return "table(empty)" end
+  if other == 0 and max_index == numeric then return "array(" .. tostring(numeric) .. ")" end
+  return "map(numeric=" .. tostring(numeric) .. ",other=" .. tostring(other) .. ")"
+end
+
+local function normalize_tools(tools)
+  local out = {}
+  if type(tools) ~= "table" then return out end
+
+  local function add_tool(t)
+    if type(t) == "table" then table.insert(out, t) end
+  end
+
+  local has_array_items = false
+  for i = 1, #tools do
+    has_array_items = true
+    add_tool(tools[i])
+  end
+  if has_array_items then return out end
+
+  local looks_like_single_tool = type(tools.name) == "string"
+      or (type(tools["function"]) == "table" and type(tools["function"].name) == "string")
+      or type(tools.input_schema) == "table"
+  if looks_like_single_tool then
+    add_tool(tools)
+    return out
+  end
+
+  for _, value in pairs(tools) do
+    add_tool(value)
+  end
+  return out
+end
 
 local function responses_max_output_tokens(request, model)
   local value = tonumber(request.max_completion_tokens)
@@ -248,6 +306,24 @@ local function with_limits(infos)
   return infos
 end
 
+-- Responses requires call_id values no longer than 64 characters.
+-- Keep native ids when possible; deterministically shorten oversized ids so
+-- function_call and function_call_output references remain identical.
+local CALL_ID_NAMESPACE = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+local function normalize_call_id(raw)
+  if type(raw) ~= "string" or raw == "" then return "call_unknown" end
+  if #raw <= 64 then return raw end
+  local ok, hashed = pcall(llm_router.uuid_v5, CALL_ID_NAMESPACE, raw)
+  if ok and type(hashed) == "string" and hashed ~= "" then
+    local normalized = "call_" .. hashed
+    print("[OPENCODE-FREE-DEBUG] normalized oversized call_id length=" .. tostring(#raw) .. " -> " .. tostring(#normalized))
+    return normalized
+  end
+  local normalized = raw:sub(1, 64)
+  print("[OPENCODE-FREE-DEBUG] truncated oversized call_id length=" .. tostring(#raw) .. " -> 64")
+  return normalized
+end
+
 -- Build the OpenAI Responses input from chat messages.
 local function build_responses_input(messages)
   local input = {}
@@ -273,11 +349,11 @@ local function build_responses_input(messages)
         if name ~= "" then
           local args = tc["function"].arguments or "{}"
           if args == "" then args = "{}" end
-          table.insert(input, { type = "function_call", call_id = tc.id or "", name = name, arguments = args })
+          table.insert(input, { type = "function_call", call_id = normalize_call_id(tc.id), name = name, arguments = args })
         end
       end
     elseif role == "tool" then
-      table.insert(input, { type = "function_call_output", call_id = m.tool_call_id or "call_unknown", output = message_text(m) })
+      table.insert(input, { type = "function_call_output", call_id = normalize_call_id(m.tool_call_id), output = message_text(m) })
     end
   end
   if #input == 0 then
@@ -288,7 +364,7 @@ end
 
 local function build_responses_tools(tools)
   local out = {}
-  for _, t in ipairs(tools or {}) do
+  for _, t in ipairs(normalize_tools(tools)) do
     local name = t.name or ""
     local desc = t.description or ""
     local params = t.parameters
@@ -317,7 +393,7 @@ local function has_history(messages)
 end
 
 local function has_client_tools(request)
-  return type(request.tools) == "table" and #request.tools > 0
+  return #normalize_tools(request.tools) > 0
 end
 
 local function tool_name(t)
@@ -330,9 +406,9 @@ local function tool_name(t)
 end
 
 local function merge_tools(client_tools)
-  local out = json.decode("[]") -- Ensure it's an array
+  local out = json.decode("[]")
   local seen = {}
-  for _, t in ipairs(client_tools or {}) do
+  for _, t in ipairs(normalize_tools(client_tools)) do
     local name = tool_name(t)
     if name ~= "" then seen[name] = true end
     table.insert(out, t)
@@ -348,7 +424,9 @@ end
 -- max_tokens default to the proven values when the client omits them:
 -- the gate stalls requests that lack either field.
 local function build_anon_chat_payload(request, model)
-  local agent_path = has_history(request.messages) or has_client_tools(request)
+  local normalized_tools = normalize_tools(request.tools)
+  local agent_path = has_history(request.messages) or #normalized_tools > 0
+  debug_log("TOOLS", "chat input shape=" .. table_shape(request.tools) .. " normalized=" .. tostring(#normalized_tools) .. " agent_path=" .. tostring(agent_path))
   local messages = {}
   if agent_path then
     table.insert(messages, { role = "system", content = AGENT_SYS })
@@ -375,8 +453,8 @@ local function build_anon_chat_payload(request, model)
     payload.max_tokens = 32000
   end
   if request.top_p and request.top_p > 0 then payload.top_p = request.top_p end
-  if agent_path then
-
+  if #normalized_tools > 0 then
+    payload.tools = normalized_tools
     if request.tool_choice then
       payload.tool_choice = request.tool_choice
     else
@@ -384,7 +462,8 @@ local function build_anon_chat_payload(request, model)
     end
   end
   if type(request.response_format) == "table" then payload.response_format = request.response_format end
-  if not agent_path and not payload.tools then payload.tools = json.decode("[]") end -- Ensure empty array if no tools and not agent_path
+  debug_log("CHAT_TOOLS_ENCODE", "present=" .. tostring(payload.tools ~= nil) .. " type=" .. tostring(type(payload.tools)) .. " shape=" .. table_shape(payload.tools) .. " encoded=" .. (payload.tools and debug_json(payload.tools) or "<absent>"))
+  debug_log("CHAT_PAYLOAD", "json=" .. debug_json(payload))
   return payload
 end
 
@@ -393,7 +472,9 @@ end
 -- genuine tools. reasoning minimal is the cheapest effort this family
 -- accepts; the genuine shape carries no temperature default.
 local function build_anon_responses_payload(request, model)
-  local agent_path = has_history(request.messages) or has_client_tools(request)
+  local normalized_tools = normalize_tools(request.tools)
+  local agent_path = has_history(request.messages) or #normalized_tools > 0
+  debug_log("TOOLS", "responses input shape=" .. table_shape(request.tools) .. " normalized=" .. tostring(#normalized_tools) .. " agent_path=" .. tostring(agent_path))
   local input = {}
   if agent_path then
     table.insert(input, { role = "developer", content = AGENT_SYS })
@@ -419,22 +500,13 @@ local function build_anon_responses_payload(request, model)
   end
   if request.temperature and request.temperature > 0 then payload.temperature = request.temperature end
   if request.top_p and request.top_p > 0 then payload.top_p = request.top_p end
-  if agent_path then
-
-    if request.tool_choice then
-      payload.tool_choice = request.tool_choice
-    else
-      payload.tool_choice = "auto"
-    end
-  else
-    local tools_from_builder = build_responses_tools(request.tools)
-    if #tools_from_builder > 0 then
-      payload.tools = tools_from_builder
-      if request.tool_choice then payload.tool_choice = request.tool_choice end
-    else
-      if not agent_path and not payload.tools then payload.tools = json.decode("[]") end -- Ensure empty array if no tools and not agent_path
-    end
+  local tools_from_builder = build_responses_tools(normalized_tools)
+  if #tools_from_builder > 0 then
+    payload.tools = tools_from_builder
+    if request.tool_choice then payload.tool_choice = request.tool_choice end
   end
+  debug_log("RESPONSES_TOOLS_ENCODE", "present=" .. tostring(payload.tools ~= nil) .. " type=" .. tostring(payload.tools and type(payload.tools) or "nil") .. " shape=" .. table_shape(payload.tools) .. " encoded=" .. (payload.tools and debug_json(payload.tools) or "<absent>"))
+  debug_log("RESPONSES_PAYLOAD", "json=" .. debug_json(payload))
   local rf = request.response_format
   if type(rf) == "table" and type(rf.type) == "string" then
     if rf.type == "json_object" then
@@ -688,7 +760,8 @@ llm_router.register("opencode-free", {
     local endpoint = endpoint_for_model(model)
     local client = llm_router.http_client({})
 
-    -- Free tier ignores stored keys: legacy credentials may still carry one.
+    debug_log("COMPLETE", "model=" .. tostring(model) .. " full_model=" .. tostring(request.model) .. " endpoint=" .. tostring(endpoint) .. " request_tools=" .. table_shape(request.tools) .. " tools_count=" .. tostring(#normalize_tools(request.tools)) .. " messages=" .. tostring(type(request.messages) == "table" and #request.messages or -1) .. " tool_choice=" .. debug_json(request.tool_choice))
+
     local ses, msg = mint_ids()
 
     if endpoint == "/responses" then
@@ -696,11 +769,18 @@ llm_router.register("opencode-free", {
       -- client and assemble the event stream into one completion.
       local payload = build_anon_responses_payload(request, model)
       local headers = opencode_headers(ses, msg)
+      local body = debug_json(payload)
+      print("[OPENCODE-FREE-DEBUG] responses tools body fragment: " .. tostring(payload.tools and debug_json(payload.tools) or "<absent>"))
+      debug_log("HTTP", "POST " .. BASE_URL .. "/responses body_len=" .. tostring(#body))
       local resp, err = client:request({
         method = "POST", url = BASE_URL .. "/responses",
-        headers = headers, body = json.encode(payload),
+        headers = headers, body = body,
       })
-      if err then return nil, err end
+      if err then
+        debug_log("HTTP_ERROR", debug_json(err))
+        return nil, err
+      end
+      debug_log("HTTP_RESPONSE", "status=" .. tostring(resp.status) .. " body_len=" .. tostring(type(resp.body) == "string" and #resp.body or -1) .. " body=" .. tostring(resp.body or ""))
       if resp.status ~= 200 then
         return nil, llm_router.classify_error({ status = resp.status, headers = resp.headers, body = resp.body })
       end
@@ -712,12 +792,19 @@ llm_router.register("opencode-free", {
     -- and assemble the SSE body into one completion here.
     local payload = build_anon_chat_payload(request, model)
     local headers = opencode_headers(ses, msg)
+    local body = debug_json(payload)
+    print("[OPENCODE-FREE-DEBUG] chat tools body fragment: " .. tostring(payload.tools and debug_json(payload.tools) or "<absent>"))
+    debug_log("HTTP", "POST " .. BASE_URL .. "/chat/completions body_len=" .. tostring(#body))
     local resp, err = client:request({
       method = "POST", url = BASE_URL .. "/chat/completions",
       headers = headers,
-      body = json.encode(payload),
+      body = body,
     })
-    if err then return nil, err end
+    if err then
+      debug_log("HTTP_ERROR", debug_json(err))
+      return nil, err
+    end
+    debug_log("HTTP_RESPONSE", "status=" .. tostring(resp.status) .. " body_len=" .. tostring(type(resp.body) == "string" and #resp.body or -1) .. " body=" .. tostring(resp.body or ""))
     if resp.status ~= 200 then
       return nil, llm_router.classify_error({ status = resp.status, headers = resp.headers, body = resp.body })
     end
@@ -726,23 +813,30 @@ llm_router.register("opencode-free", {
 
   complete_stream = function(ctx, credential, request, emit)
     local model = request.model_name
+    local endpoint = endpoint_for_model(model)
+    debug_log("STREAM", "model=" .. tostring(model) .. " full_model=" .. tostring(request.model) .. " endpoint=" .. tostring(endpoint) .. " request_tools=" .. table_shape(request.tools) .. " tools_count=" .. tostring(#normalize_tools(request.tools)) .. " messages=" .. tostring(type(request.messages) == "table" and #request.messages or -1))
     local ses, msg = mint_ids()
     local client = llm_router.http_client({})
     local full_model = request.model
 
-    if endpoint_for_model(model) == "/chat/completions" then
+    if endpoint == "/chat/completions" then
       local payload = build_anon_chat_payload(request, model)
       local headers = opencode_headers(ses, msg)
+      local body = debug_json(payload)
+      print("[OPENCODE-FREE-DEBUG] chat-stream tools body fragment: " .. tostring(payload.tools and debug_json(payload.tools) or "<absent>"))
+      debug_log("HTTP_STREAM", "POST " .. BASE_URL .. "/chat/completions body_len=" .. tostring(#body))
       local _, stream_err = client:stream({
         method = "POST", url = BASE_URL .. "/chat/completions",
         headers = headers,
-        body = json.encode(payload),
+        body = body,
         on_response = function(r)
+          debug_log("HTTP_STREAM_RESPONSE", "status=" .. tostring(r.status) .. " body=" .. tostring(r.body or ""))
           if r.status ~= 200 then
             return llm_router.classify_error({ status = r.status, headers = r.headers, body = r.body })
           end
         end,
         on_line = function(line)
+          debug_log("SSE", "line=" .. tostring(line))
           if line:sub(1, 6) ~= "data: " then return end
           local data = line:sub(7)
           if data == "[DONE]" or data == "" then return end
@@ -755,21 +849,28 @@ llm_router.register("opencode-free", {
         end,
       })
       if stream_err then
+        debug_log("HTTP_STREAM_ERROR", debug_json(stream_err))
         return nil, stream_err
       end
+      debug_log("HTTP_STREAM_DONE", "chat stream completed")
       return
     end
-
-    local endpoint = endpoint_for_model(model)
 
     if endpoint == "/responses" then
       local payload = build_anon_responses_payload(request, model)
       local headers = opencode_headers(ses, msg)
+      local body = debug_json(payload)
+      print("[OPENCODE-FREE-DEBUG] responses-stream tools body fragment: " .. tostring(payload.tools and debug_json(payload.tools) or "<absent>"))
+      debug_log("HTTP_STREAM", "POST " .. BASE_URL .. "/responses body_len=" .. tostring(#body))
       local resp, err = client:request({
         method = "POST", url = BASE_URL .. "/responses",
-        headers = headers, body = json.encode(payload),
+        headers = headers, body = body,
       })
-      if err then return nil, err end
+      if err then
+        debug_log("HTTP_ERROR", debug_json(err))
+        return nil, err
+      end
+      debug_log("HTTP_RESPONSE", "status=" .. tostring(resp.status) .. " body_len=" .. tostring(type(resp.body) == "string" and #resp.body or -1) .. " body=" .. tostring(resp.body or ""))
       if resp.status ~= 200 then
         return nil, llm_router.classify_error({ status = resp.status, headers = resp.headers, body = resp.body })
       end
