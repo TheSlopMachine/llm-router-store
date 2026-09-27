@@ -1,9 +1,10 @@
 --- @plugin OpenCode Zen
 --- @author TheSlopMachine
---- @version 4.0.0
+--- @version 4.0.3
 --- @router_version 0.3.0
 --- @description OpenAI/Anthropic/Google compatible paid provider OpenCode Zen (API key required)
 --- @allow_host opencode.ai
+
 
 local BASE_URL = "https://opencode.ai/zen/v1"
 
@@ -306,6 +307,19 @@ end
 llm_router.register("opencode-zen", {
   icon = "https://opencode.ai/favicon.ico",
 
+  credential_schema = function()
+    return {
+      { type = "section", title = "OpenCode Zen",
+        content = {
+          { type = "banner", variant = "info",
+            text = "API key is required." },
+          { type = "secret", name = "api_key", label = "API Key", required = true },
+          { type = "button", text = "Save", form_action = "submit" },
+        } },
+    }
+  end,
+
+
   classify_error = classify_extension,
 
   credential_schema = function()
@@ -437,7 +451,13 @@ llm_router.register("opencode-zen", {
     if request.max_tokens and request.max_tokens > 0 then payload.max_tokens = request.max_tokens end
     if request.temperature and request.temperature > 0 then payload.temperature = request.temperature end
     if request.top_p and request.top_p > 0 then payload.top_p = request.top_p end
-    if request.tools then payload.tools = request.tools end
+    if request.tools then
+      payload.tools = request.tools
+      print("[OPENCODE-ZEN-DEBUG] build_anon_chat_payload: tools before json.encode: " .. tostring(json.encode(payload.tools)))
+    else
+      payload.tools = {}
+      print("[OPENCODE-ZEN-DEBUG] build_anon_chat_payload: no tools, setting to {}." .. tostring(json.encode(payload.tools)))
+    end
     if request.tool_choice then payload.tool_choice = request.tool_choice end
     if type(request.response_format) == "table" then payload.response_format = request.response_format end
 
@@ -497,11 +517,13 @@ llm_router.register("opencode-zen", {
           end
         end,
         on_line = function(line)
+          print("[OPENCODE-ZEN-DEBUG] responses line: " .. tostring(line))
           if line:sub(1, 6) ~= "data: " then return end
           local data = line:sub(7)
           if data == "[DONE]" or data == "" then return end
           local ok, chunk = pcall(json.decode, data)
           if not ok or type(chunk) ~= "table" then return end
+          print("[OPENCODE-ZEN-DEBUG] responses decoded type: " .. tostring(chunk.type))
           emit(chunk)
         end,
       })
@@ -515,7 +537,13 @@ llm_router.register("opencode-zen", {
     if request.max_tokens and request.max_tokens > 0 then payload.max_tokens = request.max_tokens end
     if request.temperature and request.temperature > 0 then payload.temperature = request.temperature end
     if request.top_p and request.top_p > 0 then payload.top_p = request.top_p end
-    if request.tools then payload.tools = request.tools end
+    if request.tools then
+      payload.tools = request.tools
+      print("[OPENCODE-ZEN-DEBUG] build_anon_chat_payload: tools before json.encode: " .. tostring(json.encode(payload.tools)))
+    else
+      payload.tools = {}
+      print("[OPENCODE-ZEN-DEBUG] build_anon_chat_payload: no tools, setting to {}." .. tostring(json.encode(payload.tools)))
+    end
     if request.tool_choice then payload.tool_choice = request.tool_choice end
     if type(request.response_format) == "table" then payload.response_format = request.response_format end
     local headers = opencode_headers(api_key, ses, msg)

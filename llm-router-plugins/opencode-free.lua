@@ -1,6 +1,6 @@
 --- @plugin OpenCode Free
 --- @author TheSlopMachine
---- @version 4.0.1
+--- @version 4.0.12
 --- @router_version 0.3.0
 --- @description OpenAI/Anthropic/Google compatible free provider OpenCode Free (no key required)
 --- @allow_host opencode.ai
@@ -70,7 +70,7 @@ for _, t in ipairs(INJECTED_TOOLS) do
 end
 
 local function merge_tools_resp(client_tools)
-  local out = {}
+  local out = json.decode("[]") -- Ensure it's an array
   local seen = {}
   for _, t in ipairs(client_tools or {}) do
     local name = ""
@@ -89,7 +89,7 @@ local function merge_tools_resp(client_tools)
         type = "function",
         name = name,
         description = (type(t["function"]) == "table" and t["function"].description) or "",
-        parameters = (type(t["function"]) == "table" and t["function"].parameters) or { type = "object", properties = {} },
+        parameters = (type(t["function"]) == "table" and t["function"].parameters) or { type = "object", properties = {}, required = json.decode("[]") },
       })
     end
   end
@@ -181,37 +181,31 @@ local function message_text(m)
   return table.concat(parts, "\n")
 end
 
--- Free-tier limit semantics: quota wording binds to the account, plain rate
--- limits bind to the exit IP (anonymous paths carry no key, so proxy
--- rotation is the only bypass). Delay parsing lives in the core helper.
+-- Anonymous free-tier requests bind limits to the exit IP, so 429
+-- (rate limits and quota) maps to geo to trigger proxy rotation.
 local function classify_extension(raw, default_err)
+  local body_str = tostring(raw.body or "")
+  if raw.status == 401 and body_str:find("only be used from within OpenCode") then
+    local message = default_err and default_err.message or body_str
+    return {
+      type = "geo",
+      message = message,
+      upstream_status = raw.status,
+      upstream_body = body_str,
+    }
+  end
   if raw.status == 426 then
-    local message = default_err and default_err.message or tostring(raw.body)
-    return { type = "auth", message = message, upstream_status = raw.status, upstream_body = tostring(raw.body) }
+    local message = default_err and default_err.message or body_str
+    return { type = "auth", message = message, upstream_status = raw.status, upstream_body = body_str }
   end
   if raw.status ~= 429 then return nil end
-  -- 0.3.0 contract: rate/quota tables require a future retry_after.
-  -- default_err always carries one (core fallback); the literal fallback
-  -- below only fires when the core has nothing to say.
-  local err = default_err or { type = "rate_limit", message = tostring(raw.body), retry_after = os.time() + 60 }
-  local etype = ""
-  do
-    local ok, parsed = pcall(json.decode, tostring(raw.body))
-    if ok and parsed and type(parsed.error) == "table" and type(parsed.error.type) == "string" then
-      etype = parsed.error.type
-    end
-  end
-  local lower_message = string.lower(err.message or "")
-  local quota = string.lower(etype) == "freeusagelimiterror"
-    or string.find(lower_message, "quota", 1, true) ~= nil
-    or string.find(lower_message, "free usage", 1, true) ~= nil
-  if quota then
-    err.type = "quota_exceeded"
-    err.scope = { "proxy" }
-  else
-    err.scope = { "proxy" }
-  end
-  return err
+  local message = default_err and default_err.message or body_str
+  return {
+    type = "geo",
+    message = message,
+    upstream_status = raw.status,
+    upstream_body = body_str,
+  }
 end
 
 -- Free models only: the anonymous /models listing serves the free tier.
@@ -304,7 +298,7 @@ local function build_responses_tools(tools)
       if t["function"].parameters then params = t["function"].parameters end
     end
     if name ~= "" then
-      if params == nil then params = { type = "object", properties = {} } end
+      if params == nil then params = { type = "object", properties = {}, required = json.decode("[]") } end
       table.insert(out, { type = "function", name = name, description = desc, parameters = params })
     end
   end
@@ -336,7 +330,7 @@ local function tool_name(t)
 end
 
 local function merge_tools(client_tools)
-  local out = {}
+  local out = json.decode("[]") -- Ensure it's an array
   local seen = {}
   for _, t in ipairs(client_tools or {}) do
     local name = tool_name(t)
@@ -382,7 +376,7 @@ local function build_anon_chat_payload(request, model)
   end
   if request.top_p and request.top_p > 0 then payload.top_p = request.top_p end
   if agent_path then
-    payload.tools = merge_tools(request.tools)
+
     if request.tool_choice then
       payload.tool_choice = request.tool_choice
     else
@@ -390,6 +384,7 @@ local function build_anon_chat_payload(request, model)
     end
   end
   if type(request.response_format) == "table" then payload.response_format = request.response_format end
+  if not agent_path and not payload.tools then payload.tools = json.decode("[]") end -- Ensure empty array if no tools and not agent_path
   return payload
 end
 
@@ -425,17 +420,19 @@ local function build_anon_responses_payload(request, model)
   if request.temperature and request.temperature > 0 then payload.temperature = request.temperature end
   if request.top_p and request.top_p > 0 then payload.top_p = request.top_p end
   if agent_path then
-    payload.tools = merge_tools_resp(request.tools)
+
     if request.tool_choice then
       payload.tool_choice = request.tool_choice
     else
       payload.tool_choice = "auto"
     end
   else
-    local tools = build_responses_tools(request.tools)
-    if #tools > 0 then
-      payload.tools = tools
+    local tools_from_builder = build_responses_tools(request.tools)
+    if #tools_from_builder > 0 then
+      payload.tools = tools_from_builder
       if request.tool_choice then payload.tool_choice = request.tool_choice end
+    else
+      if not agent_path and not payload.tools then payload.tools = json.decode("[]") end -- Ensure empty array if no tools and not agent_path
     end
   end
   local rf = request.response_format
@@ -487,10 +484,10 @@ local function assemble_responses_stream(body, model)
             if type(ev.item.call_id) == "string" and ev.item.call_id ~= "" then acc.call_id = ev.item.call_id end
             if type(ev.item.name) == "string" and ev.item.name ~= "" then acc.name = ev.item.name end
             if type(ev.item.arguments) == "string" and ev.item.arguments ~= "" then
-              table.insert(acc.args, ev.item.arguments)
+              acc.args[1] = ev.item.arguments
             end
           elseif et == "response.function_call_arguments.delta" and type(ev.delta) == "string" then
-            table.insert(fn_slot(ev.output_index or 0).args, ev.delta)
+            local acc_for_delta = fn_slot(ev.output_index or 0); acc_for_delta.args[1] = (acc_for_delta.args[1] or "") .. ev.delta
           elseif (et == "response.completed" or et == "response.incomplete")
               and type(ev.response) == "table" then
             local r = ev.response
@@ -516,13 +513,15 @@ local function assemble_responses_stream(body, model)
     if acc.name ~= "" then
       table.insert(tool_calls, {
         id = acc.call_id, type = "function",
-        ["function"] = { name = acc.name, arguments = table.concat(acc.args) },
+        ["function"] = { name = acc.name, arguments = acc.args[1] or "" },
       })
     end
   end
   local finish = terminal_finish or "stop"
   if #tool_calls > 0 then finish = "tool_calls" end
-  local message = { role = "assistant", content = table.concat(text_parts), tool_calls = tool_calls }
+    local tool_calls_final = tool_calls
+  if #tool_calls == 0 then tool_calls_final = json.decode("[]") end
+  local message = { role = "assistant", content = table.concat(text_parts), tool_calls = tool_calls_final }
   local reasoning = table.concat(reasoning_parts)
   if reasoning ~= "" then message.reasoning_content = reasoning end
   return {
@@ -579,7 +578,7 @@ local function assemble_chat_response(body, model)
                         if type(fn) == "table" then
                           if type(fn.name) == "string" and fn.name ~= "" then acc.name = fn.name end
                           if type(fn.arguments) == "string" and fn.arguments ~= "" then
-                            table.insert(acc.args, fn.arguments)
+                            acc.args[1] = fn.arguments
                           end
                         end
                       end
@@ -608,12 +607,14 @@ local function assemble_chat_response(body, model)
     if acc.name ~= "" then
       table.insert(tool_calls, {
         id = acc.id, type = "function",
-        ["function"] = { name = acc.name, arguments = table.concat(acc.args) },
+        ["function"] = { name = acc.name, arguments = acc.args[1] or "" },
       })
     end
   end
   if #tool_calls > 0 and finish == "stop" then finish = "tool_calls" end
-  local message = { role = "assistant", content = table.concat(text_parts), tool_calls = tool_calls }
+    local tool_calls_final = tool_calls
+  if #tool_calls == 0 then tool_calls_final = json.decode("[]") end
+  local message = { role = "assistant", content = table.concat(text_parts), tool_calls = tool_calls_final }
   local reasoning = table.concat(reasoning_parts)
   if reasoning ~= "" then message.reasoning_content = reasoning end
   return {
@@ -762,30 +763,34 @@ llm_router.register("opencode-free", {
     local endpoint = endpoint_for_model(model)
 
     if endpoint == "/responses" then
-      -- Anonymous Responses relay: forward event lines as-is.
       local payload = build_anon_responses_payload(request, model)
       local headers = opencode_headers(ses, msg)
-      local _, stream_err = client:stream({
+      local resp, err = client:request({
         method = "POST", url = BASE_URL .. "/responses",
-        headers = headers,
-        body = json.encode(payload),
-        on_response = function(r)
-          if r.status ~= 200 then
-            return llm_router.classify_error({ status = r.status, headers = r.headers, body = r.body })
-          end
-        end,
-        on_line = function(line)
-          if line:sub(1, 6) ~= "data: " then return end
-          local data = line:sub(7)
-          if data == "[DONE]" or data == "" then return end
-          local ok, chunk = pcall(json.decode, data)
-          if not ok or type(chunk) ~= "table" then return end
-          emit(chunk)
-        end,
+        headers = headers, body = json.encode(payload),
       })
-      if stream_err then
-        return nil, stream_err
+      if err then return nil, err end
+      if resp.status ~= 200 then
+        return nil, llm_router.classify_error({ status = resp.status, headers = resp.headers, body = resp.body })
       end
+      local full_resp = assemble_responses_stream(resp.body, request.model)
+      local choice = (full_resp.choices and full_resp.choices[1]) or {}
+      local msg_obj = choice.message or {}
+      local delta = { role = msg_obj.role or "assistant", content = msg_obj.content or "" }
+      if msg_obj.tool_calls and #msg_obj.tool_calls > 0 then
+        delta.tool_calls = msg_obj.tool_calls
+      end
+      local chunk = {
+        id = full_resp.id or ("zen-" .. tostring(os.time())),
+        object = "chat.completion.chunk",
+        created = full_resp.created or os.time(),
+        model = full_resp.model or request.model,
+        choices = {
+          { index = 0, delta = delta, finish_reason = choice.finish_reason or "stop" }
+        },
+        usage = full_resp.usage,
+      }
+      emit(chunk)
       return
     end
   end,
