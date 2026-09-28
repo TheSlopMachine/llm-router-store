@@ -1,6 +1,6 @@
 --- @plugin OpenCode Free
 --- @author TheSlopMachine
---- @version 4.1
+--- @version 4.2
 --- @router_version 0.3.0
 --- @description OpenAI/Anthropic/Google compatible free provider OpenCode Free (no key required)
 --- @allow_host opencode.ai
@@ -243,6 +243,19 @@ end
 -- (rate limits and quota) maps to geo to trigger proxy rotation.
 local function classify_extension(raw, default_err)
   local body_str = tostring(raw.body or "")
+  -- Unavailable free models answer without an API key binding: the upstream
+  -- reports "missing api key" even though the tier is anonymous. Treat it as
+  -- model_unavailable so the router cools the model down instead of
+  -- disabling the credential as auth would.
+  if body_str:lower():find("missing api key", 1, true) then
+    local message = default_err and default_err.message or body_str
+    return {
+      type = "model_unavailable",
+      message = message,
+      upstream_status = raw.status,
+      upstream_body = body_str,
+    }
+  end
   if raw.status == 401 and body_str:find("only be used from within OpenCode") then
     local message = default_err and default_err.message or body_str
     return {
