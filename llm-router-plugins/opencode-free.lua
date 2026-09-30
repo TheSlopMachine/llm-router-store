@@ -1,6 +1,6 @@
 --- @plugin OpenCode Free
 --- @author TheSlopMachine
---- @version 4.2
+--- @version 4.3
 --- @router_version 0.3.4
 --- @description OpenAI/Anthropic/Google compatible free provider OpenCode Free (no key required)
 --- @allow_host opencode.ai
@@ -17,7 +17,11 @@ local function endpoint_for_model(model)
   return "/chat/completions"
 end
 
-local MUSE_SPARK_MIN_OUTPUT_TOKENS = 512
+-- Free-tier models think inside the output budget, including chat-protocol
+-- models with no reasoning flag. Requests below the floor starve the text
+-- (reasoning consumes the whole budget), so the floor applies to every
+-- model, explicit caller budgets included.
+local MIN_OUTPUT_TOKENS = 512
 
 local function debug_json(value)
   local ok, encoded = pcall(json.encode, value)
@@ -77,12 +81,12 @@ local function normalize_tools(tools)
   return out
 end
 
-local function responses_max_output_tokens(request, model)
+local function output_token_budget(request)
   local value = tonumber(request.max_completion_tokens)
   if value == nil or value <= 0 then value = tonumber(request.max_tokens) end
   if value == nil or value <= 0 then return 32000 end
-  if model:lower():match("^muse%-spark") and value < MUSE_SPARK_MIN_OUTPUT_TOKENS then
-    return MUSE_SPARK_MIN_OUTPUT_TOKENS
+  if value < MIN_OUTPUT_TOKENS then
+    return MIN_OUTPUT_TOKENS
   end
   return value
 end
@@ -455,7 +459,7 @@ local function build_anon_chat_payload(request, model)
     payload.temperature = 0.5
   end
   if request.max_tokens and request.max_tokens > 0 then
-    payload.max_tokens = request.max_tokens
+    payload.max_tokens = output_token_budget(request)
   else
     payload.max_tokens = 32000
   end
@@ -496,7 +500,7 @@ local function build_anon_responses_payload(request, model)
     input = input,
     stream = true,
   }
-  payload.max_output_tokens = responses_max_output_tokens(request, model)
+  payload.max_output_tokens = output_token_budget(request)
   payload.store = false
   local effort = request.reasoning_effort
   if effort == "low" or effort == "medium" or effort == "high" or effort == "xhigh"
@@ -639,8 +643,12 @@ local function assemble_chat_response(body, model)
                   if type(delta.content) == "string" and delta.content ~= "" then
                     table.insert(text_parts, delta.content)
                   end
-                  if type(delta.reasoning) == "string" and delta.reasoning ~= "" then
-                    table.insert(reasoning_parts, delta.reasoning)
+                  -- Upstream chat deltas carry the trace as reasoning_content;
+                  -- older shapes used reasoning. Accept both.
+                  local reasoning = delta.reasoning_content
+                  if type(reasoning) ~= "string" or reasoning == "" then reasoning = delta.reasoning end
+                  if type(reasoning) == "string" and reasoning ~= "" then
+                    table.insert(reasoning_parts, reasoning)
                   end
                   if type(delta.tool_calls) == "table" then
                     for _, tc in ipairs(delta.tool_calls) do
