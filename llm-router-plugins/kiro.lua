@@ -1,15 +1,16 @@
 --- @plugin Kiro AI
 --- @author TheSlopMachine
---- @version 3.0.0
+--- @version 3.1.0
 --- @router_version 0.3.0
 --- @description AWS Kiro models via device login (OAuth2 with proactive refresh)
 --- @allow_host codewhisperer.us-east-1.amazonaws.com
 --- @allow_host oidc.us-east-1.amazonaws.com
+--- @allow_host q.us-east-1.amazonaws.com
+--- @allow_host q.eu-central-1.amazonaws.com
 
 local DEFAULT_REGION = "us-east-1"
 local BUILDER_START_URL = "https://view.awsapps.com/start"
 local ISSUER_URL = "https://identitycenter.amazonaws.com/ssoins-722374e8c3c8e6c6"
-local GENERATE_URL = "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse"
 local CONVERSATION_NS = "34f7193f-561d-4050-bc84-9547d953d6bf"
 
 local function oidc_url(region, path)
@@ -24,6 +25,105 @@ local function region_of(credential, provider_config)
     return provider_config.region
   end
   return DEFAULT_REGION
+end
+
+-- ── Runtime region + model discovery ──
+
+-- Q Developer profiles live in us-east-1/eu-central-1 only. A stored IdC
+-- region is a token region, not a runtime region. The profileArn region
+-- wins when present; hosts come from a fixed list, never raw input.
+local PROFILE_REGIONS = { "us-east-1", "eu-central-1" }
+
+local function valid_region(s)
+  return type(s) == "string" and s:lower():match("^[a-z][a-z]-[a-z]+-%d+$") ~= nil
+end
+
+local function region_from_arn(arn)
+  if type(arn) ~= "string" then return nil end
+  local region = arn:lower():match("^arn:aws:codewhisperer:([a-z0-9-]+):")
+  if region and valid_region(region) then return region end
+  return nil
+end
+
+local function runtime_region(credential, provider_config)
+  local data = credential and credential.data or {}
+  local arn_region = region_from_arn(data.profile_arn) or region_from_arn(data.profileArn)
+  if arn_region then return arn_region end
+  local stored = region_of(credential, provider_config):lower()
+  for _, region in ipairs(PROFILE_REGIONS) do
+    if stored == region then return stored end
+  end
+  return DEFAULT_REGION
+end
+
+local function runtime_host(region)
+  if region == "us-east-1" then
+    return "https://codewhisperer.us-east-1.amazonaws.com"
+  end
+  return "https://q." .. region .. ".amazonaws.com"
+end
+
+local function generate_url(credential, provider_config)
+  return runtime_host(runtime_region(credential, provider_config)) .. "/generateAssistantResponse"
+end
+
+local function discovery_endpoints(region)
+  local urls = { "https://q." .. region .. ".amazonaws.com/ListAvailableModels" }
+  if region ~= "us-east-1" then
+    table.insert(urls, "https://q.us-east-1.amazonaws.com/ListAvailableModels")
+  end
+  return urls
+end
+
+local function parse_model_list(body)
+  local ok, parsed = pcall(json.decode, body)
+  if not ok or type(parsed) ~= "table" then return nil end
+  local items = parsed.models
+  if type(items) ~= "table" then items = parsed.availableModels end
+  if type(items) ~= "table" then return nil end
+  local out, seen = {}, {}
+  for _, item in ipairs(items) do
+    if type(item) == "table" then
+      local id = item.modelId
+      if type(id) ~= "string" or id == "" then id = item.id end
+      if type(id) == "string" and id ~= "" and not seen[id] then
+        seen[id] = true
+        local name = item.modelName
+        if type(name) ~= "string" or name == "" then name = item.name end
+        if type(name) ~= "string" or name == "" then name = id end
+        local context = 200000
+        if type(item.tokenLimits) == "table" then
+          local max_input = tonumber(item.tokenLimits.maxInputTokens)
+          if max_input and max_input > 0 then context = math.floor(max_input) end
+        end
+        table.insert(out, {
+          name = id, display_name = name,
+          context_window = context, max_tokens = 32000,
+          supported_parameters = { "tools" },
+        })
+      end
+    end
+  end
+  if #out == 0 then return nil end
+  return out
+end
+
+local function fetch_model_list(client, url, token, profile_arn)
+  local target = url .. "?origin=AI_EDITOR"
+  if type(profile_arn) == "string" and profile_arn ~= "" then
+    target = target .. "&profileArn=" .. profile_arn
+  end
+  local resp, err = client:request({
+    method = "GET", url = target,
+    headers = {
+      ["Authorization"] = "Bearer " .. token,
+      ["Accept"] = "application/json",
+      ["User-Agent"] = "AWS-SDK-JS/3.0.0 kiro-ide/1.0.0",
+    },
+  })
+  if err then return nil end
+  if resp.status ~= 200 then return nil end
+  return parse_model_list(resp.body)
 end
 
 -- ── Binary AWS event-stream framing ──
@@ -469,16 +569,27 @@ llm_router.register("kiro", {
   end,
 
   get_model_infos = function(ctx, credential, provider_config)
-    local tools = { "tools" }
-    -- Cheapest first: credential probes and smoke matrices take the first
-    -- listed model.
-    return {
-      { name = "claude-haiku-4.5", display_name = "Claude Haiku 4.5", context_window = 200000, max_tokens = 32000, supported_parameters = tools },
-      { name = "claude-opus-4.7", display_name = "Claude Opus 4.7", context_window = 200000, max_tokens = 32000, supported_parameters = tools },
-      { name = "claude-opus-4.6", display_name = "Claude Opus 4.6", context_window = 200000, max_tokens = 32000, supported_parameters = tools },
-      { name = "claude-sonnet-4.6", display_name = "Claude Sonnet 4.6", context_window = 200000, max_tokens = 32000, supported_parameters = tools },
-      { name = "claude-sonnet-4.5", display_name = "Claude Sonnet 4.5", context_window = 200000, max_tokens = 32000, supported_parameters = tools },
-    }
+    local token = ""
+    if credential and credential.data then token = credential.data.access_token or "" end
+    if token == "" then
+      return nil, { type = "auth", message = "kiro access token is required for model discovery" }
+    end
+    local data = credential.data or {}
+    local region = runtime_region(credential, provider_config)
+    local client = llm_router.http_client({})
+    for _, url in ipairs(discovery_endpoints(region)) do
+      local models = fetch_model_list(client, url, token)
+      if models then return models end
+    end
+    -- Desktop-style accounts serve the catalog under their profile ARN.
+    -- Builder ID must not send it (yields 403), so this stays a retry.
+    local arn = data.profile_arn
+    if type(arn) ~= "string" or arn == "" then arn = data.profileArn end
+    if type(arn) == "string" and arn ~= "" then
+      local models = fetch_model_list(client, discovery_endpoints(region)[1], token, arn)
+      if models then return models end
+    end
+    return nil, { type = "upstream", message = "kiro model discovery failed on every region" }
   end,
 
   needs_refresh = function(credential)
@@ -663,7 +774,7 @@ llm_router.register("kiro", {
     local model = request.model_name
     local client = llm_router.http_client({})
     local resp, err = client:request({
-      method = "POST", url = GENERATE_URL,
+      method = "POST", url = generate_url(credential, ctx.provider_config),
       headers = generate_headers(credential),
       body = json.encode(build_payload(request, model)),
     })
@@ -705,7 +816,8 @@ llm_router.register("kiro", {
     local first = true
     local stream_usage = nil
     local payload = build_payload(request, short_model)
-    local _, stream_err = client_stream_raw(generate_headers(credential), payload, function(bytes)
+    local generate = generate_url(credential, ctx.provider_config)
+    local _, stream_err = client_stream_raw(generate_headers(credential), payload, generate, function(bytes)
       buffer = buffer .. bytes
       while true do
         if #buffer < 16 then break end
@@ -774,10 +886,10 @@ llm_router.register("kiro", {
 
 -- Raw event-stream POST with chunked delivery. Declared after register so
 -- the closure above resolves it at call time, not at load time.
-function client_stream_raw(headers, payload, on_bytes)
+function client_stream_raw(headers, payload, url, on_bytes)
   local client = llm_router.http_client({})
   return client:stream({
-    method = "POST", url = GENERATE_URL,
+    method = "POST", url = url,
     headers = headers, body = json.encode(payload),
     on_response = function(r)
       if r.status ~= 200 then
