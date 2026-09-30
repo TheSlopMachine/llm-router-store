@@ -1,6 +1,6 @@
 --- @plugin OpenCode Free
 --- @author TheSlopMachine
---- @version 4.3
+--- @version 4.4
 --- @router_version 0.3.4
 --- @description OpenAI/Anthropic/Google compatible free provider OpenCode Free (no key required)
 --- @allow_host opencode.ai
@@ -243,6 +243,29 @@ local function message_text(m)
   return table.concat(parts, "\n")
 end
 
+-- Free-tier identity: -free suffix or the known keyless set. Unknown
+-- non-suffixed ids default to premium (fail-safe). Proven-broken free
+-- ids stay listed nowhere: remove them here when upstream heals.
+-- 2026-09-30: jev-1.13-free (upstream 502s), deepseek-v4-flash-free and
+-- ling-3.0-flash-fin-free (fatal 400s).
+local KNOWN_FREE = { ["big-pickle"] = true }
+local EXCLUDED_FREE = {
+  ["jev-1.13-free"] = true,
+  ["deepseek-v4-flash-free"] = true,
+  ["ling-3.0-flash-fin-free"] = true,
+}
+
+local function is_free_model(id)
+  if type(id) ~= "string" or id == "" then return false end
+  if EXCLUDED_FREE[id] then return false end
+  if id:sub(-5) == "-free" then return true end
+  return KNOWN_FREE[id] == true
+end
+
+-- Model of the in-flight handler call, for classify decisions that depend
+-- on the id. Same sandbox state as the handler, reset on every call.
+local last_model_name = ""
+
 -- Free-tier rate and quota limits apply to the exit IP. The router cools
 -- down that proxy and retries the request through another exit.
 local function classify_extension(raw, default_err)
@@ -251,6 +274,18 @@ local function classify_extension(raw, default_err)
     local message = default_err and default_err.message or body_str
     return {
       type = "upstream",
+      message = message,
+      upstream_status = raw.status,
+      upstream_body = body_str,
+    }
+  end
+  -- Paid models answer 401 without an API key binding on the anonymous
+  -- tier. Cool the model down instead of disabling the credential as
+  -- auth would. Free-tier 401s keep the core auth verdict.
+  if raw.status == 401 and not is_free_model(last_model_name) then
+    local message = default_err and default_err.message or body_str
+    return {
+      type = "model_unavailable",
       message = message,
       upstream_status = raw.status,
       upstream_body = body_str,
@@ -284,10 +319,19 @@ local FALLBACK_MODELS = {
   { name = "nemotron-3.5-lightning-free", display_name = "Nemotron 3.5 Lightning Free" },
   { name = "mimo-v2.5-free", display_name = "MiMo V2.5 Free" },
   { name = "big-pickle", display_name = "Big Pickle" },
-  { name = "ling-3.0-flash-fin-free", display_name = "Ling 3.0 Flash Fin Free" },
   { name = "muse-spark-1.2-contributor-free", display_name = "Muse Spark 1.2 Contributor Free" },
   { name = "muse-spark-1.3-contributor-free", display_name = "Muse Spark 1.3 Contributor Free" },
 }
+
+local function filter_free_models(infos)
+  local out = {}
+  for _, m in ipairs(infos) do
+    if type(m) == "table" and is_free_model(m.name) then
+      table.insert(out, m)
+    end
+  end
+  return out
+end
 
 -- Upstream /models carries no capability metadata, so reasoning support
 -- is matched by model family. Conservative: known-thinking families only.
@@ -749,14 +793,14 @@ llm_router.register("opencode-free", {
     })
     if err then
       -- Upstream listing failed: fall back to the known model set.
-      return with_limits(FALLBACK_MODELS)
+      return with_limits(filter_free_models(FALLBACK_MODELS))
     end
     if resp.status ~= 200 then
-      return with_limits(FALLBACK_MODELS)
+      return with_limits(filter_free_models(FALLBACK_MODELS))
     end
     local ok, parsed = pcall(json.decode, resp.body)
     if not ok or not parsed or type(parsed.data) ~= "table" then
-      return with_limits(FALLBACK_MODELS)
+      return with_limits(filter_free_models(FALLBACK_MODELS))
     end
     local infos = {}
     for _, m in ipairs(parsed.data) do
@@ -764,14 +808,16 @@ llm_router.register("opencode-free", {
         table.insert(infos, { name = m.id, display_name = m.id })
       end
     end
+    infos = filter_free_models(infos)
     if #infos == 0 then
-      return with_limits(FALLBACK_MODELS)
+      return with_limits(filter_free_models(FALLBACK_MODELS))
     end
     return with_limits(infos)
   end,
 
   complete = function(ctx, credential, request)
     local model = request.model_name
+    last_model_name = model or ""
     local endpoint = endpoint_for_model(model)
     local client = llm_router.http_client({})
 
@@ -828,6 +874,7 @@ llm_router.register("opencode-free", {
 
   complete_stream = function(ctx, credential, request, emit)
     local model = request.model_name
+    last_model_name = model or ""
     local endpoint = endpoint_for_model(model)
     debug_log("STREAM", "model=" .. tostring(model) .. " full_model=" .. tostring(request.model) .. " endpoint=" .. tostring(endpoint) .. " request_tools=" .. table_shape(request.tools) .. " tools_count=" .. tostring(#normalize_tools(request.tools)) .. " messages=" .. tostring(type(request.messages) == "table" and #request.messages or -1))
     local ses, msg = mint_ids()
@@ -910,5 +957,19 @@ llm_router.register("opencode-free", {
       return
     end
   end,
+
+  -- Verified reasoning support the upstream catalog does not advertise.
+  -- Effort sets match the opencode-go registry measurements.
+  model_specs = {
+    ["mimo-v2.5-free"] = {
+      reasoning = { supported_efforts = { "high", "max" } },
+    },
+    ["muse-spark-1.2-contributor-free"] = {
+      reasoning = { supported_efforts = { "minimal", "low", "medium", "high", "xhigh" } },
+    },
+    ["muse-spark-1.3-contributor-free"] = {
+      reasoning = { supported_efforts = { "minimal", "low", "medium", "high", "xhigh" } },
+    },
+  },
 
 })
