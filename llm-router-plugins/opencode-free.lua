@@ -1,7 +1,7 @@
 --- @plugin OpenCode Free
 --- @author TheSlopMachine
---- @version 4.1
---- @router_version 0.3.0
+--- @version 4.2
+--- @router_version 0.3.4
 --- @description OpenAI/Anthropic/Google compatible free provider OpenCode Free (no key required)
 --- @allow_host opencode.ai
 
@@ -239,14 +239,14 @@ local function message_text(m)
   return table.concat(parts, "\n")
 end
 
--- Anonymous free-tier requests bind limits to the exit IP, so 429
--- (rate limits and quota) maps to geo to trigger proxy rotation.
+-- Free-tier rate and quota limits apply to the exit IP. The router cools
+-- down that proxy and retries the request through another exit.
 local function classify_extension(raw, default_err)
   local body_str = tostring(raw.body or "")
-  if raw.status == 401 and body_str:find("only be used from within OpenCode") then
+  if raw.status == 401 and body_str:find("only be used from within OpenCode", 1, true) then
     local message = default_err and default_err.message or body_str
     return {
-      type = "geo",
+      type = "upstream",
       message = message,
       upstream_status = raw.status,
       upstream_body = body_str,
@@ -258,9 +258,16 @@ local function classify_extension(raw, default_err)
   end
   if raw.status ~= 429 then return nil end
   local message = default_err and default_err.message or body_str
+  local lower_body = body_str:lower()
+  local quota = default_err and default_err.type == "quota_exceeded"
+    or lower_body:find("freeusagelimiterror", 1, true) ~= nil
+    or lower_body:find("quota", 1, true) ~= nil
+    or lower_body:find("free usage", 1, true) ~= nil
   return {
-    type = "geo",
+    type = quota and "quota_exceeded" or "rate_limit",
     message = message,
+    retry_after = default_err and default_err.retry_after or os.time() + 60,
+    scope = { "proxy" },
     upstream_status = raw.status,
     upstream_body = body_str,
   }
