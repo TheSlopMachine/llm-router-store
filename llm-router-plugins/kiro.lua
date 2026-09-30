@@ -1,6 +1,6 @@
 --- @plugin Kiro AI
 --- @author TheSlopMachine
---- @version 3.1.0
+--- @version 3.2.0
 --- @router_version 0.3.0
 --- @description AWS Kiro models via device login (OAuth2 with proactive refresh)
 --- @allow_host codewhisperer.us-east-1.amazonaws.com
@@ -126,6 +126,111 @@ local function fetch_model_list(client, url, token, profile_arn)
   return parse_model_list(resp.body)
 end
 
+-- ── Thinking support ──
+
+-- Only these models accept Kiro thinking controls. Adaptive envelope
+-- (output_config + thinking type) for Claude; native reasoning.effort
+-- for GPT-5.6. Anything else with a -thinking suffix fails closed:
+-- Kiro 400s unknown thinking requests.
+local ADAPTIVE_THINKING_MODELS = { ["claude-opus-5"] = true, ["claude-sonnet-5"] = true }
+local NATIVE_REASONING_MODELS = { ["gpt-5.6-sol"] = true, ["gpt-5.6-terra"] = true, ["gpt-5.6-luna"] = true }
+local EFFORT_BUDGETS = { low = 8000, medium = 16000, high = 32000, xhigh = 64000, max = 120000 }
+
+local function resolve_effort(request)
+  local effort = ""
+  if request and type(request.reasoning_effort) == "string" then
+    effort = request.reasoning_effort:lower()
+  end
+  if effort == "minimal" then effort = "low" end
+  if effort == "" or effort == "none" then return "" end
+  if not EFFORT_BUDGETS[effort] then return "" end
+  return effort
+end
+
+-- Splits a requested model into its upstream id plus thinking flag. A
+-- -thinking suffix enables thinking; an explicit effort on an allowlisted
+-- model does the same without the suffix. Anything else thinking-flavored
+-- returns nil plus an invalid_request table.
+local function resolve_model(model, effort)
+  local upstream, thinking = model, false
+  if type(model) == "string" and model:sub(-9) == "-thinking" then
+    thinking = true
+    upstream = model:sub(1, -10)
+  elseif effort ~= "" and (ADAPTIVE_THINKING_MODELS[model] or NATIVE_REASONING_MODELS[model]) then
+    thinking = true
+    upstream = model
+  end
+  if thinking and not ADAPTIVE_THINKING_MODELS[upstream] and not NATIVE_REASONING_MODELS[upstream] then
+    return nil, false, { type = "invalid_request",
+      message = "model " .. tostring(model) .. " does not support thinking on kiro" }
+  end
+  return upstream, thinking, nil
+end
+
+-- Appends -thinking variants for allowlisted models to a discovered list.
+local function with_thinking_variants(models)
+  local out = {}
+  for _, m in ipairs(models) do
+    table.insert(out, m)
+    if ADAPTIVE_THINKING_MODELS[m.name] or NATIVE_REASONING_MODELS[m.name] then
+      table.insert(out, {
+        name = m.name .. "-thinking", display_name = m.display_name .. " (Thinking)",
+        context_window = m.context_window, max_tokens = m.max_tokens,
+        supported_parameters = { "tools" },
+        reasoning = { default_enabled = true, supported_efforts = { "max", "xhigh", "high", "medium", "low" } },
+      })
+    end
+  end
+  return out
+end
+
+-- Reasoning trace out of a reasoningContentEvent payload: object form
+-- ({text} or {Text}), plain string form, or flat {text}.
+local function reasoning_text(p)
+  local rt = p.reasoningText
+  if type(rt) == "table" then
+    if type(rt.text) == "string" and rt.text ~= "" then return rt.text end
+    if type(rt.Text) == "string" and rt.Text ~= "" then return rt.Text end
+    return ""
+  end
+  if type(rt) == "string" and rt ~= "" then return rt end
+  if type(p.text) == "string" then return p.text end
+  return ""
+end
+
+local THINK_OPEN, THINK_CLOSE = "<thinking>", "</thinking>"
+
+-- Stream-safe splitter: routes one content slice into content vs reasoning
+-- buckets by <thinking> state. A tag split across frames is held in
+-- st.pending (</thinking> is the longest at 11 chars) and completed on
+-- the next slice.
+local function split_thinking(st, raw, content_arr, reasoning_arr)
+  local text = (st.pending or "") .. (raw or "")
+  st.pending = ""
+  local function emit(s)
+    if s == "" then return end
+    if st.thinkingMode then table.insert(reasoning_arr, s)
+    else table.insert(content_arr, s) end
+  end
+  while #text > 0 do
+    local tag = st.thinkingMode and THINK_CLOSE or THINK_OPEN
+    local s, e = text:find(tag, 1, true)
+    if not s then
+      local hold = #text + 1
+      local from = math.max(1, #text - 10)
+      for i = from, #text do
+        if tag:sub(1, #text - i + 1) == text:sub(i) then hold = i; break end
+      end
+      emit(text:sub(1, hold - 1))
+      st.pending = text:sub(hold)
+      return
+    end
+    emit(text:sub(1, s - 1))
+    st.thinkingMode = not st.thinkingMode
+    text = text:sub(e + 1)
+  end
+end
+
 -- ── Binary AWS event-stream framing ──
 
 local function u32be(s, pos)
@@ -180,9 +285,10 @@ local function parse_frame(frame)
   return { headers = headers, payload = payload }
 end
 
-local function new_aggregate()
-  return { content = {}, prompt_tokens = 0, completion_tokens = 0, total_tokens = 0,
-           finish_reason = "", tool_calls = {}, builders = {}, order = {} }
+local function new_aggregate(thinking)
+  return { content = {}, reasoning = {}, prompt_tokens = 0, completion_tokens = 0, total_tokens = 0,
+           finish_reason = "", tool_calls = {}, builders = {}, order = {},
+           split = thinking == true, think_state = { thinkingMode = false, pending = "" } }
 end
 
 local function flush_builder(state, id)
@@ -202,8 +308,15 @@ local function consume_event(state, frame)
   if etype == "assistantResponseEvent" or etype == "codeEvent" then
     local content = p.content
     if type(content) == "string" and content ~= "" then
-      table.insert(state.content, content)
+      if state.split then
+        split_thinking(state.think_state, content, state.content, state.reasoning)
+      else
+        table.insert(state.content, content)
+      end
     end
+  elseif etype == "reasoningContentEvent" then
+    local text = reasoning_text(p)
+    if text ~= "" then table.insert(state.reasoning, text) end
   elseif etype == "metricsEvent" then
     local m = p.metricsEvent or p
     state.prompt_tokens = m.inputTokens or 0
@@ -237,12 +350,17 @@ local function consume_event(state, frame)
   end
 end
 
-local function aggregate_response(body)
-  local state = new_aggregate()
+local function aggregate_response(body, thinking)
+  local state = new_aggregate(thinking)
   local frames = split_frames(body)
   for _, f in ipairs(frames) do
     local frame = parse_frame(f)
     if frame then consume_event(state, frame) end
+  end
+  if state.think_state.pending ~= "" then
+    if state.think_state.thinkingMode then table.insert(state.reasoning, state.think_state.pending)
+    else table.insert(state.content, state.think_state.pending) end
+    state.think_state.pending = ""
   end
   for _, id in ipairs(state.order) do
     if state.builders[id] and state.builders[id].name ~= "" then
@@ -400,10 +518,16 @@ local function conversation_id(history, current_content)
   return llm_router.uuid_v5(CONVERSATION_NS, seed)
 end
 
-local function build_payload(request, model)
+local function build_payload(request, model, thinking, effort)
   local history, current = convert_messages(request.messages, request.tools or {}, model)
   if current.content == "" then current.content = "continue" end
   current.content = "[Context: Current time is " .. os.date("!%Y-%m-%dT%H:%M:%SZ") .. "]\n\n" .. current.content
+  if thinking then
+    if effort == "" then effort = "high" end
+    current.content = "<thinking_mode>enabled</thinking_mode>"
+      .. "<max_thinking_length>" .. tostring(EFFORT_BUDGETS[effort] or EFFORT_BUDGETS.high) .. "</max_thinking_length>"
+      .. "\n\n" .. current.content
+  end
   current.origin = "AI_EDITOR"
   local state = {
     chatTriggerType = "MANUAL",
@@ -413,12 +537,24 @@ local function build_payload(request, model)
   if #history > 0 then state.history = history end
   local payload = { conversationState = state }
   if (request.max_tokens and request.max_tokens > 0)
-      or (request.temperature and request.temperature > 0)
-      or (request.top_p and request.top_p > 0) then
+      or ((request.temperature and request.temperature > 0) and not thinking)
+      or ((request.top_p and request.top_p > 0) and not thinking) then
     payload.inferenceConfig = {}
     if request.max_tokens and request.max_tokens > 0 then payload.inferenceConfig.maxTokens = request.max_tokens end
-    if request.temperature and request.temperature > 0 then payload.inferenceConfig.temperature = request.temperature end
-    if request.top_p and request.top_p > 0 then payload.inferenceConfig.topP = request.top_p end
+    if not thinking then
+      if request.temperature and request.temperature > 0 then payload.inferenceConfig.temperature = request.temperature end
+      if request.top_p and request.top_p > 0 then payload.inferenceConfig.topP = request.top_p end
+    end
+  end
+  if thinking then
+    if NATIVE_REASONING_MODELS[model] then
+      payload.additionalModelRequestFields = { reasoning = { effort = effort } }
+    else
+      payload.additionalModelRequestFields = {
+        output_config = { effort = effort },
+        thinking = { type = "adaptive", display = "summarized" },
+      }
+    end
   end
   return payload
 end
@@ -579,7 +715,7 @@ llm_router.register("kiro", {
     local client = llm_router.http_client({})
     for _, url in ipairs(discovery_endpoints(region)) do
       local models = fetch_model_list(client, url, token)
-      if models then return models end
+      if models then return with_thinking_variants(models) end
     end
     -- Desktop-style accounts serve the catalog under their profile ARN.
     -- Builder ID must not send it (yields 403), so this stays a retry.
@@ -587,7 +723,7 @@ llm_router.register("kiro", {
     if type(arn) ~= "string" or arn == "" then arn = data.profileArn end
     if type(arn) == "string" and arn ~= "" then
       local models = fetch_model_list(client, discovery_endpoints(region)[1], token, arn)
-      if models then return models end
+      if models then return with_thinking_variants(models) end
     end
     return nil, { type = "upstream", message = "kiro model discovery failed on every region" }
   end,
@@ -771,19 +907,22 @@ llm_router.register("kiro", {
   end,
 
   complete = function(ctx, credential, request)
-    local model = request.model_name
+    local effort = resolve_effort(request)
+    local model, thinking, alias_err = resolve_model(request.model_name, effort)
+    if alias_err then return nil, alias_err end
     local client = llm_router.http_client({})
     local resp, err = client:request({
       method = "POST", url = generate_url(credential, ctx.provider_config),
       headers = generate_headers(credential),
-      body = json.encode(build_payload(request, model)),
+      body = json.encode(build_payload(request, model, thinking, effort)),
     })
     if err then return nil, err end
     if resp.status ~= 200 then
       return nil, llm_router.classify_error({ status = resp.status, headers = resp.headers, body = resp.body })
     end
-    local state = aggregate_response(resp.body)
+    local state = aggregate_response(resp.body, thinking)
     local text = table.concat(state.content, "")
+    local reasoning = table.concat(state.reasoning, "")
     local finish = state.finish_reason
     if finish == "" then finish = "stop" end
     if #state.tool_calls > 0 then finish = "tool_calls" end
@@ -793,11 +932,13 @@ llm_router.register("kiro", {
       total = state.prompt_tokens + completion
       state.completion_tokens = completion
     end
+    local message = { role = "assistant", content = text, tool_calls = state.tool_calls }
+    if reasoning ~= "" then message.reasoning_content = reasoning end
     return {
       id = "kiro-" .. tostring(os.time()), object = "chat.completion", created = os.time(),
       model = request.model,
       choices = {
-        { index = 0, message = { role = "assistant", content = text, tool_calls = state.tool_calls },
+        { index = 0, message = message,
           finish_reason = finish },
       },
       usage = { prompt_tokens = state.prompt_tokens,
@@ -807,7 +948,9 @@ llm_router.register("kiro", {
 
   complete_stream = function(ctx, credential, request, emit)
     local model = request.model
-    local short_model = request.model_name
+    local effort = resolve_effort(request)
+    local short_model, thinking, alias_err = resolve_model(request.model_name, effort)
+    if alias_err then return nil, alias_err end
     local response_id = "kiro-" .. tostring(os.time())
     local created = os.time()
     local buffer = ""
@@ -815,7 +958,14 @@ llm_router.register("kiro", {
     local saw_tool = false
     local first = true
     local stream_usage = nil
-    local payload = build_payload(request, short_model)
+    local think_state = { thinkingMode = false, pending = "" }
+    local function emit_delta(delta)
+      if first then delta.role = "assistant" end
+      first = false
+      emit({ id = response_id, object = "chat.completion.chunk", created = created,
+        model = model, choices = { { index = 0, delta = delta } } })
+    end
+    local payload = build_payload(request, short_model, thinking, effort)
     local generate = generate_url(credential, ctx.provider_config)
     local _, stream_err = client_stream_raw(generate_headers(credential), payload, generate, function(bytes)
       buffer = buffer .. bytes
@@ -830,12 +980,24 @@ llm_router.register("kiro", {
           local p = frame.payload
           if etype == "assistantResponseEvent" or etype == "codeEvent" then
             if type(p.content) == "string" and p.content ~= "" then
-              local delta = { content = p.content }
-              if first then delta.role = "assistant" end
-              first = false
-              emit({ id = response_id, object = "chat.completion.chunk", created = created,
-                model = model, choices = { { index = 0, delta = delta } } })
+              if thinking then
+                local content_parts, reasoning_parts = {}, {}
+                split_thinking(think_state, p.content, content_parts, reasoning_parts)
+                local text = table.concat(content_parts, "")
+                local reasoning = table.concat(reasoning_parts, "")
+                if text ~= "" then emit_delta({ content = text }) end
+                if reasoning ~= "" then emit_delta({ reasoning_content = reasoning }) end
+              else
+                local delta = { content = p.content }
+                if first then delta.role = "assistant" end
+                first = false
+                emit({ id = response_id, object = "chat.completion.chunk", created = created,
+                  model = model, choices = { { index = 0, delta = delta } } })
+              end
             end
+          elseif etype == "reasoningContentEvent" then
+            local text = reasoning_text(p)
+            if text ~= "" then emit_delta({ reasoning_content = text }) end
           elseif etype == "toolUseEvent" then
             local id = p.toolUseId or ""
             if id == "" then id = "call_" .. tostring(os.time()) end
@@ -875,6 +1037,11 @@ llm_router.register("kiro", {
       end
     end)
     if stream_err then return nil, stream_err end
+    if thinking and think_state.pending ~= "" then
+      if think_state.thinkingMode then emit_delta({ reasoning_content = think_state.pending })
+      else emit_delta({ content = think_state.pending }) end
+      think_state.pending = ""
+    end
     local finish = "stop"
     if saw_tool then finish = "tool_calls" end
     local last = { id = response_id, object = "chat.completion.chunk", created = created,
