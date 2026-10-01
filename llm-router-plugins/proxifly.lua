@@ -1,12 +1,12 @@
 --- @plugin Proxifly Proxy List
 --- @author TheSlopMachine
---- @version 3.1.0
+--- @version 4.0.0
 --- @router_version 0.3.0
---- @description Free proxy list from proxifly (proxies/all/data.json)
---- @allow_host raw.githubusercontent.com
+--- @description Free HTTP proxy list from proxifly (proxies/protocols/http/data.json)
+--- @allow_host cdn.jsdelivr.net
 --- @proxy_source true
 
-local LIST_URL = "https://raw.githubusercontent.com/proxifly/free-proxy-list/refs/heads/main/proxies/all/data.json"
+local LIST_URL = "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.json"
 local CACHE_SCOPE = "proxy_list"
 
 llm_router.register_proxy_source("proxifly", {
