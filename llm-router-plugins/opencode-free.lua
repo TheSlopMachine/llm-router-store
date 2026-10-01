@@ -1,6 +1,6 @@
 --- @plugin OpenCode Free
 --- @author TheSlopMachine
---- @version 4.4
+--- @version 4.5
 --- @router_version 0.3.4
 --- @description OpenAI/Anthropic/Google compatible free provider OpenCode Free (no key required)
 --- @allow_host opencode.ai
@@ -52,6 +52,15 @@ local function table_shape(value)
   return "map(numeric=" .. tostring(numeric) .. ",other=" .. tostring(other) .. ")"
 end
 
+local function tool_name(t)
+  if type(t) ~= "table" then return "" end
+  if type(t["function"]) == "table" and type(t["function"].name) == "string" then
+    return t["function"].name
+  end
+  if type(t.name) == "string" then return t.name end
+  return ""
+end
+
 local function normalize_tools(tools)
   local out = {}
   if type(tools) ~= "table" then return out end
@@ -75,9 +84,12 @@ local function normalize_tools(tools)
     return out
   end
 
+  -- Map-shaped input iterates in undefined order. Sort by name so the
+  -- upstream tool list (and the cache-key canonical form) is stable.
   for _, value in pairs(tools) do
     add_tool(value)
   end
+  table.sort(out, function(a, b) return tool_name(a) < tool_name(b) end)
   return out
 end
 
@@ -202,14 +214,107 @@ end
 -- Fresh ULID-shaped session/message ids per request. The time head uses
 -- the current second plus a uniform sub-second part, matching the genuine
 -- millisecond distribution; the message counter follows the session
--- counter, preserving request ordering. Shape match is sufficient: the
--- values carry no server-side state.
-local function mint_ids()
+-- counter, preserving request ordering.
+local function mint_ms()
   local jitter = tonumber(rand_bytes(2):sub(1, 4), 16) or 0
-  local ms = os.time() * 1000 + (jitter % 1000)
-  local ses = "ses_" .. time_head(true, ms, 1) .. ulid_tail()
-  local msg = "msg_" .. time_head(false, ms, 2) .. ulid_tail()
-  return ses, msg
+  return os.time() * 1000 + (jitter % 1000)
+end
+
+local function mint_session(ms)
+  return "ses_" .. time_head(true, ms, 1) .. ulid_tail()
+end
+
+local function mint_msg(ms)
+  return "msg_" .. time_head(false, ms, 2) .. ulid_tail()
+end
+
+local function mint_ids()
+  local ms = mint_ms()
+  return mint_session(ms), mint_msg(ms)
+end
+
+-- Anonymous usage is attributed per session upstream, so the session id
+-- stays stable per credential (24h rotation) instead of per request.
+-- Loss fails open to a fresh id: continuity degrades, nothing breaks.
+local SESSION_SCOPE = "session"
+local SESSION_TTL = 24 * 3600
+
+local function stable_session()
+  local ses, at = nil, 0
+  local ok, v = pcall(llm_router.storage.get, SESSION_SCOPE, "ses")
+  if ok and type(v) == "string" and v ~= "" then ses = v end
+  local ok2, v2 = pcall(llm_router.storage.get, SESSION_SCOPE, "ses_at")
+  if ok2 and tonumber(v2) then at = tonumber(v2) end
+  if ses ~= nil and os.time() - at < SESSION_TTL then return ses end
+  local fresh = mint_session(mint_ms())
+  pcall(llm_router.storage.set, SESSION_SCOPE, "ses", fresh)
+  pcall(llm_router.storage.set, SESSION_SCOPE, "ses_at", os.time())
+  return fresh
+end
+
+-- Deterministic encoder for the cache-key canonical form: object keys sort,
+-- arrays keep order, so equal conversations hash equal regardless of how the
+-- request tables were built.
+local function stable_encode(value)
+  local t = type(value)
+  if t == "string" then
+    local ok, enc = pcall(json.encode, value)
+    if ok then return enc end
+    return "\"\""
+  elseif t == "number" or t == "boolean" then
+    return tostring(value)
+  elseif t ~= "table" then
+    return "null"
+  end
+  local numeric, other, max_index = 0, 0, 0
+  for k, _ in pairs(value) do
+    if type(k) == "number" and k >= 1 and k % 1 == 0 then
+      numeric = numeric + 1
+      if k > max_index then max_index = k end
+    else
+      other = other + 1
+    end
+  end
+  if other == 0 and max_index == numeric then
+    local parts = {}
+    for i = 1, max_index do table.insert(parts, stable_encode(value[i])) end
+    return "[" .. table.concat(parts, ",") .. "]"
+  end
+  local keys = {}
+  for k, _ in pairs(value) do table.insert(keys, k) end
+  table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+  local parts = {}
+  for _, k in ipairs(keys) do
+    table.insert(parts, stable_encode(tostring(k)) .. ":" .. stable_encode(value[k]))
+  end
+  return "{" .. table.concat(parts, ",") .. "}"
+end
+
+-- Prefix-cache partition shared across turns: the key hashes the
+-- conversation root (model, first message, sorted tool names), which
+-- appends keep identical. The router may supply request.cache_key
+-- (Go-side hash); otherwise hash the canonical form here. Empty histories
+-- use a constant key.
+local CACHE_KEY_NAMESPACE = "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
+local CACHE_KEY_BOOT = "opencode-free-boot"
+
+local function prefix_cache_key(request, model)
+  if type(request.cache_key) == "string" and request.cache_key ~= "" then
+    return request.cache_key
+  end
+  if type(request.messages) ~= "table" or #request.messages == 0 then
+    return CACHE_KEY_BOOT
+  end
+  local names = {}
+  for _, t in ipairs(normalize_tools(request.tools)) do
+    local name = tool_name(t)
+    if name ~= "" then table.insert(names, name) end
+  end
+  table.sort(names)
+  local canonical = stable_encode({ model = model, first = request.messages[1], tools = names })
+  local ok, hashed = pcall(llm_router.uuid_v5, CACHE_KEY_NAMESPACE, canonical)
+  if ok and type(hashed) == "string" and hashed ~= "" then return hashed end
+  return CACHE_KEY_BOOT
 end
 
 -- Free tier is anonymous: every request carries Bearer public.
@@ -266,8 +371,9 @@ end
 -- on the id. Same sandbox state as the handler, reset on every call.
 local last_model_name = ""
 
--- Free-tier rate and quota limits apply to the exit IP. The router cools
--- down that proxy and retries the request through another exit.
+-- Free-tier rate limits apply to the exit IP; quota binds to the anonymous
+-- account. Plain rate limits cool the proxy down and retry through another
+-- exit; quota cools the credential down instead.
 local function classify_extension(raw, default_err)
   local body_str = tostring(raw.body or "")
   if raw.status == 401 and body_str:find("only be used from within OpenCode", 1, true) then
@@ -302,11 +408,14 @@ local function classify_extension(raw, default_err)
     or lower_body:find("freeusagelimiterror", 1, true) ~= nil
     or lower_body:find("quota", 1, true) ~= nil
     or lower_body:find("free usage", 1, true) ~= nil
+  -- Free-tier quota binds to the anonymous account, plain rate limits to
+  -- the exit IP. Quota cools the credential down; only plain rate limits
+  -- rotate proxies (same shape as opencode-zen).
   return {
     type = quota and "quota_exceeded" or "rate_limit",
     message = message,
     retry_after = default_err and default_err.retry_after or os.time() + 60,
-    scope = { "proxy" },
+    scope = quota and { "account" } or { "proxy" },
     upstream_status = raw.status,
     upstream_body = body_str,
   }
@@ -395,6 +504,15 @@ local function build_responses_input(messages)
         table.insert(input, { role = "user", content = { { type = "input_text", text = text } } })
       end
     elseif role == "assistant" then
+      -- Reasoning text round-trips so upstream reuses prior thinking
+      -- instead of re-reasoning every turn. Responses carry no encrypted
+      -- content through the chat protocol, so only the summary reshapes.
+      local rc = m.reasoning_content
+      if type(rc) ~= "string" or rc == "" then rc = m.reasoning end
+      if type(rc) == "string" and rc ~= "" then
+        debug_log("REASONING_PASSTHROUGH", "chars=" .. tostring(#rc))
+        table.insert(input, { type = "reasoning", summary = { { type = "summary_text", text = rc } } })
+      end
       local text = message_text(m)
       if text ~= "" then
         table.insert(input, { role = "assistant", content = { { type = "output_text", text = text } } })
@@ -451,15 +569,6 @@ local function has_client_tools(request)
   return #normalize_tools(request.tools) > 0
 end
 
-local function tool_name(t)
-  if type(t) ~= "table" then return "" end
-  if type(t["function"]) == "table" and type(t["function"].name) == "string" then
-    return t["function"].name
-  end
-  if type(t.name) == "string" then return t.name end
-  return ""
-end
-
 local function merge_tools(client_tools)
   local out = json.decode("[]")
   local seen = {}
@@ -481,7 +590,9 @@ end
 local function build_anon_chat_payload(request, model)
   local normalized_tools = normalize_tools(request.tools)
   local agent_path = has_history(request.messages) or #normalized_tools > 0
-  debug_log("TOOLS", "chat input shape=" .. table_shape(request.tools) .. " normalized=" .. tostring(#normalized_tools) .. " agent_path=" .. tostring(agent_path))
+  local tool_names = {}
+  for _, t in ipairs(normalized_tools) do table.insert(tool_names, tool_name(t)) end
+  debug_log("TOOLS", "chat input shape=" .. table_shape(request.tools) .. " normalized=" .. tostring(#normalized_tools) .. " agent_path=" .. tostring(agent_path) .. " tools=" .. table.concat(tool_names, ","))
   local messages = {}
   if agent_path then
     table.insert(messages, { role = "system", content = AGENT_SYS })
@@ -529,7 +640,9 @@ end
 local function build_anon_responses_payload(request, model)
   local normalized_tools = normalize_tools(request.tools)
   local agent_path = has_history(request.messages) or #normalized_tools > 0
-  debug_log("TOOLS", "responses input shape=" .. table_shape(request.tools) .. " normalized=" .. tostring(#normalized_tools) .. " agent_path=" .. tostring(agent_path))
+  local tool_names = {}
+  for _, t in ipairs(normalized_tools) do table.insert(tool_names, tool_name(t)) end
+  debug_log("TOOLS", "responses input shape=" .. table_shape(request.tools) .. " normalized=" .. tostring(#normalized_tools) .. " agent_path=" .. tostring(agent_path) .. " tools=" .. table.concat(tool_names, ","))
   local input = {}
   if agent_path then
     table.insert(input, { role = "developer", content = AGENT_SYS })
@@ -546,6 +659,9 @@ local function build_anon_responses_payload(request, model)
   }
   payload.max_output_tokens = output_token_budget(request)
   payload.store = false
+  -- Stable partition across turns: turn N+1 reuses turn N's prefix cache.
+  payload.prompt_cache_key = prefix_cache_key(request, model)
+  payload.include = { "reasoning.encrypted_content" }
   local effort = request.reasoning_effort
   if effort == "low" or effort == "medium" or effort == "high" or effort == "xhigh"
       or effort == "minimal" or effort == "max" then
@@ -623,6 +739,10 @@ local function assemble_responses_stream(body, model)
               prompt_tokens = r.usage.input_tokens or 0
               completion_tokens = r.usage.output_tokens or 0
               total_tokens = r.usage.total_tokens or (prompt_tokens + completion_tokens)
+              local details = r.usage.input_tokens_details
+              if type(details) == "table" and tonumber(details.cached_tokens) then
+                debug_log("CACHE", "cached_tokens=" .. tostring(details.cached_tokens) .. " input_tokens=" .. tostring(prompt_tokens))
+              end
             end
             if et == "response.incomplete" and type(r.incomplete_details) == "table"
                 and r.incomplete_details.reason == "max_output_tokens" then
@@ -785,7 +905,8 @@ llm_router.register("opencode-free", {
 
   get_model_infos = function(ctx, credential, provider_config)
     local client = llm_router.http_client({})
-    local ses, msg = mint_ids()
+    local ses = stable_session()
+    local msg = mint_msg(mint_ms())
     local headers = opencode_headers(ses, msg)
     local resp, err = client:request({
       method = "GET", url = BASE_URL .. "/models",
@@ -823,17 +944,21 @@ llm_router.register("opencode-free", {
 
     debug_log("COMPLETE", "model=" .. tostring(model) .. " full_model=" .. tostring(request.model) .. " endpoint=" .. tostring(endpoint) .. " request_tools=" .. table_shape(request.tools) .. " tools_count=" .. tostring(#normalize_tools(request.tools)) .. " messages=" .. tostring(type(request.messages) == "table" and #request.messages or -1) .. " tool_choice=" .. debug_json(request.tool_choice))
 
-    local ses, msg = mint_ids()
+    local ses = stable_session()
+    local msg = mint_msg(mint_ms())
 
     if endpoint == "/responses" then
       -- Anonymous Responses path: stream upstream like the genuine
       -- client and assemble the event stream into one completion.
+      -- Generations over large contexts run long; the wide timeout only
+      -- bounds dead connections, progress streams underneath it.
+      local resp_client = llm_router.http_client({ timeout_ms = 300000 })
       local payload = build_anon_responses_payload(request, model)
       local headers = opencode_headers(ses, msg)
       local body = debug_json(payload)
       print("[OPENCODE-FREE-DEBUG] responses tools body fragment: " .. tostring(payload.tools and debug_json(payload.tools) or "<absent>"))
       debug_log("HTTP", "POST " .. BASE_URL .. "/responses body_len=" .. tostring(#body))
-      local resp, err = client:request({
+      local resp, err = resp_client:request({
         method = "POST", url = BASE_URL .. "/responses",
         headers = headers, body = body,
       })
@@ -877,7 +1002,8 @@ llm_router.register("opencode-free", {
     last_model_name = model or ""
     local endpoint = endpoint_for_model(model)
     debug_log("STREAM", "model=" .. tostring(model) .. " full_model=" .. tostring(request.model) .. " endpoint=" .. tostring(endpoint) .. " request_tools=" .. table_shape(request.tools) .. " tools_count=" .. tostring(#normalize_tools(request.tools)) .. " messages=" .. tostring(type(request.messages) == "table" and #request.messages or -1))
-    local ses, msg = mint_ids()
+    local ses = stable_session()
+    local msg = mint_msg(mint_ms())
     local client = llm_router.http_client({})
     local full_model = request.model
 
@@ -919,41 +1045,113 @@ llm_router.register("opencode-free", {
     end
 
     if endpoint == "/responses" then
+      -- Anonymous Responses stream: forward upstream SSE as chat chunks
+      -- incrementally, like the chat path. Wide timeout: generations over
+      -- large contexts run long, progress streams underneath it.
+      local stream_client = llm_router.http_client({ timeout_ms = 300000 })
       local payload = build_anon_responses_payload(request, model)
       local headers = opencode_headers(ses, msg)
       local body = debug_json(payload)
       print("[OPENCODE-FREE-DEBUG] responses-stream tools body fragment: " .. tostring(payload.tools and debug_json(payload.tools) or "<absent>"))
       debug_log("HTTP_STREAM", "POST " .. BASE_URL .. "/responses body_len=" .. tostring(#body))
-      local resp, err = client:request({
+      local fn_state = {}
+      local usage = nil
+      local finish = "stop"
+      local saw_tools = false
+      local function fn_acc(index)
+        local acc = fn_state[index]
+        if not acc then
+          acc = { call_id = "", name = "", args = "", emitted = false }
+          fn_state[index] = acc
+        end
+        return acc
+      end
+      local _, stream_err = stream_client:stream({
         method = "POST", url = BASE_URL .. "/responses",
-        headers = headers, body = body,
+        headers = headers,
+        body = body,
+        on_response = function(r)
+          debug_log("HTTP_STREAM_RESPONSE", "status=" .. tostring(r.status))
+          if r.status ~= 200 then
+            return llm_router.classify_error({ status = r.status, headers = r.headers, body = r.body })
+          end
+        end,
+        on_line = function(line)
+          if line:sub(1, 6) ~= "data: " then return end
+          local data = line:sub(7)
+          if data == "[DONE]" or data == "" then return end
+          local ok, ev = pcall(json.decode, data)
+          if not ok or type(ev) ~= "table" or type(ev.type) ~= "string" then return end
+          local et = ev.type
+          if et == "response.output_text.delta" and type(ev.delta) == "string" and ev.delta ~= "" then
+            emit({ model = full_model, choices = { { index = 0, delta = { role = "assistant", content = ev.delta } } } })
+          elseif et == "response.reasoning_summary_text.delta" and type(ev.delta) == "string" and ev.delta ~= "" then
+            emit({ model = full_model, choices = { { index = 0, delta = { role = "assistant", reasoning_content = ev.delta } } } })
+          elseif (et == "response.output_item.added" or et == "response.output_item.done")
+              and type(ev.item) == "table" and ev.item.type == "function_call" then
+            local acc = fn_acc(ev.output_index or 0)
+            if type(ev.item.call_id) == "string" and ev.item.call_id ~= "" then acc.call_id = ev.item.call_id end
+            if type(ev.item.name) == "string" and ev.item.name ~= "" then acc.name = ev.item.name end
+            if type(ev.item.arguments) == "string" and ev.item.arguments ~= "" then acc.args = ev.item.arguments end
+            if et == "response.output_item.done" and acc.name ~= "" and not acc.emitted then
+              acc.emitted = true
+              saw_tools = true
+              emit({ model = full_model, choices = { { index = 0, delta = { role = "assistant", tool_calls = {
+                { id = acc.call_id, type = "function", ["function"] = { name = acc.name, arguments = acc.args } },
+              } } } } })
+            end
+          elseif et == "response.function_call_arguments.delta" and type(ev.delta) == "string" then
+            local acc_for_delta = fn_acc(ev.output_index or 0)
+            acc_for_delta.args = acc_for_delta.args .. ev.delta
+          elseif (et == "response.completed" or et == "response.incomplete")
+              and type(ev.response) == "table" then
+            local r = ev.response
+            if type(r.usage) == "table" then
+              usage = {
+                prompt_tokens = r.usage.input_tokens or 0,
+                completion_tokens = r.usage.output_tokens or 0,
+                total_tokens = r.usage.total_tokens or 0,
+              }
+              local details = r.usage.input_tokens_details
+              if type(details) == "table" and tonumber(details.cached_tokens) then
+                debug_log("CACHE", "cached_tokens=" .. tostring(details.cached_tokens) .. " input_tokens=" .. tostring(usage.prompt_tokens))
+              end
+            end
+            if et == "response.incomplete" then finish = "length" end
+          end
+        end,
       })
-      if err then
-        debug_log("HTTP_ERROR", debug_json(err))
-        return nil, err
+      if stream_err then
+        debug_log("HTTP_STREAM_ERROR", debug_json(stream_err))
+        return nil, stream_err
       end
-      debug_log("HTTP_RESPONSE", "status=" .. tostring(resp.status) .. " body_len=" .. tostring(type(resp.body) == "string" and #resp.body or -1) .. " body=" .. tostring(resp.body or ""))
-      if resp.status ~= 200 then
-        return nil, llm_router.classify_error({ status = resp.status, headers = resp.headers, body = resp.body })
+      -- Terminal chunk: finish reason plus usage. Tool calls emitted
+      -- above stay out; anything accumulated but unemitted rides here.
+      local order = {}
+      for idx, acc in pairs(fn_state) do
+        if acc.name ~= "" and not acc.emitted then table.insert(order, idx) end
       end
-      local full_resp = assemble_responses_stream(resp.body, request.model)
-      local choice = (full_resp.choices and full_resp.choices[1]) or {}
-      local msg_obj = choice.message or {}
-      local delta = { role = msg_obj.role or "assistant", content = msg_obj.content or "" }
-      if msg_obj.tool_calls and #msg_obj.tool_calls > 0 then
-        delta.tool_calls = msg_obj.tool_calls
+      table.sort(order)
+      local pending_calls = {}
+      for _, idx in ipairs(order) do
+        local acc = fn_state[idx]
+        saw_tools = true
+        table.insert(pending_calls, {
+          id = acc.call_id, type = "function",
+          ["function"] = { name = acc.name, arguments = acc.args },
+        })
       end
-      local chunk = {
-        id = full_resp.id or ("zen-" .. tostring(os.time())),
-        object = "chat.completion.chunk",
-        created = full_resp.created or os.time(),
-        model = full_resp.model or request.model,
-        choices = {
-          { index = 0, delta = delta, finish_reason = choice.finish_reason or "stop" }
-        },
-        usage = full_resp.usage,
-      }
+      local terminal = { index = 0, delta = { role = "assistant" }, finish_reason = finish }
+      if #pending_calls > 0 then
+        terminal.delta.tool_calls = pending_calls
+        terminal.finish_reason = "tool_calls"
+      elseif saw_tools then
+        terminal.finish_reason = "tool_calls"
+      end
+      local chunk = { model = full_model, choices = { terminal } }
+      if usage then chunk.usage = usage end
       emit(chunk)
+      debug_log("HTTP_STREAM_DONE", "responses stream completed")
       return
     end
   end,
