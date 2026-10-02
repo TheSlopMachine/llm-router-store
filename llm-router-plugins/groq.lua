@@ -1,6 +1,6 @@
 --- @plugin Groq
 --- @author TheSlopMachine
---- @version 3.0.0
+--- @version 3.0.1
 --- @router_version 0.3.0
 --- @description Groq OpenAI-compatible API: fast Llama/Qwen/gpt-oss inference, Whisper speech-to-text
 --- @allow_host api.groq.com
@@ -57,11 +57,11 @@ end
 
 -- Build the upstream payload from the OpenAI-shaped request table:
 -- pass everything through, fix the model id, pin the stream flag.
--- Router-only fields (model_name) never leave the plugin.
+-- Router-only fields (model_name, cache_key) never leave the plugin.
 local function build_payload(request, stream)
   local payload = {}
   for k, v in pairs(request) do
-    if k ~= "model_name" then payload[k] = v end
+    if k ~= "model_name" and k ~= "cache_key" then payload[k] = v end
   end
   payload.model = request.model_name
   payload.stream = stream
