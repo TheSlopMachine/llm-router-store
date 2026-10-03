@@ -1,6 +1,6 @@
 --- @plugin OpenCode Zen
 --- @author TheSlopMachine
---- @version 4.1.0
+--- @version 4.1.1
 --- @router_version 0.3.0
 --- @description OpenAI/Anthropic/Google compatible paid provider OpenCode Zen (API key required)
 --- @allow_host opencode.ai
@@ -175,6 +175,7 @@ local FALLBACK_MODELS = {
 -- at compile time, so a later local would resolve to a nil global.)
 local function supports_reasoning(name)
   local m = name:lower()
+  if m == "gemini-3-flash" then return false end
   if m:find("claude") then return true end
   if m:find("^gpt%-5") or m:match("^o[0-9]") then return true end
   if m:find("gemini") and not m:find("tts") and not m:find("image") then return true end
@@ -190,6 +191,9 @@ local function with_limits(infos)
     m.tpm = 100000
     m.rpd = 500
     m.supported_parameters = { "tools", "tool_choice", "response_format", "temperature", "top_p", "max_tokens" }
+    m.input_modalities = { "text" }
+    m.output_modalities = { "text" }
+    m.endpoints = { "chat/completions" }
     if supports_reasoning(m.name or "") then
       m.reasoning = { default_enabled = true, supported_efforts = { "high", "medium", "low" } }
     end

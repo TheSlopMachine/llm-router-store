@@ -1,6 +1,6 @@
 --- @plugin Kiro AI
 --- @author TheSlopMachine
---- @version 3.3.0
+--- @version 3.3.1
 --- @router_version 0.3.0
 --- @description AWS Kiro models via device login (OAuth2 with proactive refresh)
 --- @allow_host codewhisperer.us-east-1.amazonaws.com
@@ -100,6 +100,9 @@ local function parse_model_list(body)
           name = id, display_name = name,
           context_window = context, max_tokens = 32000,
           supported_parameters = { "tools" },
+          input_modalities = { "text" },
+          output_modalities = { "text" },
+          endpoints = { "chat/completions" },
         })
       end
     end
@@ -177,6 +180,9 @@ local function with_thinking_variants(models)
         name = m.name .. "-thinking", display_name = m.display_name .. " (Thinking)",
         context_window = m.context_window, max_tokens = m.max_tokens,
         supported_parameters = { "tools" },
+        input_modalities = { "text" },
+        output_modalities = { "text" },
+        endpoints = { "chat/completions" },
         reasoning = { default_enabled = true, supported_efforts = { "max", "xhigh", "high", "medium", "low" } },
       })
     end

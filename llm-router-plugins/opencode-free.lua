@@ -1,6 +1,6 @@
 --- @plugin OpenCode Free
 --- @author TheSlopMachine
---- @version 4.5
+--- @version 4.6
 --- @router_version 0.3.4
 --- @description OpenAI/Anthropic/Google compatible free provider OpenCode Free (no key required)
 --- @allow_host opencode.ai
@@ -463,6 +463,9 @@ local function with_limits(infos)
     m.tpm = 100000
     m.rpd = 500
     m.supported_parameters = { "tools", "tool_choice", "response_format", "temperature", "top_p", "max_tokens" }
+    m.input_modalities = { "text" }
+    m.output_modalities = { "text" }
+    m.endpoints = { "chat/completions" }
     if supports_reasoning(m.name or "") then
       m.reasoning = { default_enabled = true, supported_efforts = { "high", "medium", "low" } }
     end
@@ -1161,6 +1164,8 @@ llm_router.register("opencode-free", {
   model_specs = {
     ["mimo-v2.5-free"] = {
       reasoning = { supported_efforts = { "high", "max" } },
+      input_modalities = { "text", "image" },
+      output_modalities = { "text" },
     },
     ["muse-spark-1.2-contributor-free"] = {
       reasoning = { supported_efforts = { "minimal", "low", "medium", "high", "xhigh" } },
