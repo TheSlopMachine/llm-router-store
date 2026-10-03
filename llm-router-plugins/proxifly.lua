@@ -1,10 +1,9 @@
 --- @plugin Proxifly Proxy List
 --- @author TheSlopMachine
---- @version 4.0.0
---- @router_version 0.3.0
+--- @version 5.0.0
+--- @router_version 0.7.0
 --- @description Free HTTP proxy list from proxifly (proxies/protocols/http/data.json)
 --- @allow_host cdn.jsdelivr.net
---- @proxy_source true
 
 local LIST_URL = "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.json"
 local CACHE_SCOPE = "proxy_list"
@@ -31,11 +30,11 @@ llm_router.register_proxy_source("proxifly", {
       return nil
     end
     if resp.status ~= 200 then
-      return nil, { type = "upstream", message = "proxifly list: status " .. resp.status }
+      return nil, { message = "proxifly list: status " .. resp.status, code = "server_error", status = resp.status }
     end
     local ok, entries = pcall(json.decode, resp.body)
     if not ok or type(entries) ~= "table" then
-      return nil, { type = "upstream", message = "proxifly list: invalid json" }
+      return nil, { message = "proxifly list: invalid json", code = "server_error", status = 502 }
     end
     local response_headers = resp.headers or {}
     if type(response_headers.etag) == "string" then

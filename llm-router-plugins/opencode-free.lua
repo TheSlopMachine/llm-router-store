@@ -1,7 +1,7 @@
 --- @plugin OpenCode Free
 --- @author TheSlopMachine
---- @version 4.6
---- @router_version 0.3.4
+--- @version 5.0.1
+--- @router_version 0.7.0
 --- @description OpenAI/Anthropic/Google compatible free provider OpenCode Free (no key required)
 --- @allow_host opencode.ai
 
@@ -247,8 +247,8 @@ local function stable_session()
   if ok2 and tonumber(v2) then at = tonumber(v2) end
   if ses ~= nil and os.time() - at < SESSION_TTL then return ses end
   local fresh = mint_session(mint_ms())
-  pcall(llm_router.storage.set, SESSION_SCOPE, "ses", fresh)
-  pcall(llm_router.storage.set, SESSION_SCOPE, "ses_at", os.time())
+  pcall(llm_router.storage.set, SESSION_SCOPE, "ses", fresh, { ttl = SESSION_TTL })
+  pcall(llm_router.storage.set, SESSION_SCOPE, "ses_at", os.time(), { ttl = SESSION_TTL })
   return fresh
 end
 
@@ -367,58 +367,60 @@ local function is_free_model(id)
   return KNOWN_FREE[id] == true
 end
 
--- Model of the in-flight handler call, for classify decisions that depend
--- on the id. Same sandbox state as the handler, reset on every call.
-local last_model_name = ""
+local function pick_proxies(ctx, limit)
+  -- Unconfigured providers go direct: only an explicit pool selection
+  -- (dashboard proxy switch) routes through pooled exits.
+  local pool = nil
+  if ctx.provider_config and ctx.provider_config.proxy
+    and ctx.provider_config.proxy.pool ~= "" then
+    pool = ctx.provider_config.proxy.pool
+  end
+  local proxies = llm_router.proxies.query({ pool = pool, limit = limit or 3 })
+  if #proxies == 0 then
+    -- Empty pool degrades to one direct attempt, never to silence.
+    return { {} }
+  end
+  return proxies
+end
 
--- Free-tier rate limits apply to the exit IP; quota binds to the anonymous
--- account. Plain rate limits cool the proxy down and retry through another
--- exit; quota cools the credential down instead.
-local function classify_extension(raw, default_err)
-  local body_str = tostring(raw.body or "")
-  if raw.status == 401 and body_str:find("only be used from within OpenCode", 1, true) then
-    local message = default_err and default_err.message or body_str
-    return {
-      type = "upstream",
-      message = message,
-      upstream_status = raw.status,
-      upstream_body = body_str,
-    }
+-- Free-tier mapping. The tier is anonymous: quota binds to the shared
+-- account and ends the request, plain rate limits bind to the exit IP and
+-- retry through another exit. Outcomes: "proxy" tries the next exit,
+-- "done" returns the terminal error at once.
+local function map_upstream(resp, model_name)
+  local body_str = tostring(resp.body or "")
+  if resp.status == 401 and body_str:find("only be used from within OpenCode", 1, true) then
+    return "done", { message = "free tier rejected the client fingerprint", code = "server_error", status = 401 }
   end
   -- Paid models answer 401 without an API key binding on the anonymous
-  -- tier. Cool the model down instead of disabling the credential as
-  -- auth would. Free-tier 401s keep the core auth verdict.
-  if raw.status == 401 and not is_free_model(last_model_name) then
-    local message = default_err and default_err.message or body_str
-    return {
-      type = "model_unavailable",
-      message = message,
-      upstream_status = raw.status,
-      upstream_body = body_str,
-    }
+  -- tier: fail the request, never mark anything.
+  if resp.status == 401 and not is_free_model(model_name) then
+    return "done", { message = "model '" .. tostring(model_name) .. "' is not available on the free tier",
+      code = "invalid_request_error", status = 401 }
   end
-  if raw.status == 426 then
-    local message = default_err and default_err.message or body_str
-    return { type = "auth", message = message, upstream_status = raw.status, upstream_body = body_str }
+  if resp.status == 401 then
+    return "done", { message = "free tier rejected the anonymous credential",
+      code = "authentication_error", status = 401 }
   end
-  if raw.status ~= 429 then return nil end
-  local message = default_err and default_err.message or body_str
-  local lower_body = body_str:lower()
-  local quota = default_err and default_err.type == "quota_exceeded"
-    or lower_body:find("freeusagelimiterror", 1, true) ~= nil
-    or lower_body:find("quota", 1, true) ~= nil
-    or lower_body:find("free usage", 1, true) ~= nil
-  -- Free-tier quota binds to the anonymous account, plain rate limits to
-  -- the exit IP. Quota cools the credential down; only plain rate limits
-  -- rotate proxies (same shape as opencode-zen).
-  return {
-    type = quota and "quota_exceeded" or "rate_limit",
-    message = message,
-    retry_after = default_err and default_err.retry_after or os.time() + 60,
-    scope = quota and { "account" } or { "proxy" },
-    upstream_status = raw.status,
-    upstream_body = body_str,
-  }
+  if resp.status == 426 then
+    return "done", { message = "free-tier client upgrade required",
+      code = "authentication_error", status = 426 }
+  end
+  if resp.status == 429 then
+    local lower_body = body_str:lower()
+    if lower_body:find("freeusagelimiterror", 1, true) ~= nil
+        or lower_body:find("quota", 1, true) ~= nil
+        or lower_body:find("free usage", 1, true) ~= nil then
+      return "done", { message = "free-tier quota exhausted", code = "insufficient_quota", status = 429 }
+    end
+    return "proxy", { message = "free tier rate limited on current exit", code = "rate_limit", status = 429 }
+  end
+  if resp.status == 400 or resp.status == 404 or resp.status == 422 then
+    return "done", { message = "free tier rejected the request with status " .. tostring(resp.status),
+      code = "invalid_request_error", status = resp.status }
+  end
+  return "done", { message = "free tier returned status " .. tostring(resp.status),
+    code = "server_error", status = resp.status }
 end
 
 -- Free models only: the anonymous /models listing serves the free tier.
@@ -885,28 +887,26 @@ local function assemble_chat_response(body, model)
   }
 end
 
+-- One upstream fetch: returns (body) or (nil, action, err) where action is
+-- "retry" (next exit) or "done" (terminal, return at once).
+local function fetch_body(client, url, headers, body, model_name, proxy_url)
+  local resp, err = client:request({
+    method = "POST", url = url,
+    headers = headers, body = body,
+    proxy_url = proxy_url,
+  })
+  if err then return nil, "retry", err end
+  if resp.status == 200 then return resp.body end
+  local action, terr = map_upstream(resp, model_name)
+  return nil, action, terr
+end
+
 llm_router.register("opencode-free", {
   icon = "https://opencode.ai/favicon.ico",
 
-  classify_error = classify_extension,
+  proxy_schema = {},
 
-  credential_schema = function()
-    return {
-      { type = "section", title = "OpenCode Free",
-        content = {
-          { type = "banner", variant = "info",
-            text = "No key needed. Free models only." },
-          { type = "button", text = "Save", form_action = "submit" },
-        } },
-    }
-  end,
-
-  -- Free tier carries no key: legacy stored keys validate as-is and are ignored.
-  validate_credentials = function(data)
-    return true
-  end,
-
-  get_model_infos = function(ctx, credential, provider_config)
+  get_model_infos = function(ctx)
     local client = llm_router.http_client({})
     local ses = stable_session()
     local msg = mint_msg(mint_ms())
@@ -939,76 +939,70 @@ llm_router.register("opencode-free", {
     return with_limits(infos)
   end,
 
-  complete = function(ctx, credential, request)
+  complete = function(ctx, request)
     local model = request.model_name
-    last_model_name = model or ""
     local endpoint = endpoint_for_model(model)
     local client = llm_router.http_client({})
+    local last_err = nil
 
     debug_log("COMPLETE", "model=" .. tostring(model) .. " full_model=" .. tostring(request.model) .. " endpoint=" .. tostring(endpoint) .. " request_tools=" .. table_shape(request.tools) .. " tools_count=" .. tostring(#normalize_tools(request.tools)) .. " messages=" .. tostring(type(request.messages) == "table" and #request.messages or -1) .. " tool_choice=" .. debug_json(request.tool_choice))
 
-    local ses = stable_session()
-    local msg = mint_msg(mint_ms())
+    for _, px in ipairs(pick_proxies(ctx, 3)) do
+      local ses = stable_session()
+      local msg = mint_msg(mint_ms())
 
-    if endpoint == "/responses" then
-      -- Anonymous Responses path: stream upstream like the genuine
-      -- client and assemble the event stream into one completion.
-      -- Generations over large contexts run long; the wide timeout only
-      -- bounds dead connections, progress streams underneath it.
-      local resp_client = llm_router.http_client({ timeout_ms = 300000 })
-      local payload = build_anon_responses_payload(request, model)
-      local headers = opencode_headers(ses, msg)
-      local body = debug_json(payload)
-      print("[OPENCODE-FREE-DEBUG] responses tools body fragment: " .. tostring(payload.tools and debug_json(payload.tools) or "<absent>"))
-      debug_log("HTTP", "POST " .. BASE_URL .. "/responses body_len=" .. tostring(#body))
-      local resp, err = resp_client:request({
-        method = "POST", url = BASE_URL .. "/responses",
-        headers = headers, body = body,
-      })
-      if err then
+      if endpoint == "/responses" then
+        -- Anonymous Responses path: stream upstream like the genuine
+        -- client and assemble the event stream into one completion.
+        -- Generations over large contexts run long; the wide timeout only
+        -- bounds dead connections, progress streams underneath it.
+        local resp_client = llm_router.http_client({ timeout_ms = 300000 })
+        local payload = build_anon_responses_payload(request, model)
+        local headers = opencode_headers(ses, msg)
+        local body = debug_json(payload)
+        print("[OPENCODE-FREE-DEBUG] responses tools body fragment: " .. tostring(payload.tools and debug_json(payload.tools) or "<absent>"))
+        debug_log("HTTP", "POST " .. BASE_URL .. "/responses body_len=" .. tostring(#body))
+        local raw_body, action, err = fetch_body(resp_client, BASE_URL .. "/responses", headers, body, model, px.url)
+        if raw_body then
+          return assemble_responses_stream(raw_body, request.model)
+        end
         debug_log("HTTP_ERROR", debug_json(err))
-        return nil, err
+        if action == "done" then return nil, err end
+        last_err = err
+      else
+        -- Anonymous chat path: the free-tier gate only serves stream:true
+        -- requests shaped like the genuine client, so always stream upstream
+        -- and assemble the SSE body into one completion here.
+        local payload = build_anon_chat_payload(request, model)
+        local headers = opencode_headers(ses, msg)
+        local body = debug_json(payload)
+        print("[OPENCODE-FREE-DEBUG] chat tools body fragment: " .. tostring(payload.tools and debug_json(payload.tools) or "<absent>"))
+        debug_log("HTTP", "POST " .. BASE_URL .. "/chat/completions body_len=" .. tostring(#body))
+        local raw_body, action, err = fetch_body(client, BASE_URL .. "/chat/completions", headers, body, model, px.url)
+        if raw_body then
+          return assemble_chat_response(raw_body, request.model)
+        end
+        debug_log("HTTP_ERROR", debug_json(err))
+        if action == "done" then return nil, err end
+        last_err = err
       end
-      debug_log("HTTP_RESPONSE", "status=" .. tostring(resp.status) .. " body_len=" .. tostring(type(resp.body) == "string" and #resp.body or -1) .. " body=" .. tostring(resp.body or ""))
-      if resp.status ~= 200 then
-        return nil, llm_router.classify_error({ status = resp.status, headers = resp.headers, body = resp.body })
-      end
-      return assemble_responses_stream(resp.body, request.model)
     end
-
-    -- Anonymous chat path: the free-tier gate only serves stream:true
-    -- requests shaped like the genuine client, so always stream upstream
-    -- and assemble the SSE body into one completion here.
-    local payload = build_anon_chat_payload(request, model)
-    local headers = opencode_headers(ses, msg)
-    local body = debug_json(payload)
-    print("[OPENCODE-FREE-DEBUG] chat tools body fragment: " .. tostring(payload.tools and debug_json(payload.tools) or "<absent>"))
-    debug_log("HTTP", "POST " .. BASE_URL .. "/chat/completions body_len=" .. tostring(#body))
-    local resp, err = client:request({
-      method = "POST", url = BASE_URL .. "/chat/completions",
-      headers = headers,
-      body = body,
-    })
-    if err then
-      debug_log("HTTP_ERROR", debug_json(err))
-      return nil, err
-    end
-    debug_log("HTTP_RESPONSE", "status=" .. tostring(resp.status) .. " body_len=" .. tostring(type(resp.body) == "string" and #resp.body or -1) .. " body=" .. tostring(resp.body or ""))
-    if resp.status ~= 200 then
-      return nil, llm_router.classify_error({ status = resp.status, headers = resp.headers, body = resp.body })
-    end
-    return assemble_chat_response(resp.body, request.model)
+    return nil, last_err or { message = "all free-tier exits exhausted", code = "server_error" }
   end,
 
-  complete_stream = function(ctx, credential, request, emit)
+  complete_stream = function(ctx, request, emit)
     local model = request.model_name
-    last_model_name = model or ""
     local endpoint = endpoint_for_model(model)
     debug_log("STREAM", "model=" .. tostring(model) .. " full_model=" .. tostring(request.model) .. " endpoint=" .. tostring(endpoint) .. " request_tools=" .. table_shape(request.tools) .. " tools_count=" .. tostring(#normalize_tools(request.tools)) .. " messages=" .. tostring(type(request.messages) == "table" and #request.messages or -1))
-    local ses = stable_session()
-    local msg = mint_msg(mint_ms())
     local client = llm_router.http_client({})
     local full_model = request.model
+    local last_err = nil
+
+    for _, px in ipairs(pick_proxies(ctx, 3)) do
+      local ses = stable_session()
+      local msg = mint_msg(mint_ms())
+      local done = false
+      local fatal = false
 
     if endpoint == "/chat/completions" then
       local payload = build_anon_chat_payload(request, model)
@@ -1020,10 +1014,13 @@ llm_router.register("opencode-free", {
         method = "POST", url = BASE_URL .. "/chat/completions",
         headers = headers,
         body = body,
+        proxy_url = px.url,
         on_response = function(r)
           debug_log("HTTP_STREAM_RESPONSE", "status=" .. tostring(r.status) .. " body=" .. tostring(r.body or ""))
           if r.status ~= 200 then
-            return llm_router.classify_error({ status = r.status, headers = r.headers, body = r.body })
+            local action, terr = map_upstream(r, model)
+            if action == "done" then fatal = true end
+            return terr
           end
         end,
         on_line = function(line)
@@ -1037,14 +1034,18 @@ llm_router.register("opencode-free", {
           if not has_choices and chunk.usage == nil then return end
           chunk.model = full_model
           emit(chunk)
+          done = true
         end,
       })
       if stream_err then
         debug_log("HTTP_STREAM_ERROR", debug_json(stream_err))
-        return nil, stream_err
+        last_err = stream_err
+        if fatal then return nil, last_err end
+        if done then return nil, last_err end
+      else
+        debug_log("HTTP_STREAM_DONE", "chat stream completed")
+        return
       end
-      debug_log("HTTP_STREAM_DONE", "chat stream completed")
-      return
     end
 
     if endpoint == "/responses" then
@@ -1073,10 +1074,13 @@ llm_router.register("opencode-free", {
         method = "POST", url = BASE_URL .. "/responses",
         headers = headers,
         body = body,
+        proxy_url = px.url,
         on_response = function(r)
           debug_log("HTTP_STREAM_RESPONSE", "status=" .. tostring(r.status))
           if r.status ~= 200 then
-            return llm_router.classify_error({ status = r.status, headers = r.headers, body = r.body })
+            local action, terr = map_upstream(r, model)
+            if action == "done" then fatal = true end
+            return terr
           end
         end,
         on_line = function(line)
@@ -1088,8 +1092,10 @@ llm_router.register("opencode-free", {
           local et = ev.type
           if et == "response.output_text.delta" and type(ev.delta) == "string" and ev.delta ~= "" then
             emit({ model = full_model, choices = { { index = 0, delta = { role = "assistant", content = ev.delta } } } })
+            done = true
           elseif et == "response.reasoning_summary_text.delta" and type(ev.delta) == "string" and ev.delta ~= "" then
             emit({ model = full_model, choices = { { index = 0, delta = { role = "assistant", reasoning_content = ev.delta } } } })
+            done = true
           elseif (et == "response.output_item.added" or et == "response.output_item.done")
               and type(ev.item) == "table" and ev.item.type == "function_call" then
             local acc = fn_acc(ev.output_index or 0)
@@ -1102,6 +1108,7 @@ llm_router.register("opencode-free", {
               emit({ model = full_model, choices = { { index = 0, delta = { role = "assistant", tool_calls = {
                 { id = acc.call_id, type = "function", ["function"] = { name = acc.name, arguments = acc.args } },
               } } } } })
+              done = true
             end
           elseif et == "response.function_call_arguments.delta" and type(ev.delta) == "string" then
             local acc_for_delta = fn_acc(ev.output_index or 0)
@@ -1126,37 +1133,42 @@ llm_router.register("opencode-free", {
       })
       if stream_err then
         debug_log("HTTP_STREAM_ERROR", debug_json(stream_err))
-        return nil, stream_err
-      end
-      -- Terminal chunk: finish reason plus usage. Tool calls emitted
-      -- above stay out; anything accumulated but unemitted rides here.
-      local order = {}
-      for idx, acc in pairs(fn_state) do
-        if acc.name ~= "" and not acc.emitted then table.insert(order, idx) end
-      end
-      table.sort(order)
-      local pending_calls = {}
-      for _, idx in ipairs(order) do
-        local acc = fn_state[idx]
-        saw_tools = true
-        table.insert(pending_calls, {
-          id = acc.call_id, type = "function",
-          ["function"] = { name = acc.name, arguments = acc.args },
-        })
-      end
-      local terminal = { index = 0, delta = { role = "assistant" }, finish_reason = finish }
-      if #pending_calls > 0 then
-        terminal.delta.tool_calls = pending_calls
-        terminal.finish_reason = "tool_calls"
-      elseif saw_tools then
-        terminal.finish_reason = "tool_calls"
-      end
-      local chunk = { model = full_model, choices = { terminal } }
-      if usage then chunk.usage = usage end
-      emit(chunk)
+        last_err = stream_err
+        if fatal then return nil, last_err end
+        if done then return nil, last_err end
+      else
+        -- Terminal chunk: finish reason plus usage. Tool calls emitted
+        -- above stay out; anything accumulated but unemitted rides here.
+        local order = {}
+        for idx, acc in pairs(fn_state) do
+          if acc.name ~= "" and not acc.emitted then table.insert(order, idx) end
+        end
+        table.sort(order)
+        local pending_calls = {}
+        for _, idx in ipairs(order) do
+          local acc = fn_state[idx]
+          saw_tools = true
+          table.insert(pending_calls, {
+            id = acc.call_id, type = "function",
+            ["function"] = { name = acc.name, arguments = acc.args },
+          })
+        end
+        local terminal = { index = 0, delta = { role = "assistant" }, finish_reason = finish }
+        if #pending_calls > 0 then
+          terminal.delta.tool_calls = pending_calls
+          terminal.finish_reason = "tool_calls"
+        elseif saw_tools then
+          terminal.finish_reason = "tool_calls"
+        end
+        local chunk = { model = full_model, choices = { terminal } }
+        if usage then chunk.usage = usage end
+        emit(chunk)
       debug_log("HTTP_STREAM_DONE", "responses stream completed")
       return
+      end
     end
+    end
+    return nil, last_err or { message = "all free-tier exits exhausted", code = "server_error" }
   end,
 
   -- Verified reasoning support the upstream catalog does not advertise.

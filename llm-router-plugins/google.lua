@@ -1,49 +1,103 @@
 --- @plugin Google AI Studio
 --- @author TheSlopMachine
---- @version 3.1.0
---- @router_version 0.3.0
+--- @version 4.0.5
+--- @router_version 0.7.0
 --- @description Google Gemini models via AI Studio API
 --- @allow_host generativelanguage.googleapis.com
---- @proxy_location US
 
 local BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
--- Google specifics the core default does not know: geo/auth wording on
--- 400s, and the exhausted dimensions of 429s. Delay parsing (retry-after
--- header, "retry in Ns/ms" body) and quota wording live in the core helper.
-local function classify_extension(raw, default_err)
-  if raw.status == 400 then
-    local message = default_err and default_err.message or tostring(raw.body)
-    local lower = string.lower(message)
-    if string.find(lower, "location is not supported", 1, true) then
-      -- Geo-blocked: the proxy exit is at fault, not the request.
-      return { type = "geo", message = message, upstream_status = raw.status, upstream_body = tostring(raw.body) }
-    end
-    if string.find(lower, "api key not valid", 1, true)
-        or string.find(lower, "api_key_invalid", 1, true)
-        or string.find(lower, "invalid api key", 1, true)
-        or string.find(lower, "unauthenticated", 1, true) then
-      return { type = "auth", message = message, upstream_status = raw.status, upstream_body = tostring(raw.body) }
-    end
-    return nil
-  end
-  if raw.status ~= 429 then return nil end
-  -- 0.3.0 contract: rate/quota tables require a future retry_after.
-  -- default_err always carries one (core fallback); the literal fallback
-  -- below only fires when the core has nothing to say.
-  local err = default_err or { type = "rate_limit", message = tostring(raw.body), retry_after = os.time() + 60 }
-  -- Gemini quotas bind to the key+model pair; other models on the key serve on.
-  err.scope = { "account", "model" }
-  return err
-end
-
-local function api_key_of(credential)
-  if credential == nil or credential.data == nil then return "" end
-  return credential.data.api_key or ""
+local function api_key_of(data)
+  if type(data) ~= "table" then return "" end
+  return data.api_key or ""
 end
 
 local function invalid_request(message)
-  return { type = "invalid_request", message = message }
+  return { message = message, code = "invalid_request_error", status = 400 }
+end
+
+-- Dead-key bench: shared disable when automation is on (visible in the
+-- dashboard, global to every path), unified cooldown park otherwise.
+local function bench(ctx, cred_id, reason, wait_secs)
+  local cfg = ctx.provider_config or {}
+  if cfg.disable_failed_credentials == true then
+    llm_router.credentials.disable(cred_id, reason)
+  else
+    llm_router.credentials.park(cred_id, wait_secs, reason)
+  end
+end
+
+local function retry_after_secs(resp)
+  local headers = resp.headers or {}
+  local raw = headers["retry-after"] or headers["retry_after"]
+  local n = tonumber(raw)
+  if n ~= nil and n > 0 then return math.floor(n) end
+  local body = tostring(resp.body or "")
+  local secs, unit = body:match("retry in (%d+)%s*(%a*)")
+  secs = tonumber(secs)
+  if secs ~= nil and secs > 0 then
+    if unit == "ms" then return math.max(1, math.floor(secs / 1000)) end
+    return secs
+  end
+  return 60
+end
+
+-- Gemini serves US exits: proxy selection filters the pool accordingly.
+-- Unconfigured providers go direct: only an explicit pool selection
+-- (dashboard proxy switch) routes through pooled exits.
+local function pick_proxies(ctx, limit)
+  local pool = nil
+  if ctx.provider_config and ctx.provider_config.proxy
+    and ctx.provider_config.proxy.pool ~= "" then
+    pool = ctx.provider_config.proxy.pool
+  end
+  local proxies = llm_router.proxies.query({ pool = pool, country = "US", limit = limit or 3 })
+  if #proxies == 0 then
+    -- Empty pool degrades to one direct attempt, never to silence. A
+    -- non-US direct egress fails loudly as a location block below.
+    return { {} }
+  end
+  return proxies
+end
+
+-- Google specifics: geo/auth wording on 400s, key+model-bound quotas.
+-- Outcomes map to loop decisions: "proxy" retries the same credential on
+-- the next exit, "cred" moves to the next credential, "done" returns the
+-- terminal error to the client at once.
+local function map_upstream(ctx, resp, cred_id)
+  local lower = string.lower(tostring(resp.body or ""))
+  local status = resp.status
+  if status == 400 and string.find(lower, "location is not supported", 1, true) then
+    -- Geo-blocked: the proxy exit is at fault, not the request.
+    return "proxy", { message = "gemini location block on current exit", code = "server_error", status = 502 }
+  end
+  if status == 400 and (string.find(lower, "api key not valid", 1, true)
+      or string.find(lower, "api_key_invalid", 1, true)
+      or string.find(lower, "invalid api key", 1, true)
+      or string.find(lower, "unauthenticated", 1, true)) then
+    bench(ctx, cred_id, "gemini rejected the api key", 300)
+    return "cred", { message = "gemini rejected the api key", code = "authentication_error", status = 401 }
+  end
+  if status == 401 then
+    bench(ctx, cred_id, "gemini rejected the api key", 300)
+    return "cred", { message = "gemini rejected the api key", code = "authentication_error", status = 401 }
+  end
+  if status == 429 then
+    -- Gemini quotas bind to the key+model pair; other models on the key
+    -- serve on. The park is per credential; the model dimension stays in
+    -- the request the caller already scopes.
+    llm_router.credentials.park(cred_id, retry_after_secs(resp), "gemini rate limited")
+    return "cred", { message = "gemini rate limited", code = "rate_limit", status = 429 }
+  end
+  if status == 404 then
+    return "done", { message = "gemini model not found", code = "not_found", status = 404 }
+  end
+  if status == 400 or status == 422 then
+    return "done", { message = "gemini rejected the request with status " .. tostring(status),
+      code = "invalid_request_error", status = status }
+  end
+  return "proxy", { message = "gemini returned status " .. tostring(status),
+    code = "server_error", status = status }
 end
 
 local function map_finish_reason(r)
@@ -776,42 +830,93 @@ end
 local function blocked_error(g)
   if g and g.promptFeedback and g.promptFeedback.blockReason then
     -- Content rejected by upstream policy, not a malformed request.
-    return nil, { type = "content_policy", message = "prompt blocked: " .. tostring(g.promptFeedback.blockReason) }
+    return nil, { message = "prompt blocked: " .. tostring(g.promptFeedback.blockReason), code = "content_filter", status = 400 }
   end
-  return nil, { type = "upstream", message = "upstream returned no generated content" }
+  return nil, { message = "upstream returned no generated content", code = "server_error", status = 502 }
+end
+
+-- Shared unary completion assembly: Gemini candidate → OpenAI response.
+local function assemble_completion(body, full_model)
+  local g = json.decode(body)
+  if (not g.candidates or #g.candidates == 0) and g.promptFeedback and g.promptFeedback.blockReason then
+    return nil, { message = "prompt blocked: " .. tostring(g.promptFeedback.blockReason),
+      code = "content_filter", status = 400 }
+  end
+  local choices = {}
+  if g.candidates and #g.candidates > 0 then
+    local cand = g.candidates[1]
+    local out = { text = {}, reasoning = {}, toolcalls = {} }
+    collect_parts(cand, out, { n = 0 })
+    local message = { role = "assistant", content = table.concat(out.text, "") }
+    if #out.reasoning > 0 then
+      message.reasoning_content = table.concat(out.reasoning, "")
+    end
+    if #out.toolcalls > 0 then
+      local calls = {}
+      for _, tc in ipairs(out.toolcalls) do
+        local call = {
+          id = tc.id, type = "function",
+          ["function"] = { name = tc.name, arguments = tc.arguments },
+        }
+        -- Preserve thought_signature for round-trip back to Gemini
+        if tc.thought_signature then
+          if call.extra_content == nil then call.extra_content = {} end
+          if call.extra_content.google == nil then call.extra_content.google = {} end
+          call.extra_content.google.thought_signature = tc.thought_signature
+        end
+        table.insert(calls, call)
+      end
+      message.tool_calls = calls
+    end
+    local finish = map_finish_reason(cand.finishReason or "")
+    if #out.toolcalls > 0 then finish = "tool_calls" end
+    table.insert(choices, {
+      index = cand.index or 0,
+      message = message,
+      finish_reason = finish,
+    })
+  end
+  return {
+    id = (g.responseId and g.responseId ~= "") and g.responseId or ("google-" .. tostring(os.time())),
+    object = "chat.completion", created = os.time(),
+    model = full_model, choices = choices,
+    usage = build_usage(g.usageMetadata) or { prompt_tokens = 0, completion_tokens = 0, total_tokens = 0 },
+  }
 end
 
 llm_router.register("google", {
   icon = "https://www.gstatic.com/lamda/images/favicon_v1_150160cddff7f294ce30.svg",
 
-  classify_error = classify_extension,
+  proxy_schema = {},
 
-  credential_schema = function()
-    return {
-      { type = "section", title = "Google AI Studio",
-        subtitle = "Get your API key from Google AI Studio.",
-        content = {
-          { type = "link", text = "Open AI Studio", url = "https://aistudio.google.com/app/apikey" },
-          { type = "secret", name = "api_key", label = "API Key", required = true },
-          { type = "button", text = "Save", form_action = "submit" },
-        } },
-    }
-  end,
+  credential_schema = {
+    { type = "section", title = "Google AI Studio",
+      subtitle = "Get your API key from Google AI Studio.",
+      content = {
+        { type = "link", text = "Open AI Studio", url = "https://aistudio.google.com/app/apikey" },
+        { type = "secret", name = "api_key", label = "API Key", required = true },
+        { type = "button", text = "Save", form_action = "submit" },
+      } },
+  },
 
   validate_credentials = function(data)
     local key = data.api_key
     if key == nil or key == "" then
-      return false, { type = "invalid_request", message = "api_key is required" }
+      return false, { message = "api_key is required", code = "invalid_request_error" }
     end
     if #key < 20 then
-      return false, { type = "invalid_request", message = "api_key: minimum 20 characters" }
+      return false, { message = "api_key: minimum 20 characters", code = "invalid_request_error" }
     end
     return true
   end,
 
-  get_model_infos = function(ctx, credential, provider_config)
+  get_model_infos = function(ctx)
+    local creds = llm_router.credentials.list()
+    if #creds == 0 then
+      return nil, { message = "no google credentials configured", code = "invalid_request_error", status = 400 }
+    end
     local client = llm_router.http_client({})
-    local key = api_key_of(credential)
+    local key = api_key_of(creds[1].data)
     local url = BASE_URL .. "/models"
     local infos = {}
     while url do
@@ -821,7 +926,8 @@ llm_router.register("google", {
       })
       if err then return nil, err end
       if resp.status ~= 200 then
-        return nil, llm_router.classify_error({ status = resp.status, headers = resp.headers, body = resp.body })
+        return nil, { message = "google model discovery failed with status " .. tostring(resp.status),
+          code = "server_error", status = resp.status }
       end
       local page = json.decode(resp.body)
       for _, entry in ipairs(page.models or {}) do
@@ -907,7 +1013,7 @@ llm_router.register("google", {
   -- Only explicit invalid-key signals verdict unhealthy; location blocks,
   -- quotas and every other failure are unknown and change nothing.
   check_health = function(ctx, credential)
-    local key = api_key_of(credential)
+    local key = api_key_of(credential.data)
     if key == "" then return { status = "unhealthy", message = "api_key is required" } end
     local client = llm_router.http_client({ timeout_ms = 15000 })
     local resp, err = client:request({
@@ -937,85 +1043,65 @@ llm_router.register("google", {
     return { status = "unknown", message = "status " .. tostring(resp.status) }
   end,
 
-  complete = function(ctx, credential, request)
+  complete = function(ctx, request)
     local client = llm_router.http_client({})
     local payload, perr = build_payload(request, ctx.provider_config)
     if perr then return nil, perr end
-    local resp, err = client:request({
-      method = "POST", url = BASE_URL .. "/models/" .. request_model_name(request.model_name) .. ":generateContent",
-      headers = { ["x-goog-api-key"] = api_key_of(credential), ["Content-Type"] = "application/json" },
-      body = json.encode(payload),
-    })
-    if err then return nil, err end
-    if resp.status ~= 200 then
-      return nil, llm_router.classify_error({ status = resp.status, headers = resp.headers, body = resp.body })
-    end
-    local g = json.decode(resp.body)
-    if (not g.candidates or #g.candidates == 0) and g.promptFeedback and g.promptFeedback.blockReason then
-      return nil, { type = "content_policy", message = "prompt blocked: " .. tostring(g.promptFeedback.blockReason) }
-    end
-    local choices = {}
-    if g.candidates and #g.candidates > 0 then
-      local cand = g.candidates[1]
-      local out = { text = {}, reasoning = {}, toolcalls = {} }
-      collect_parts(cand, out, { n = 0 })
-      local message = { role = "assistant", content = table.concat(out.text, "") }
-      if #out.reasoning > 0 then
-        message.reasoning_content = table.concat(out.reasoning, "")
-      end
-      if #out.toolcalls > 0 then
-        local calls = {}
-        for _, tc in ipairs(out.toolcalls) do
-          local call = {
-            id = tc.id, type = "function",
-            ["function"] = { name = tc.name, arguments = tc.arguments },
-          }
-          -- Preserve thought_signature for round-trip back to Gemini
-          if tc.thought_signature then
-            if call.extra_content == nil then call.extra_content = {} end
-            if call.extra_content.google == nil then call.extra_content.google = {} end
-            call.extra_content.google.thought_signature = tc.thought_signature
-          end
-          table.insert(calls, call)
+    local last_err = nil
+    for _, cred in ipairs(llm_router.credentials.list()) do
+      local key = api_key_of(cred.data)
+      for _, px in ipairs(pick_proxies(ctx, 3)) do
+        local resp, err = client:request({
+          method = "POST", url = BASE_URL .. "/models/" .. request_model_name(request.model_name) .. ":generateContent",
+          headers = { ["x-goog-api-key"] = key, ["Content-Type"] = "application/json" },
+          body = json.encode(payload),
+          proxy_url = px.url,
+        })
+        if err == nil and resp.status == 200 then
+          return assemble_completion(resp.body, request.model)
+        elseif err ~= nil then
+          last_err = err
+        else
+          local action, terr = map_upstream(ctx, resp, cred.id)
+          if action == "done" then return nil, terr end
+          last_err = terr
+          if action == "cred" then break end
         end
-        message.tool_calls = calls
       end
-      local finish = map_finish_reason(cand.finishReason or "")
-      if #out.toolcalls > 0 then finish = "tool_calls" end
-      table.insert(choices, {
-        index = cand.index or 0,
-        message = message,
-        finish_reason = finish,
-      })
     end
-    return {
-      id = (g.responseId and g.responseId ~= "") and g.responseId or ("google-" .. tostring(os.time())),
-      object = "chat.completion", created = os.time(),
-      model = request.model, choices = choices,
-      usage = build_usage(g.usageMetadata) or { prompt_tokens = 0, completion_tokens = 0, total_tokens = 0 },
-    }
+    return nil, last_err or { message = "all google credentials exhausted", code = "server_error" }
   end,
 
-  complete_stream = function(ctx, credential, request, emit)
+  complete_stream = function(ctx, request, emit)
     local client = llm_router.http_client({})
     local payload, perr = build_payload(request, ctx.provider_config)
     if perr then return nil, perr end
     local full_model = request.model
     local chunk_id = "google-" .. tostring(os.time())
-    local tool_seq = { n = 0 }
-    -- Once any tool call is emitted, every later finish in this stream
-    -- means "run the tools": Gemini sends a bare STOP after the call.
-    local saw_tools = false
-    local resp, stream_err = client:stream({
-      method = "POST",
-      url = BASE_URL .. "/models/" .. request_model_name(request.model_name) .. ":streamGenerateContent?alt=sse",
-      headers = { ["x-goog-api-key"] = api_key_of(credential), ["Content-Type"] = "application/json" },
-      body = json.encode(payload),
-      on_response = function(r)
-        if r.status ~= 200 then
-          return llm_router.classify_error({ status = r.status, headers = r.headers, body = r.body })
-        end
-      end,
+    local last_err = nil
+    for _, cred in ipairs(llm_router.credentials.list()) do
+      local key = api_key_of(cred.data)
+      for _, px in ipairs(pick_proxies(ctx, 3)) do
+        local tool_seq = { n = 0 }
+          -- Once any tool call is emitted, every later finish in this stream
+          -- means "run the tools": Gemini sends a bare STOP after the call.
+          local saw_tools = false
+          local done = false
+          local fatal = false
+          local next_cred = false
+          local resp, stream_err = client:stream({
+            method = "POST",
+            url = BASE_URL .. "/models/" .. request_model_name(request.model_name) .. ":streamGenerateContent?alt=sse",
+            headers = { ["x-goog-api-key"] = key, ["Content-Type"] = "application/json" },
+            body = json.encode(payload),
+            proxy_url = px.url,
+            on_response = function(r)
+              if r.status == 200 then return end
+              local action, terr = map_upstream(ctx, r, cred.id)
+              if action == "done" then fatal = true end
+              if action == "cred" then next_cred = true end
+              return terr
+            end,
       on_line = function(line)
         if line:sub(1, 6) ~= "data: " then return end
         local data = line:sub(7)
@@ -1054,6 +1140,7 @@ llm_router.register("google", {
               id = chunk_id, object = "chat.completion.chunk", created = os.time(),
               model = full_model, choices = { choice },
             })
+            done = true
           end
         end
         local usage = build_usage(g.usageMetadata)
@@ -1062,15 +1149,26 @@ llm_router.register("google", {
             id = chunk_id, object = "chat.completion.chunk", created = os.time(),
             model = full_model, choices = {}, usage = usage,
           })
+          done = true
         end
       end,
     })
     if stream_err then
-      return nil, stream_err
+      last_err = stream_err
+    else
+      return
     end
+    if fatal then return nil, last_err end
+    if next_cred then break end
+    -- A stream that emitted already belongs to that attempt: surface
+    -- instead of failing over mid-stream.
+    if done then return nil, last_err end
+      end
+    end
+    return nil, last_err or { message = "all google credentials exhausted", code = "server_error" }
   end,
 
-  speech = function(ctx, credential, request)
+  speech = function(ctx, request)
     if type(request.input) ~= "string" or request.input == "" then
       return nil, invalid_request("input is required")
     end
@@ -1091,33 +1189,46 @@ llm_router.register("google", {
       },
     }
     local client = llm_router.http_client({})
-    local resp, err = client:request({
-      method = "POST", url = BASE_URL .. "/models/" .. request_model_name(request.model_name) .. ":generateContent",
-      headers = { ["x-goog-api-key"] = api_key_of(credential), ["Content-Type"] = "application/json" },
-      body = json.encode(payload),
-    })
-    if err then return nil, err end
-    if resp.status ~= 200 then
-      return nil, llm_router.classify_error({ status = resp.status, headers = resp.headers, body = resp.body })
+    local last_err = nil
+    for _, cred in ipairs(llm_router.credentials.list()) do
+      local key = api_key_of(cred.data)
+      for _, px in ipairs(pick_proxies(ctx, 3)) do
+        local resp, err = client:request({
+          method = "POST", url = BASE_URL .. "/models/" .. request_model_name(request.model_name) .. ":generateContent",
+          headers = { ["x-goog-api-key"] = key, ["Content-Type"] = "application/json" },
+          body = json.encode(payload),
+          proxy_url = px.url,
+        })
+        if err == nil and resp.status == 200 then
+          local g = json.decode(resp.body)
+          local inline = find_inline_data(g, "audio/")
+          if not inline then return blocked_error(g) end
+          -- Upstream audio is always PCM s16le (mimeType "audio/L16;...;rate=24000").
+          -- Only pcm and wav are servable without transcoding; every other
+          -- requested format gets wav, the lossless playable container.
+          local rate = tonumber(tostring(inline.mimeType):match("rate=(%d+)")) or 24000
+          local requested = request.response_format
+          if type(requested) ~= "string" or requested == "" then requested = "mp3" end
+          if requested == "pcm" then
+            return { audio_b64 = inline.data, format = "pcm" }
+          end
+          local pcm = llm_router.base64_decode(inline.data)
+          local wav = wrap_wav(pcm, rate, 1)
+          return { audio_b64 = llm_router.base64_encode(wav), format = "wav" }
+        elseif err ~= nil then
+          last_err = err
+        else
+          local action, terr = map_upstream(ctx, resp, cred.id)
+          if action == "done" then return nil, terr end
+          last_err = terr
+          if action == "cred" then break end
+        end
+      end
     end
-    local g = json.decode(resp.body)
-    local inline = find_inline_data(g, "audio/")
-    if not inline then return blocked_error(g) end
-    -- Upstream audio is always PCM s16le (mimeType "audio/L16;...;rate=24000").
-    -- Only pcm and wav are servable without transcoding; every other
-    -- requested format gets wav, the lossless playable container.
-    local rate = tonumber(tostring(inline.mimeType):match("rate=(%d+)")) or 24000
-    local requested = request.response_format
-    if type(requested) ~= "string" or requested == "" then requested = "mp3" end
-    if requested == "pcm" then
-      return { audio_b64 = inline.data, format = "pcm" }
-    end
-    local pcm = llm_router.base64_decode(inline.data)
-    local wav = wrap_wav(pcm, rate, 1)
-    return { audio_b64 = llm_router.base64_encode(wav), format = "wav" }
+    return nil, last_err or { message = "all google credentials exhausted", code = "server_error" }
   end,
 
-  generate_image = function(ctx, credential, request)
+  generate_image = function(ctx, request)
     if type(request.prompt) ~= "string" or request.prompt == "" then
       return nil, invalid_request("prompt is required")
     end
@@ -1131,28 +1242,56 @@ llm_router.register("google", {
       generationConfig = gen_config,
     }
     local client = llm_router.http_client({})
-    local data = {}
-    -- One upstream call per requested image; image models do not take
-    -- candidateCount.
-    for _ = 1, n do
-      local resp, err = client:request({
-        method = "POST", url = BASE_URL .. "/models/" .. request_model_name(request.model_name) .. ":generateContent",
-        headers = { ["x-goog-api-key"] = api_key_of(credential), ["Content-Type"] = "application/json" },
-        body = json.encode(payload),
-      })
-    if err then return nil, err end
-    if resp.status ~= 200 then
-      return nil, llm_router.classify_error({ status = resp.status, headers = resp.headers, body = resp.body })
-    end
-    local g = json.decode(resp.body)
-      local inline = find_inline_data(g, "image/")
-      if not inline then return blocked_error(g) end
-      table.insert(data, { b64_json = inline.data })
-    end
-    return { created = os.time(), data = data }
+    local last_err = nil
+    for _, cred in ipairs(llm_router.credentials.list()) do
+      local key = api_key_of(cred.data)
+      for _, px in ipairs(pick_proxies(ctx, 3)) do
+        local data = {}
+        local failed = false
+        local next_cred = false
+          -- One upstream call per requested image; image models do not take
+          -- candidateCount. A failed batch restarts on the next attempt;
+          -- partial images are discarded, never half-returned.
+          for _ = 1, n do
+            local resp, err = client:request({
+              method = "POST", url = BASE_URL .. "/models/" .. request_model_name(request.model_name) .. ":generateContent",
+              headers = { ["x-goog-api-key"] = key, ["Content-Type"] = "application/json" },
+              body = json.encode(payload),
+              proxy_url = px.url,
+            })
+            if err ~= nil then
+              last_err = err
+              failed = true
+              break
+            end
+            if resp.status ~= 200 then
+              local action, terr = map_upstream(ctx, resp, cred.id)
+              last_err = terr
+              failed = true
+              if action == "done" then return nil, terr end
+              if action == "cred" then next_cred = true end
+              break
+            end
+            local g = json.decode(resp.body)
+            local inline = find_inline_data(g, "image/")
+            if not inline then
+              local _, berr = blocked_error(g)
+              last_err = berr
+              failed = true
+              break
+            end
+            table.insert(data, { b64_json = inline.data })
+          end
+          if next_cred then break end
+          if not failed then
+            return { created = os.time(), data = data }
+          end
+        end
+      end
+    return nil, last_err or { message = "all google credentials exhausted", code = "server_error" }
   end,
 
-  embed = function(ctx, credential, request)
+  embed = function(ctx, request)
     local input = request.input
     if type(input) ~= "table" or #input == 0 then
       return nil, invalid_request("input is required")
@@ -1173,26 +1312,39 @@ llm_router.register("google", {
       table.insert(requests, entry)
     end
     local client = llm_router.http_client({})
-    local resp, err = client:request({
-      method = "POST", url = BASE_URL .. "/models/" .. model .. ":batchEmbedContents",
-      headers = { ["x-goog-api-key"] = api_key_of(credential), ["Content-Type"] = "application/json" },
-      body = json.encode({ requests = requests }),
-    })
-    if err then return nil, err end
-    if resp.status ~= 200 then
-      return nil, llm_router.classify_error({ status = resp.status, headers = resp.headers, body = resp.body })
-    end
-    local g = json.decode(resp.body)
-    local data = {}
-    for i, item in ipairs(g.embeddings or {}) do
-      if type(item.values) ~= "table" or #item.values == 0 then
-        return nil, { type = "upstream", message = "upstream returned an empty embedding vector" }
+    local last_err = nil
+    for _, cred in ipairs(llm_router.credentials.list()) do
+      local key = api_key_of(cred.data)
+      for _, px in ipairs(pick_proxies(ctx, 3)) do
+        local resp, err = client:request({
+          method = "POST", url = BASE_URL .. "/models/" .. model .. ":batchEmbedContents",
+          headers = { ["x-goog-api-key"] = key, ["Content-Type"] = "application/json" },
+          body = json.encode({ requests = requests }),
+          proxy_url = px.url,
+        })
+        if err == nil and resp.status == 200 then
+          local g = json.decode(resp.body)
+          local data = {}
+          for i, item in ipairs(g.embeddings or {}) do
+            if type(item.values) ~= "table" or #item.values == 0 then
+              return nil, { message = "upstream returned an empty embedding vector", code = "server_error", status = 502 }
+            end
+            table.insert(data, { index = i - 1, embedding = item.values })
+          end
+          if #data ~= #input then
+            return nil, { message = "upstream returned fewer embeddings than requested", code = "server_error", status = 502 }
+          end
+          return { data = data }
+        elseif err ~= nil then
+          last_err = err
+        else
+          local action, terr = map_upstream(ctx, resp, cred.id)
+          if action == "done" then return nil, terr end
+          last_err = terr
+          if action == "cred" then break end
+        end
       end
-      table.insert(data, { index = i - 1, embedding = item.values })
     end
-    if #data ~= #input then
-      return nil, { type = "upstream", message = "upstream returned fewer embeddings than requested" }
-    end
-    return { data = data }
+    return nil, last_err or { message = "all google credentials exhausted", code = "server_error" }
   end,
 })

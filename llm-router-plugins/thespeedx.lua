@@ -1,10 +1,9 @@
 --- @plugin TheSpeedX Proxy List
 --- @author TheSlopMachine
---- @version 1.0.0
---- @router_version 0.3.0
+--- @version 2.0.0
+--- @router_version 0.7.0
 --- @description Free HTTP proxy list from TheSpeedX (http.txt)
 --- @allow_host cdn.jsdelivr.net
---- @proxy_source true
 
 local LIST_URL = "https://cdn.jsdelivr.net/gh/TheSpeedX/PROXY-List@master/http.txt"
 local CACHE_SCOPE = "proxy_list"
@@ -31,7 +30,7 @@ llm_router.register_proxy_source("thespeedx", {
       return nil
     end
     if resp.status ~= 200 then
-      return nil, { type = "upstream", message = "thespeedx list: status " .. resp.status }
+      return nil, { message = "thespeedx list: status " .. resp.status, code = "server_error", status = resp.status }
     end
     local response_headers = resp.headers or {}
     if type(response_headers.etag) == "string" then
@@ -46,7 +45,7 @@ llm_router.register_proxy_source("thespeedx", {
     end
     local body = resp.body
     if type(body) ~= "string" or body == "" then
-      return nil, { type = "upstream", message = "thespeedx list: empty body" }
+      return nil, { message = "thespeedx list: empty body", code = "server_error", status = 502 }
     end
     local out = {}
     for raw in (body .. "\n"):gmatch("([^\n]*)\n") do

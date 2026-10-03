@@ -1,7 +1,7 @@
 --- @plugin Kiro AI
 --- @author TheSlopMachine
---- @version 3.3.1
---- @router_version 0.3.0
+--- @version 4.0.3
+--- @router_version 0.7.0
 --- @description AWS Kiro models via device login (OAuth2 with proactive refresh)
 --- @allow_host codewhisperer.us-east-1.amazonaws.com
 --- @allow_host oidc.us-east-1.amazonaws.com
@@ -164,8 +164,8 @@ local function resolve_model(model, effort)
     upstream = model
   end
   if thinking and not ADAPTIVE_THINKING_MODELS[upstream] and not NATIVE_REASONING_MODELS[upstream] then
-    return nil, false, { type = "invalid_request",
-      message = "model " .. tostring(model) .. " does not support thinking on kiro" }
+    return nil, false, { message = "model " .. tostring(model) .. " does not support thinking on kiro",
+      code = "invalid_request_error", status = 400 }
   end
   return upstream, thinking, nil
 end
@@ -659,65 +659,214 @@ local function flow_scope(flow_id)
   return "auth_flow:" .. flow_id
 end
 
+local function token_of(data)
+  if type(data) ~= "table" then return "" end
+  return data.access_token or ""
+end
+
+-- Dead-key bench: shared disable when automation is on (visible in the
+-- dashboard, global to every path), unified cooldown park otherwise.
+local function bench(ctx, cred_id, reason, wait_secs)
+  if wait_secs == nil or wait_secs < 1 then wait_secs = 300 end
+  local cfg = ctx.provider_config or {}
+  if cfg.disable_failed_credentials == true then
+    llm_router.credentials.disable(cred_id, reason)
+  else
+    llm_router.credentials.park(cred_id, wait_secs, reason)
+  end
+end
+
+local function retry_after_secs(resp)
+  local headers = resp.headers or {}
+  local n = tonumber(headers["retry-after"] or headers["retry_after"])
+  if n ~= nil and n > 0 then return math.floor(n) end
+  return 60
+end
+
+local function pick_proxies(ctx, limit)
+  -- Unconfigured providers go direct: only an explicit pool selection
+  -- (dashboard proxy switch) routes through pooled exits.
+  local pool = nil
+  if ctx.provider_config and ctx.provider_config.proxy
+    and ctx.provider_config.proxy.pool ~= "" then
+    pool = ctx.provider_config.proxy.pool
+  end
+  local proxies = llm_router.proxies.query({ pool = pool, limit = limit or 3 })
+  if #proxies == 0 then
+    -- Empty pool degrades to one direct attempt, never to silence.
+    return { {} }
+  end
+  return proxies
+end
+
+-- Kiro status mapping: 429 quota wording parks the OAuth account, other
+-- outcomes move on. Returns "proxy" (next exit, same credential), "cred"
+-- (next credential) or "done" (terminal, return at once).
+local function map_upstream(ctx, resp, cred_id)
+  if resp.status == 401 then
+    bench(ctx, cred_id, "kiro rejected the access token", 300)
+    return "cred", { message = "kiro rejected the access token", code = "authentication_error", status = 401 }
+  end
+  if resp.status == 429 then
+    llm_router.credentials.park(cred_id, retry_after_secs(resp), "kiro rate limited")
+    local lower = string.lower(tostring(resp.body or ""))
+    if string.find(lower, "quota", 1, true) then
+      return "cred", { message = "kiro quota exhausted", code = "insufficient_quota", status = 429 }
+    end
+    return "cred", { message = "kiro rate limited", code = "rate_limit", status = 429 }
+  end
+  if resp.status == 400 or resp.status == 404 then
+    return "done", { message = "kiro rejected the request with status " .. tostring(resp.status),
+      code = "invalid_request_error", status = resp.status }
+  end
+  return "proxy", { message = "kiro returned status " .. tostring(resp.status),
+    code = "server_error", status = resp.status }
+end
+
+-- Expiry check moved out of needs_refresh: true when the token needs a
+-- refresh attempt. Pasted tokens without expiry metadata only qualify when
+-- the device flow stored OIDC client credentials.
+local function is_token_stale(data)
+  data = data or {}
+  if not data.refresh_token or data.refresh_token == "" then return false end
+  if not data.access_token or data.access_token == "" then return true end
+  if not data.expires_at or data.expires_at == "" then
+    return (data.client_id or "") ~= ""
+  end
+  local now = os.time()
+  local exp = nil
+  local y, mo, d, h, mi, s = data.expires_at:match("^(%d+)-(%d+)-(%d+)T(%d+):(%d+):(%d+)")
+  if y then
+    exp = os.time({ year = tonumber(y), month = tonumber(mo), day = tonumber(d),
+      hour = tonumber(h), min = tonumber(mi), sec = tonumber(s) })
+  else
+    exp = tonumber(data.expires_at)
+  end
+  if exp == nil then return false end
+  return (exp - now) <= 300
+end
+
+-- OIDC refresh moved out of refresh_credential: returns the merged data
+-- map on success, nil on any failure (the next tick retries).
+local function do_refresh(data)
+  local region = data.region
+  if not region or region == "" then region = DEFAULT_REGION end
+  local client = llm_router.http_client({})
+  local resp, err = client:request({
+    method = "POST", url = oidc_url(region, "token"),
+    headers = { ["Content-Type"] = "application/json", ["Accept"] = "application/json" },
+    body = json.encode({
+      clientId = data.client_id or "", clientSecret = data.client_secret or "",
+      refreshToken = data.refresh_token or "", grantType = "refresh_token",
+    }),
+  })
+  if err then return nil end
+  if resp.status ~= 200 then return nil end
+  local out = json.decode(resp.body)
+  if not out.accessToken or out.accessToken == "" then return nil end
+  local merged = {}
+  for k, v in pairs(data) do merged[k] = v end
+  merged.access_token = out.accessToken
+  if out.refreshToken and out.refreshToken ~= "" then merged.refresh_token = out.refreshToken end
+  if out.expiresIn and out.expiresIn > 0 then
+    merged.expires_at = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time() + out.expiresIn)
+  end
+  return merged
+end
+
+-- Shared unary completion assembly: aggregated Kiro response → OpenAI.
+local function assemble_completion(body, thinking, full_model)
+  local state = aggregate_response(body, thinking)
+  local text = table.concat(state.content, "")
+  local reasoning = table.concat(state.reasoning, "")
+  local finish = state.finish_reason
+  if finish == "" then finish = "stop" end
+  if #state.tool_calls > 0 then finish = "tool_calls" end
+  local total = state.total_tokens
+  if total == 0 then
+    local completion = math.max(1, math.floor(#body / 4))
+    total = state.prompt_tokens + completion
+    state.completion_tokens = completion
+  end
+  local message = { role = "assistant", content = text, tool_calls = state.tool_calls }
+  if reasoning ~= "" then message.reasoning_content = reasoning end
+  return {
+    id = "kiro-" .. tostring(os.time()), object = "chat.completion", created = os.time(),
+    model = full_model,
+    choices = {
+      { index = 0, message = message,
+        finish_reason = finish },
+    },
+    usage = { prompt_tokens = state.prompt_tokens,
+      completion_tokens = state.completion_tokens, total_tokens = total },
+  }
+end
+
 llm_router.register("kiro", {
   icon = "https://kiro.dev/favicon.ico",
 
-  classify_error = function(raw, default_err)
-    if raw.status ~= 429 then return nil end
-    -- 0.3.0 contract: rate/quota tables require a future retry_after.
-    -- default_err always carries one (core fallback); the literal fallback
-    -- below only fires when the core has nothing to say.
-    local err = default_err or { type = "rate_limit", message = tostring(raw.body), retry_after = os.time() + 60 }
-    local lower = string.lower(err.message or "")
-    if string.find(lower, "quota", 1, true) then
-      err.type = "quota_exceeded"
-    end
-    -- Kiro limits bind to the OAuth account, never to the exit IP.
-    err.scope = { "account" }
-    return err
-  end,
+  proxy_schema = {},
 
-  config_schema = function()
-    return {
-      { type = "select", name = "region", label = "Region", options = { "us-east-1" } },
-    }
-  end,
+  config_schema = {
+    { type = "select", name = "region", label = "Region", options = { "us-east-1" } },
+  },
 
-  credential_schema = function()
-    return {
-      { type = "section", title = "Manual token entry",
-        subtitle = "Paste tokens from a previous login, or use device login instead.",
-        content = {
-          { type = "secret", name = "access_token", label = "Access Token" },
-          { type = "secret", name = "refresh_token", label = "Refresh Token" },
-          { type = "button", text = "Save", form_action = "submit" },
-        } },
-    }
-  end,
+  credential_schema = {
+    { type = "section", title = "Manual token entry",
+      subtitle = "Paste tokens from a previous login, or use device login instead.",
+      content = {
+        { type = "secret", name = "access_token", label = "Access Token" },
+        { type = "secret", name = "refresh_token", label = "Refresh Token" },
+        { type = "button", text = "Save", form_action = "submit" },
+      } },
+  },
+
+  jobs = {
+    refresh = {
+      interval_seconds = 300, run_on_startup = true, timeout_ms = 30000,
+      run = function(ctx)
+        for _, c in ipairs(llm_router.credentials.list()) do
+          local data = c.data or {}
+          if is_token_stale(data) then
+            local merged, err = do_refresh(data)
+            if merged then
+              llm_router.credentials.update(c.id, merged)
+            end
+          end
+        end
+        return true
+      end,
+    },
+  },
 
   validate_credentials = function(data)
     local access = data.access_token or ""
     local refresh = data.refresh_token or ""
     if access == "" and refresh == "" then
-      return false, { type = "invalid_request", message = "either access_token or refresh_token is required" }
+      return false, { message = "either access_token or refresh_token is required", code = "invalid_request_error" }
     end
     if access ~= "" and #access < 20 then
-      return false, { type = "invalid_request", message = "access_token appears invalid (too short)" }
+      return false, { message = "access_token appears invalid (too short)", code = "invalid_request_error" }
     end
     if refresh ~= "" and #refresh < 20 then
-      return false, { type = "invalid_request", message = "refresh_token appears invalid (too short)" }
+      return false, { message = "refresh_token appears invalid (too short)", code = "invalid_request_error" }
     end
     return true
   end,
 
-  get_model_infos = function(ctx, credential, provider_config)
-    local token = ""
-    if credential and credential.data then token = credential.data.access_token or "" end
-    if token == "" then
-      return nil, { type = "auth", message = "kiro access token is required for model discovery" }
+  get_model_infos = function(ctx)
+    local creds = llm_router.credentials.list()
+    if #creds == 0 then
+      return nil, { message = "no kiro credentials configured", code = "invalid_request_error", status = 400 }
     end
-    local data = credential.data or {}
-    local region = runtime_region(credential, provider_config)
+    local first = creds[1]
+    local token = token_of(first.data)
+    if token == "" then
+      return nil, { message = "kiro access token is required for model discovery",
+        code = "authentication_error", status = 401 }
+    end
+    local data = first.data or {}
+    local region = runtime_region(first, ctx.provider_config)
     local client = llm_router.http_client({})
     for _, url in ipairs(discovery_endpoints(region)) do
       local models = fetch_model_list(client, url, token)
@@ -731,7 +880,7 @@ llm_router.register("kiro", {
       local models = fetch_model_list(client, discovery_endpoints(region)[1], token, arn)
       if models then return with_thinking_variants(models) end
     end
-    return nil, { type = "upstream", message = "kiro model discovery failed on every region" }
+    return nil, { message = "kiro model discovery failed on every region", code = "server_error", status = 502 }
   end,
 
   -- Account liveness: the ListAvailableModels catalog answers 200 for live
@@ -770,59 +919,6 @@ llm_router.register("kiro", {
       return { status = "unhealthy", message = "access token rejected" }
     end
     return { status = "unknown", message = "status " .. tostring(resp.status) }
-  end,
-
-  needs_refresh = function(credential)
-    local data = credential.data or {}
-    if not data.refresh_token or data.refresh_token == "" then return false end
-    if not data.access_token or data.access_token == "" then return true end
-    if not data.expires_at or data.expires_at == "" then
-      -- Pasted tokens carry no expiry metadata: a refresh attempt only
-      -- makes sense when the device flow stored OIDC client credentials.
-      return (data.client_id or "") ~= ""
-    end
-    local now = os.time()
-    local exp = nil
-    local y, mo, d, h, mi, s = data.expires_at:match("^(%d+)-(%d+)-(%d+)T(%d+):(%d+):(%d+)")
-    if y then
-      exp = os.time({ year = tonumber(y), month = tonumber(mo), day = tonumber(d),
-        hour = tonumber(h), min = tonumber(mi), sec = tonumber(s) })
-    else
-      exp = tonumber(data.expires_at)
-    end
-    if exp == nil then return false end
-    return (exp - now) <= 300
-  end,
-
-  refresh_credential = function(ctx, credential)
-    local data = credential.data or {}
-    local region = data.region
-    if not region or region == "" then region = DEFAULT_REGION end
-    local client = llm_router.http_client({})
-    local resp, err = client:request({
-      method = "POST", url = oidc_url(region, "token"),
-      headers = { ["Content-Type"] = "application/json", ["Accept"] = "application/json" },
-      body = json.encode({
-        clientId = data.client_id or "", clientSecret = data.client_secret or "",
-        refreshToken = data.refresh_token or "", grantType = "refresh_token",
-      }),
-    })
-    if err then return nil, err end
-    if resp.status ~= 200 then
-      return nil, llm_router.classify_error({ status = resp.status, headers = resp.headers, body = resp.body })
-    end
-    local out = json.decode(resp.body)
-    if not out.accessToken or out.accessToken == "" then
-      return nil, { type = "auth", message = "refresh response did not include an access token" }
-    end
-    local merged = {}
-    for k, v in pairs(data) do merged[k] = v end
-    merged.access_token = out.accessToken
-    if out.refreshToken and out.refreshToken ~= "" then merged.refresh_token = out.refreshToken end
-    if out.expiresIn and out.expiresIn > 0 then
-      merged.expires_at = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time() + out.expiresIn)
-    end
-    return merged
   end,
 
   auth_initiate = function(ctx)
@@ -950,57 +1046,52 @@ llm_router.register("kiro", {
     return start_page("Choose a device login method to continue.", DEFAULT_REGION, BUILDER_START_URL, "builder-id")
   end,
 
-  complete = function(ctx, credential, request)
+  complete = function(ctx, request)
     local effort = resolve_effort(request)
     local model, thinking, alias_err = resolve_model(request.model_name, effort)
     if alias_err then return nil, alias_err end
     local client = llm_router.http_client({})
-    local resp, err = client:request({
-      method = "POST", url = generate_url(credential, ctx.provider_config),
-      headers = generate_headers(credential),
-      body = json.encode(build_payload(request, model, thinking, effort)),
-    })
-    if err then return nil, err end
-    if resp.status ~= 200 then
-      return nil, llm_router.classify_error({ status = resp.status, headers = resp.headers, body = resp.body })
-    end
-    local state = aggregate_response(resp.body, thinking)
-    local text = table.concat(state.content, "")
-    local reasoning = table.concat(state.reasoning, "")
-    local finish = state.finish_reason
-    if finish == "" then finish = "stop" end
-    if #state.tool_calls > 0 then finish = "tool_calls" end
-    local total = state.total_tokens
-    if total == 0 then
-      local completion = math.max(1, math.floor(#resp.body / 4))
-      total = state.prompt_tokens + completion
-      state.completion_tokens = completion
-    end
-    local message = { role = "assistant", content = text, tool_calls = state.tool_calls }
-    if reasoning ~= "" then message.reasoning_content = reasoning end
-    return {
-      id = "kiro-" .. tostring(os.time()), object = "chat.completion", created = os.time(),
-      model = request.model,
-      choices = {
-        { index = 0, message = message,
-          finish_reason = finish },
-      },
-      usage = { prompt_tokens = state.prompt_tokens,
-        completion_tokens = state.completion_tokens, total_tokens = total },
-    }
+    local last_err = nil
+    for _, cred in ipairs(llm_router.credentials.list()) do
+      for _, px in ipairs(pick_proxies(ctx, 3)) do
+        local resp, err = client:request({
+          method = "POST", url = generate_url(cred, ctx.provider_config),
+          headers = generate_headers(cred),
+          body = json.encode(build_payload(request, model, thinking, effort)),
+          proxy_url = px.url,
+          })
+          if err == nil and resp.status == 200 then
+            return assemble_completion(resp.body, thinking, request.model)
+          elseif err ~= nil then
+            last_err = err
+          else
+            local action, terr = map_upstream(ctx, resp, cred.id)
+            if action == "done" then return nil, terr end
+            last_err = terr
+            if action == "cred" then break end
+          end
+        end
+      end
+    return nil, last_err or { message = "all kiro credentials exhausted", code = "server_error" }
   end,
 
-  complete_stream = function(ctx, credential, request, emit)
+  complete_stream = function(ctx, request, emit)
     local model = request.model
     local effort = resolve_effort(request)
     local short_model, thinking, alias_err = resolve_model(request.model_name, effort)
     if alias_err then return nil, alias_err end
+    local client = llm_router.http_client({})
+    local last_err = nil
+    for _, cred in ipairs(llm_router.credentials.list()) do
+      for _, px in ipairs(pick_proxies(ctx, 3)) do
     local response_id = "kiro-" .. tostring(os.time())
     local created = os.time()
     local buffer = ""
     local builders = {}
     local saw_tool = false
     local first = true
+    local done = false
+    local st = { fatal = false, next_cred = false }
     local stream_usage = nil
     local think_state = { thinkingMode = false, pending = "" }
     local function emit_delta(delta)
@@ -1008,10 +1099,11 @@ llm_router.register("kiro", {
       first = false
       emit({ id = response_id, object = "chat.completion.chunk", created = created,
         model = model, choices = { { index = 0, delta = delta } } })
+      done = true
     end
     local payload = build_payload(request, short_model, thinking, effort)
-    local generate = generate_url(credential, ctx.provider_config)
-    local _, stream_err = client_stream_raw(generate_headers(credential), payload, generate, function(bytes)
+    local generate = generate_url(cred, ctx.provider_config)
+    local _, stream_err = client_stream_raw(generate_headers(cred), payload, generate, px.url, cred.id, st, function(bytes)
       buffer = buffer .. bytes
       while true do
         if #buffer < 16 then break end
@@ -1032,11 +1124,12 @@ llm_router.register("kiro", {
                 if text ~= "" then emit_delta({ content = text }) end
                 if reasoning ~= "" then emit_delta({ reasoning_content = reasoning }) end
               else
-                local delta = { content = p.content }
-                if first then delta.role = "assistant" end
-                first = false
-                emit({ id = response_id, object = "chat.completion.chunk", created = created,
-                  model = model, choices = { { index = 0, delta = delta } } })
+              local delta = { content = p.content }
+              if first then delta.role = "assistant" end
+              first = false
+              emit({ id = response_id, object = "chat.completion.chunk", created = created,
+                model = model, choices = { { index = 0, delta = delta } } })
+              done = true
               end
             end
           elseif etype == "reasoningContentEvent" then
@@ -1066,6 +1159,7 @@ llm_router.register("kiro", {
               first = false
               emit({ id = response_id, object = "chat.completion.chunk", created = created,
                 model = model, choices = { { index = 0, delta = delta } } })
+              done = true
               builders[id] = nil
             end
           elseif etype == "metricsEvent" then
@@ -1080,32 +1174,47 @@ llm_router.register("kiro", {
         end
       end
     end)
-    if stream_err then return nil, stream_err end
-    if thinking and think_state.pending ~= "" then
-      if think_state.thinkingMode then emit_delta({ reasoning_content = think_state.pending })
-      else emit_delta({ content = think_state.pending }) end
-      think_state.pending = ""
+    if stream_err then
+      last_err = stream_err
+      if st.fatal then return nil, last_err end
+      if st.next_cred then break end
+      -- A stream that emitted already belongs to that attempt: surface
+      -- instead of failing over mid-stream.
+      if done then return nil, last_err end
+    else
+      if thinking and think_state.pending ~= "" then
+        if think_state.thinkingMode then emit_delta({ reasoning_content = think_state.pending })
+        else emit_delta({ content = think_state.pending }) end
+        think_state.pending = ""
+      end
+      local finish = "stop"
+      if saw_tool then finish = "tool_calls" end
+      local last = { id = response_id, object = "chat.completion.chunk", created = created,
+        model = model, choices = { { index = 0, delta = {}, finish_reason = finish } } }
+      if stream_usage then last.usage = stream_usage end
+      emit(last)
+      return
     end
-    local finish = "stop"
-    if saw_tool then finish = "tool_calls" end
-    local last = { id = response_id, object = "chat.completion.chunk", created = created,
-      model = model, choices = { { index = 0, delta = {}, finish_reason = finish } } }
-    if stream_usage then last.usage = stream_usage end
-    emit(last)
+      end
+    end
+    return nil, last_err or { message = "all kiro credentials exhausted", code = "server_error" }
   end,
 })
 
 -- Raw event-stream POST with chunked delivery. Declared after register so
 -- the closure above resolves it at call time, not at load time.
-function client_stream_raw(headers, payload, url, on_bytes)
+function client_stream_raw(headers, payload, url, proxy_url, cred_id, st, on_bytes)
   local client = llm_router.http_client({})
   return client:stream({
     method = "POST", url = url,
     headers = headers, body = json.encode(payload),
+    proxy_url = proxy_url,
     on_response = function(r)
-      if r.status ~= 200 then
-        return llm_router.classify_error({ status = r.status, headers = r.headers, body = r.body })
-      end
+      if r.status == 200 then return end
+              local action, terr = map_upstream(ctx, r, cred_id)
+      if action == "done" then st.fatal = true end
+      if action == "cred" then st.next_cred = true end
+      return terr
     end,
     on_chunk = function(bytes) on_bytes(bytes) end,
   })
