@@ -1,6 +1,6 @@
 --- @plugin Kiro AI
 --- @author TheSlopMachine
---- @version 3.2.0
+--- @version 3.3.0
 --- @router_version 0.3.0
 --- @description AWS Kiro models via device login (OAuth2 with proactive refresh)
 --- @allow_host codewhisperer.us-east-1.amazonaws.com
@@ -726,6 +726,44 @@ llm_router.register("kiro", {
       if models then return with_thinking_variants(models) end
     end
     return nil, { type = "upstream", message = "kiro model discovery failed on every region" }
+  end,
+
+  -- Account liveness: the ListAvailableModels catalog answers 200 for live
+  -- tokens and 401 for dead ones. Only 401 verdicts unhealthy; region and
+  -- profile-ARN mismatches surface as 403s, which stay unknown and change
+  -- nothing. Single primary-region attempt, no fallback replication.
+  check_health = function(ctx, credential, provider_config)
+    local data = (credential and credential.data) or {}
+    local token = data.access_token or ""
+    if token == "" then return { status = "unhealthy", message = "access_token is required" } end
+    local region = runtime_region(credential, provider_config)
+    local target = discovery_endpoints(region)[1] .. "?origin=AI_EDITOR"
+    local arn = data.profile_arn
+    if type(arn) ~= "string" or arn == "" then arn = data.profileArn end
+    if type(arn) == "string" and arn ~= "" then
+      target = target .. "&profileArn=" .. arn
+    end
+    local client = llm_router.http_client({ timeout_ms = 15000 })
+    local resp, err = client:request({
+      method = "GET", url = target,
+      headers = {
+        ["Authorization"] = "Bearer " .. token,
+        ["Accept"] = "application/json",
+        ["User-Agent"] = "AWS-SDK-JS/3.0.0 kiro-ide/1.0.0",
+      },
+    })
+    if err then
+      local message = "request failed"
+      if type(err) == "table" and type(err.message) == "string" then message = err.message end
+      return { status = "unknown", message = message }
+    end
+    if resp.status == 200 then
+      return { status = "healthy" }
+    end
+    if resp.status == 401 then
+      return { status = "unhealthy", message = "access token rejected" }
+    end
+    return { status = "unknown", message = "status " .. tostring(resp.status) }
   end,
 
   needs_refresh = function(credential)

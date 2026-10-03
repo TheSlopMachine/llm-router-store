@@ -1,6 +1,6 @@
 --- @plugin Groq
 --- @author TheSlopMachine
---- @version 3.0.1
+--- @version 3.1.0
 --- @router_version 0.3.0
 --- @description Groq OpenAI-compatible API: fast Llama/Qwen/gpt-oss inference, Whisper speech-to-text
 --- @allow_host api.groq.com
@@ -178,6 +178,31 @@ llm_router.register("groq", {
     end
     table.sort(infos, function(a, b) return a.name < b.name end)
     return infos
+  end,
+
+  -- Account liveness: the keyed /models listing answers 200 for live keys
+  -- and 401 for dead ones. Only 401 verdicts unhealthy; every other
+  -- failure is unknown and changes nothing.
+  check_health = function(ctx, credential)
+    local key = api_key_of(credential)
+    if key == "" then return { status = "unhealthy", message = "api_key is required" } end
+    local client = llm_router.http_client({ timeout_ms = 15000 })
+    local resp, err = client:request({
+      method = "GET", url = BASE_URL .. "/models",
+      headers = { ["Authorization"] = "Bearer " .. key },
+    })
+    if err then
+      local message = "request failed"
+      if type(err) == "table" and type(err.message) == "string" then message = err.message end
+      return { status = "unknown", message = message }
+    end
+    if resp.status == 200 then
+      return { status = "healthy" }
+    end
+    if resp.status == 401 then
+      return { status = "unhealthy", message = "api key rejected" }
+    end
+    return { status = "unknown", message = "status " .. tostring(resp.status) }
   end,
 
   complete = function(ctx, credential, request)

@@ -1,6 +1,6 @@
 --- @plugin Google AI Studio
 --- @author TheSlopMachine
---- @version 3.0.0
+--- @version 3.1.0
 --- @router_version 0.3.0
 --- @description Google Gemini models via AI Studio API
 --- @allow_host generativelanguage.googleapis.com
@@ -901,6 +901,40 @@ llm_router.register("google", {
       end
     end
     return infos
+  end,
+
+  -- Account liveness: the keyed /models listing answers 200 for live keys.
+  -- Only explicit invalid-key signals verdict unhealthy; location blocks,
+  -- quotas and every other failure are unknown and change nothing.
+  check_health = function(ctx, credential)
+    local key = api_key_of(credential)
+    if key == "" then return { status = "unhealthy", message = "api_key is required" } end
+    local client = llm_router.http_client({ timeout_ms = 15000 })
+    local resp, err = client:request({
+      method = "GET", url = BASE_URL .. "/models",
+      headers = { ["x-goog-api-key"] = key },
+    })
+    if err then
+      local message = "request failed"
+      if type(err) == "table" and type(err.message) == "string" then message = err.message end
+      return { status = "unknown", message = message }
+    end
+    if resp.status == 200 then
+      return { status = "healthy" }
+    end
+    if resp.status == 400 then
+      local lower = string.lower(tostring(resp.body or ""))
+      if string.find(lower, "api key not valid", 1, true)
+          or string.find(lower, "api_key_invalid", 1, true)
+          or string.find(lower, "invalid api key", 1, true)
+          or string.find(lower, "unauthenticated", 1, true) then
+        return { status = "unhealthy", message = "api key rejected" }
+      end
+    end
+    if resp.status == 401 then
+      return { status = "unhealthy", message = "api key rejected" }
+    end
+    return { status = "unknown", message = "status " .. tostring(resp.status) }
   end,
 
   complete = function(ctx, credential, request)

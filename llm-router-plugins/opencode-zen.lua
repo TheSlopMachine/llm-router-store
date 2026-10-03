@@ -1,6 +1,6 @@
 --- @plugin OpenCode Zen
 --- @author TheSlopMachine
---- @version 4.0.3
+--- @version 4.1.0
 --- @router_version 0.3.0
 --- @description OpenAI/Anthropic/Google compatible paid provider OpenCode Zen (API key required)
 --- @allow_host opencode.ai
@@ -376,6 +376,32 @@ llm_router.register("opencode-zen", {
       return with_limits(FALLBACK_MODELS)
     end
     return with_limits(infos)
+  end,
+
+  -- Account liveness: the keyed /models listing answers 200 for live keys
+  -- and 401 for dead ones. Only 401 verdicts unhealthy; every other
+  -- failure is unknown and changes nothing.
+  check_health = function(ctx, credential)
+    local key, key_err = require_api_key(credential)
+    if key_err then return { status = "unhealthy", message = "api_key is required" } end
+    local client = llm_router.http_client({ timeout_ms = 15000 })
+    local ses, msg = mint_ids()
+    local resp, err = client:request({
+      method = "GET", url = BASE_URL .. "/models",
+      headers = opencode_headers(key, ses, msg),
+    })
+    if err then
+      local message = "request failed"
+      if type(err) == "table" and type(err.message) == "string" then message = err.message end
+      return { status = "unknown", message = message }
+    end
+    if resp.status == 200 then
+      return { status = "healthy" }
+    end
+    if resp.status == 401 then
+      return { status = "unhealthy", message = "api key rejected" }
+    end
+    return { status = "unknown", message = "status " .. tostring(resp.status) }
   end,
 
   complete = function(ctx, credential, request)
