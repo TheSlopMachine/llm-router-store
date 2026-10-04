@@ -1,12 +1,13 @@
 --- @plugin Proxifly Proxy List
 --- @author TheSlopMachine
---- @version 5.0.0
+--- @version 5.1.0
 --- @router_version 0.7.0
---- @description Free HTTP proxy list from proxifly (proxies/protocols/http/data.json)
+--- @description Free proxy list from proxifly (proxies/all/data.json; http/https/socks4/socks5)
 --- @allow_host cdn.jsdelivr.net
 
-local LIST_URL = "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.json"
+local LIST_URL = "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/all/data.json"
 local CACHE_SCOPE = "proxy_list"
+local PROTOCOLS = { http = true, https = true, socks4 = true, socks5 = true }
 
 llm_router.register_proxy_source("proxifly", {
   fetch_proxies = function()
@@ -49,13 +50,13 @@ llm_router.register_proxy_source("proxifly", {
     end
     local out = {}
     for _, e in ipairs(entries) do
-      if type(e) == "table" and e.protocol == "http" then
+      if type(e) == "table" and PROTOCOLS[e.protocol] then
         if type(e.ip) == "string" and type(e.port) == "number" then
           local country = ""
           if type(e.geolocation) == "table" and type(e.geolocation.country) == "string" then
             country = e.geolocation.country
           end
-          table.insert(out, { protocol = "http", host = e.ip, port = e.port, country = country })
+          table.insert(out, { protocol = e.protocol, host = e.ip, port = e.port, country = country })
         end
       end
     end

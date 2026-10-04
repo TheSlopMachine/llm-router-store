@@ -1,12 +1,13 @@
 --- @plugin Monosans Proxy List
 --- @author TheSlopMachine
---- @version 2.0.0
+--- @version 2.1.0
 --- @router_version 0.7.0
---- @description Free HTTP proxy list from monosans (proxies/http.txt)
+--- @description Free proxy list from monosans (proxies/all.txt; http/socks4/socks5)
 --- @allow_host cdn.jsdelivr.net
 
-local LIST_URL = "https://cdn.jsdelivr.net/gh/monosans/proxy-list@main/proxies/http.txt"
+local LIST_URL = "https://cdn.jsdelivr.net/gh/monosans/proxy-list@main/proxies/all.txt"
 local CACHE_SCOPE = "proxy_list"
+local PROTOCOLS = { http = true, https = true, socks4 = true, socks4a = true, socks5 = true }
 
 llm_router.register_proxy_source("monosans", {
   fetch_proxies = function()
@@ -52,10 +53,16 @@ llm_router.register_proxy_source("monosans", {
       local line = (raw:gsub("\r", ""))
       line = line:match("^%s*(.-)%s*$") or ""
       if line ~= "" then
-        local host, port = line:match("^(.+):(%d+)$")
-        port = tonumber(port)
-        if type(host) == "string" and host ~= "" and type(port) == "number" and port >= 1 and port <= 65535 then
-          table.insert(out, { protocol = "http", host = host, port = port, country = "" })
+        local protocol, rest = line:match("^(%a[%w%+%-%.]*)://(.+)$")
+        if rest == nil then
+          protocol, rest = "http", line
+        end
+        if PROTOCOLS[protocol] then
+          local host, port = rest:match("^(.+):(%d+)$")
+          port = tonumber(port)
+          if type(host) == "string" and host ~= "" and type(port) == "number" and port >= 1 and port <= 65535 then
+            table.insert(out, { protocol = protocol, host = host, port = port, country = "" })
+          end
         end
       end
     end
