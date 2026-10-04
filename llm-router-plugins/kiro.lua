@@ -13,17 +13,13 @@ local BUILDER_START_URL = "https://view.awsapps.com/start"
 local ISSUER_URL = "https://identitycenter.amazonaws.com/ssoins-722374e8c3c8e6c6"
 local CONVERSATION_NS = "34f7193f-561d-4050-bc84-9547d953d6bf"
 
-local function oidc_url(region, path)
-  return "https://oidc." .. region .. ".amazonaws.com/" .. path
-end
+local function oidc_url(region, path) return "https://oidc." .. region .. ".amazonaws.com/" .. path end
 
 local function region_of(credential, provider_config)
   if credential and credential.data and credential.data.region and credential.data.region ~= "" then
     return credential.data.region
   end
-  if provider_config and provider_config.region and provider_config.region ~= "" then
-    return provider_config.region
-  end
+  if provider_config and provider_config.region and provider_config.region ~= "" then return provider_config.region end
   return DEFAULT_REGION
 end
 
@@ -34,9 +30,7 @@ end
 -- wins when present; hosts come from a fixed list, never raw input.
 local PROFILE_REGIONS = { "us-east-1", "eu-central-1" }
 
-local function valid_region(s)
-  return type(s) == "string" and s:lower():match("^[a-z][a-z]-[a-z]+-%d+$") ~= nil
-end
+local function valid_region(s) return type(s) == "string" and s:lower():match("^[a-z][a-z]-[a-z]+-%d+$") ~= nil end
 
 local function region_from_arn(arn)
   if type(arn) ~= "string" then return nil end
@@ -57,9 +51,7 @@ local function runtime_region(credential, provider_config)
 end
 
 local function runtime_host(region)
-  if region == "us-east-1" then
-    return "https://codewhisperer.us-east-1.amazonaws.com"
-  end
+  if region == "us-east-1" then return "https://codewhisperer.us-east-1.amazonaws.com" end
   return "https://q." .. region .. ".amazonaws.com"
 end
 
@@ -69,9 +61,7 @@ end
 
 local function discovery_endpoints(region)
   local urls = { "https://q." .. region .. ".amazonaws.com/ListAvailableModels" }
-  if region ~= "us-east-1" then
-    table.insert(urls, "https://q.us-east-1.amazonaws.com/ListAvailableModels")
-  end
+  if region ~= "us-east-1" then table.insert(urls, "https://q.us-east-1.amazonaws.com/ListAvailableModels") end
   return urls
 end
 
@@ -97,8 +87,10 @@ local function parse_model_list(body)
           if max_input and max_input > 0 then context = math.floor(max_input) end
         end
         table.insert(out, {
-          name = id, display_name = name,
-          context_window = context, max_tokens = 32000,
+          name = id,
+          display_name = name,
+          context_window = context,
+          max_tokens = 32000,
           supported_parameters = { "tools" },
           input_modalities = { "text" },
           output_modalities = { "text" },
@@ -113,11 +105,10 @@ end
 
 local function fetch_model_list(client, url, token, profile_arn)
   local target = url .. "?origin=AI_EDITOR"
-  if type(profile_arn) == "string" and profile_arn ~= "" then
-    target = target .. "&profileArn=" .. profile_arn
-  end
+  if type(profile_arn) == "string" and profile_arn ~= "" then target = target .. "&profileArn=" .. profile_arn end
   local resp, err = client:request({
-    method = "GET", url = target,
+    method = "GET",
+    url = target,
     headers = {
       ["Authorization"] = "Bearer " .. token,
       ["Accept"] = "application/json",
@@ -141,9 +132,7 @@ local EFFORT_BUDGETS = { low = 8000, medium = 16000, high = 32000, xhigh = 64000
 
 local function resolve_effort(request)
   local effort = ""
-  if request and type(request.reasoning_effort) == "string" then
-    effort = request.reasoning_effort:lower()
-  end
+  if request and type(request.reasoning_effort) == "string" then effort = request.reasoning_effort:lower() end
   if effort == "minimal" then effort = "low" end
   if effort == "" or effort == "none" then return "" end
   if not EFFORT_BUDGETS[effort] then return "" end
@@ -164,8 +153,13 @@ local function resolve_model(model, effort)
     upstream = model
   end
   if thinking and not ADAPTIVE_THINKING_MODELS[upstream] and not NATIVE_REASONING_MODELS[upstream] then
-    return nil, false, { message = "model " .. tostring(model) .. " does not support thinking on kiro",
-      code = "invalid_request_error", status = 400 }
+    return nil,
+      false,
+      {
+        message = "model " .. tostring(model) .. " does not support thinking on kiro",
+        code = "invalid_request_error",
+        status = 400,
+      }
   end
   return upstream, thinking, nil
 end
@@ -177,8 +171,10 @@ local function with_thinking_variants(models)
     table.insert(out, m)
     if ADAPTIVE_THINKING_MODELS[m.name] or NATIVE_REASONING_MODELS[m.name] then
       table.insert(out, {
-        name = m.name .. "-thinking", display_name = m.display_name .. " (Thinking)",
-        context_window = m.context_window, max_tokens = m.max_tokens,
+        name = m.name .. "-thinking",
+        display_name = m.display_name .. " (Thinking)",
+        context_window = m.context_window,
+        max_tokens = m.max_tokens,
         supported_parameters = { "tools" },
         input_modalities = { "text" },
         output_modalities = { "text" },
@@ -215,8 +211,11 @@ local function split_thinking(st, raw, content_arr, reasoning_arr)
   st.pending = ""
   local function emit(s)
     if s == "" then return end
-    if st.thinkingMode then table.insert(reasoning_arr, s)
-    else table.insert(content_arr, s) end
+    if st.thinkingMode then
+      table.insert(reasoning_arr, s)
+    else
+      table.insert(content_arr, s)
+    end
   end
   while #text > 0 do
     local tag = st.thinkingMode and THINK_CLOSE or THINK_OPEN
@@ -225,7 +224,10 @@ local function split_thinking(st, raw, content_arr, reasoning_arr)
       local hold = #text + 1
       local from = math.max(1, #text - 10)
       for i = from, #text do
-        if tag:sub(1, #text - i + 1) == text:sub(i) then hold = i; break end
+        if tag:sub(1, #text - i + 1) == text:sub(i) then
+          hold = i
+          break
+        end
       end
       emit(text:sub(1, hold - 1))
       st.pending = text:sub(hold)
@@ -292,9 +294,19 @@ local function parse_frame(frame)
 end
 
 local function new_aggregate(thinking)
-  return { content = {}, reasoning = {}, prompt_tokens = 0, completion_tokens = 0, total_tokens = 0,
-           finish_reason = "", tool_calls = {}, builders = {}, order = {},
-           split = thinking == true, think_state = { thinkingMode = false, pending = "" } }
+  return {
+    content = {},
+    reasoning = {},
+    prompt_tokens = 0,
+    completion_tokens = 0,
+    total_tokens = 0,
+    finish_reason = "",
+    tool_calls = {},
+    builders = {},
+    order = {},
+    split = thinking == true,
+    think_state = { thinkingMode = false, pending = "" },
+  }
 end
 
 local function flush_builder(state, id)
@@ -302,8 +314,7 @@ local function flush_builder(state, id)
   if b == nil or b.name == nil or b.name == "" then return end
   local args = b.args:match("^%s*(.-)%s*$")
   if args == "" then args = "{}" end
-  table.insert(state.tool_calls, { id = id, type = "function",
-    ["function"] = { name = b.name, arguments = args } })
+  table.insert(state.tool_calls, { id = id, type = "function", ["function"] = { name = b.name, arguments = args } })
   state.finish_reason = "tool_calls"
   state.builders[id] = nil
 end
@@ -348,8 +359,11 @@ local function consume_event(state, frame)
       end
     end
     local should_emit = false
-    if p.stop == true then should_emit = true
-    elseif not is_string_input and p.input ~= nil and b.name ~= "" then should_emit = true end
+    if p.stop == true then
+      should_emit = true
+    elseif not is_string_input and p.input ~= nil and b.name ~= "" then
+      should_emit = true
+    end
     if should_emit then flush_builder(state, id) end
   elseif etype == "messageStopEvent" then
     if state.finish_reason == "" then state.finish_reason = "stop" end
@@ -364,14 +378,15 @@ local function aggregate_response(body, thinking)
     if frame then consume_event(state, frame) end
   end
   if state.think_state.pending ~= "" then
-    if state.think_state.thinkingMode then table.insert(state.reasoning, state.think_state.pending)
-    else table.insert(state.content, state.think_state.pending) end
+    if state.think_state.thinkingMode then
+      table.insert(state.reasoning, state.think_state.pending)
+    else
+      table.insert(state.content, state.think_state.pending)
+    end
     state.think_state.pending = ""
   end
   for _, id in ipairs(state.order) do
-    if state.builders[id] and state.builders[id].name ~= "" then
-      flush_builder(state, id)
-    end
+    if state.builders[id] and state.builders[id].name ~= "" then flush_builder(state, id) end
   end
   return state
 end
@@ -409,8 +424,17 @@ local function build_tool_specs(tools)
     if name ~= "" then
       if desc == "" then desc = "Tool: " .. name end
       if schema == nil then schema = { type = "object", properties = {} } end
-      table.insert(specs, { toolSpecification = {
-        name = name, description = desc, inputSchema = { json = schema }, strict = true } })
+      table.insert(
+        specs,
+        {
+          toolSpecification = {
+            name = name,
+            description = desc,
+            inputSchema = { json = schema },
+            strict = true,
+          },
+        }
+      )
     end
   end
   return specs
@@ -425,12 +449,13 @@ local function convert_messages(messages, tools, model)
 
   local function flush_user()
     local content = table.concat(user_parts, "\n\n"):match("^%s*(.-)%s*$")
-    if content == "" and #tool_results == 0 then user_parts = {}; return end
+    if content == "" and #tool_results == 0 then
+      user_parts = {}
+      return
+    end
     local msg = { content = content, modelId = model }
     if msg.content == "" then msg.content = "continue" end
-    if #tool_results > 0 then
-      msg.userInputMessageContext = { toolResults = tool_results }
-    end
+    if #tool_results > 0 then msg.userInputMessageContext = { toolResults = tool_results } end
     if #tools > 0 and #history == 0 then
       msg.userInputMessageContext = msg.userInputMessageContext or {}
       msg.userInputMessageContext.tools = build_tool_specs(tools)
@@ -451,7 +476,11 @@ local function convert_messages(messages, tools, model)
     local role = "user"
     if m.role == "assistant" then role = "assistant" end
     if current_role and current_role ~= role then
-      if current_role == "user" then flush_user() else flush_assistant() end
+      if current_role == "user" then
+        flush_user()
+      else
+        flush_assistant()
+      end
     end
     current_role = role
     if role == "assistant" then
@@ -474,25 +503,28 @@ local function convert_messages(messages, tools, model)
       end
     else
       if m.role == "tool" then
-        table.insert(tool_results, { toolUseId = m.tool_call_id or "",
-          status = "success", content = { { text = message_text(m) } } })
+        table.insert(
+          tool_results,
+          { toolUseId = m.tool_call_id or "", status = "success", content = { { text = message_text(m) } } }
+        )
       else
         local text = message_text(m):match("^%s*(.-)%s*$")
         if text ~= "" then table.insert(user_parts, text) end
       end
     end
   end
-  if current_role == "user" then flush_user()
-  elseif current_role == "assistant" then flush_assistant() end
+  if current_role == "user" then
+    flush_user()
+  elseif current_role == "assistant" then
+    flush_assistant()
+  end
 
   local current = nil
   if #history > 0 and history[#history].userInputMessage then
     current = history[#history].userInputMessage
     table.remove(history)
   end
-  if current == nil or current.content == "" then
-    current = { content = "continue", modelId = model }
-  end
+  if current == nil or current.content == "" then current = { content = "continue", modelId = model } end
   if current.modelId == nil or current.modelId == "" then current.modelId = model end
   if #tools > 0 then
     current.userInputMessageContext = current.userInputMessageContext or {}
@@ -504,9 +536,7 @@ local function convert_messages(messages, tools, model)
     local e = entry.userInputMessage
     if e and e.userInputMessageContext then
       e.userInputMessageContext.tools = nil
-      if e.userInputMessageContext.toolResults == nil then
-        e.userInputMessageContext = nil
-      end
+      if e.userInputMessageContext.toolResults == nil then e.userInputMessageContext = nil end
     end
     if e and (e.modelId == nil or e.modelId == "") then e.modelId = model end
   end
@@ -515,9 +545,12 @@ end
 
 local function conversation_id(history, current_content)
   local seed = current_content or ""
-  if #history > 0 and history[1].userInputMessage
-      and type(history[1].userInputMessage.content) == "string"
-      and history[1].userInputMessage.content ~= "" then
+  if
+    #history > 0
+    and history[1].userInputMessage
+    and type(history[1].userInputMessage.content) == "string"
+    and history[1].userInputMessage.content ~= ""
+  then
     seed = history[1].userInputMessage.content
   end
   if #seed > 4000 then seed = seed:sub(1, 4000) end
@@ -531,8 +564,11 @@ local function build_payload(request, model, thinking, effort)
   if thinking then
     if effort == "" then effort = "high" end
     current.content = "<thinking_mode>enabled</thinking_mode>"
-      .. "<max_thinking_length>" .. tostring(EFFORT_BUDGETS[effort] or EFFORT_BUDGETS.high) .. "</max_thinking_length>"
-      .. "\n\n" .. current.content
+      .. "<max_thinking_length>"
+      .. tostring(EFFORT_BUDGETS[effort] or EFFORT_BUDGETS.high)
+      .. "</max_thinking_length>"
+      .. "\n\n"
+      .. current.content
   end
   current.origin = "AI_EDITOR"
   local state = {
@@ -542,13 +578,17 @@ local function build_payload(request, model, thinking, effort)
   }
   if #history > 0 then state.history = history end
   local payload = { conversationState = state }
-  if (request.max_tokens and request.max_tokens > 0)
-      or ((request.temperature and request.temperature > 0) and not thinking)
-      or ((request.top_p and request.top_p > 0) and not thinking) then
+  if
+    (request.max_tokens and request.max_tokens > 0)
+    or ((request.temperature and request.temperature > 0) and not thinking)
+    or ((request.top_p and request.top_p > 0) and not thinking)
+  then
     payload.inferenceConfig = {}
     if request.max_tokens and request.max_tokens > 0 then payload.inferenceConfig.maxTokens = request.max_tokens end
     if not thinking then
-      if request.temperature and request.temperature > 0 then payload.inferenceConfig.temperature = request.temperature end
+      if request.temperature and request.temperature > 0 then
+        payload.inferenceConfig.temperature = request.temperature
+      end
       if request.top_p and request.top_p > 0 then payload.inferenceConfig.topP = request.top_p end
     end
   end
@@ -589,15 +629,25 @@ local function method_page(error_text)
   if error_text and error_text ~= "" then
     table.insert(nodes, { type = "banner", variant = "error", text = error_text })
   end
-  table.insert(nodes, { type = "section", title = "Sign in to Kiro",
-    subtitle = "Use the same Kiro account as in the IDE.",
-    content = {
-      { type = "select", name = "device_method", label = "Method",
-        options = { "builder-id", "idc" },
-        option_labels = { ["builder-id"] = "AWS Builder ID", ["idc"] = "IAM Identity Center" },
-        value = "builder-id" },
-      { type = "button", text = "Continue", form_action = "pick_method" },
-    } })
+  table.insert(
+    nodes,
+    {
+      type = "section",
+      title = "Sign in to Kiro",
+      subtitle = "Use the same Kiro account as in the IDE.",
+      content = {
+        {
+          type = "select",
+          name = "device_method",
+          label = "Method",
+          options = { "builder-id", "idc" },
+          option_labels = { ["builder-id"] = "AWS Builder ID", ["idc"] = "IAM Identity Center" },
+          value = "builder-id",
+        },
+        { type = "button", text = "Continue", form_action = "pick_method" },
+      },
+    }
+  )
   return { render = nodes }
 end
 
@@ -606,35 +656,46 @@ local function region_page(error_text, region, start_url)
   if error_text and error_text ~= "" then
     table.insert(nodes, { type = "banner", variant = "error", text = error_text })
   end
-  table.insert(nodes, { type = "section", title = "Sign in to Kiro",
-    subtitle = "Enter your IAM Identity Center details.",
-    content = {
-      { type = "grid", columns = 2, content = {
-        { type = "input", name = "region", label = "Region", value = region or DEFAULT_REGION },
-        { type = "input", name = "start_url", label = "Start URL", value = start_url or BUILDER_START_URL },
-      } },
-      { type = "button", text = "Start Device Login", form_action = "start_device" },
-      { type = "button", text = "Back", form_action = "restart" },
-    } })
+  table.insert(
+    nodes,
+    {
+      type = "section",
+      title = "Sign in to Kiro",
+      subtitle = "Enter your IAM Identity Center details.",
+      content = {
+        {
+          type = "grid",
+          columns = 2,
+          content = {
+            { type = "input", name = "region", label = "Region", value = region or DEFAULT_REGION },
+            { type = "input", name = "start_url", label = "Start URL", value = start_url or BUILDER_START_URL },
+          },
+        },
+        { type = "button", text = "Start Device Login", form_action = "start_device" },
+        { type = "button", text = "Back", form_action = "restart" },
+      },
+    }
+  )
   return { render = nodes }
 end
 
 local function builder_page()
   local nodes = {
-    { type = "section", title = "Sign in to Kiro",
+    {
+      type = "section",
+      title = "Sign in to Kiro",
       subtitle = "Uses the Kiro default start URL in us-east-1. No input needed.",
       content = {
         { type = "button", text = "Start Device Login", form_action = "start_device" },
         { type = "button", text = "Back", form_action = "restart" },
-      } },
+      },
+    },
   }
   return { render = nodes }
 end
 
 local function start_page(error_text, region, start_url, method)
-  if method == "idc" then
-    return region_page(error_text, region, start_url)
-  end
+  if method == "idc" then return region_page(error_text, region, start_url) end
   return method_page(error_text)
 end
 
@@ -643,21 +704,28 @@ local function device_page(message_text, state)
   if message_text and message_text ~= "" then
     table.insert(nodes, { type = "banner", variant = "info", text = message_text })
   end
-  table.insert(nodes, { type = "section", title = "Complete device login",
-    subtitle = "Open the verification page, then enter the code below.",
-    content = {
-      { type = "code", text = state.user_code or "", label = "Device code" },
-      { type = "link", text = "Open verification page",
-        url = state.verification_uri_complete or state.verification_uri or "" },
-      { type = "button", text = "Check Authorization", form_action = "poll_device" },
-      { type = "button", text = "Start Over", form_action = "restart" },
-    } })
+  table.insert(
+    nodes,
+    {
+      type = "section",
+      title = "Complete device login",
+      subtitle = "Open the verification page, then enter the code below.",
+      content = {
+        { type = "code", text = state.user_code or "", label = "Device code" },
+        {
+          type = "link",
+          text = "Open verification page",
+          url = state.verification_uri_complete or state.verification_uri or "",
+        },
+        { type = "button", text = "Check Authorization", form_action = "poll_device" },
+        { type = "button", text = "Start Over", form_action = "restart" },
+      },
+    }
+  )
   return { render = nodes }
 end
 
-local function flow_scope(flow_id)
-  return "auth_flow:" .. flow_id
-end
+local function flow_scope(flow_id) return "auth_flow:" .. flow_id end
 
 local function token_of(data)
   if type(data) ~= "table" then return "" end
@@ -687,8 +755,7 @@ local function pick_proxies(ctx, limit)
   -- Unconfigured providers go direct: only an explicit pool selection
   -- (dashboard proxy switch) routes through pooled exits.
   local pool = nil
-  if ctx.provider_config and ctx.provider_config.proxy
-    and ctx.provider_config.proxy.pool ~= "" then
+  if ctx.provider_config and ctx.provider_config.proxy and ctx.provider_config.proxy.pool ~= "" then
     pool = ctx.provider_config.proxy.pool
   end
   local proxies = llm_router.proxies.query({ pool = pool, limit = limit or 3 })
@@ -716,11 +783,15 @@ local function map_upstream(ctx, resp, cred_id)
     return "cred", { message = "kiro rate limited", code = "rate_limit", status = 429 }
   end
   if resp.status == 400 or resp.status == 404 then
-    return "done", { message = "kiro rejected the request with status " .. tostring(resp.status),
-      code = "invalid_request_error", status = resp.status }
+    return "done",
+      {
+        message = "kiro rejected the request with status " .. tostring(resp.status),
+        code = "invalid_request_error",
+        status = resp.status,
+      }
   end
-  return "proxy", { message = "kiro returned status " .. tostring(resp.status),
-    code = "server_error", status = resp.status }
+  return "proxy",
+    { message = "kiro returned status " .. tostring(resp.status), code = "server_error", status = resp.status }
 end
 
 -- Expiry check moved out of needs_refresh: true when the token needs a
@@ -730,15 +801,19 @@ local function is_token_stale(data)
   data = data or {}
   if not data.refresh_token or data.refresh_token == "" then return false end
   if not data.access_token or data.access_token == "" then return true end
-  if not data.expires_at or data.expires_at == "" then
-    return (data.client_id or "") ~= ""
-  end
+  if not data.expires_at or data.expires_at == "" then return (data.client_id or "") ~= "" end
   local now = os.time()
   local exp = nil
   local y, mo, d, h, mi, s = data.expires_at:match("^(%d+)-(%d+)-(%d+)T(%d+):(%d+):(%d+)")
   if y then
-    exp = os.time({ year = tonumber(y), month = tonumber(mo), day = tonumber(d),
-      hour = tonumber(h), min = tonumber(mi), sec = tonumber(s) })
+    exp = os.time({
+      year = tonumber(y),
+      month = tonumber(mo),
+      day = tonumber(d),
+      hour = tonumber(h),
+      min = tonumber(mi),
+      sec = tonumber(s),
+    })
   else
     exp = tonumber(data.expires_at)
   end
@@ -753,11 +828,14 @@ local function do_refresh(data)
   if not region or region == "" then region = DEFAULT_REGION end
   local client = llm_router.http_client({})
   local resp, err = client:request({
-    method = "POST", url = oidc_url(region, "token"),
+    method = "POST",
+    url = oidc_url(region, "token"),
     headers = { ["Content-Type"] = "application/json", ["Accept"] = "application/json" },
     body = json.encode({
-      clientId = data.client_id or "", clientSecret = data.client_secret or "",
-      refreshToken = data.refresh_token or "", grantType = "refresh_token",
+      clientId = data.client_id or "",
+      clientSecret = data.client_secret or "",
+      refreshToken = data.refresh_token or "",
+      grantType = "refresh_token",
     }),
   })
   if err then return nil end
@@ -765,7 +843,9 @@ local function do_refresh(data)
   local out = json.decode(resp.body)
   if not out.accessToken or out.accessToken == "" then return nil end
   local merged = {}
-  for k, v in pairs(data) do merged[k] = v end
+  for k, v in pairs(data) do
+    merged[k] = v
+  end
   merged.access_token = out.accessToken
   if out.refreshToken and out.refreshToken ~= "" then merged.refresh_token = out.refreshToken end
   if out.expiresIn and out.expiresIn > 0 then
@@ -791,14 +871,18 @@ local function assemble_completion(body, thinking, full_model)
   local message = { role = "assistant", content = text, tool_calls = state.tool_calls }
   if reasoning ~= "" then message.reasoning_content = reasoning end
   return {
-    id = "kiro-" .. tostring(os.time()), object = "chat.completion", created = os.time(),
+    id = "kiro-" .. tostring(os.time()),
+    object = "chat.completion",
+    created = os.time(),
     model = full_model,
     choices = {
-      { index = 0, message = message,
-        finish_reason = finish },
+      { index = 0, message = message, finish_reason = finish },
     },
-    usage = { prompt_tokens = state.prompt_tokens,
-      completion_tokens = state.completion_tokens, total_tokens = total },
+    usage = {
+      prompt_tokens = state.prompt_tokens,
+      completion_tokens = state.completion_tokens,
+      total_tokens = total,
+    },
   }
 end
 
@@ -812,26 +896,29 @@ llm_router.register("kiro", {
   },
 
   credential_schema = {
-    { type = "section", title = "Manual token entry",
+    {
+      type = "section",
+      title = "Manual token entry",
       subtitle = "Paste tokens from a previous login, or use device login instead.",
       content = {
         { type = "secret", name = "access_token", label = "Access Token" },
         { type = "secret", name = "refresh_token", label = "Refresh Token" },
         { type = "button", text = "Save", form_action = "submit" },
-      } },
+      },
+    },
   },
 
   jobs = {
     refresh = {
-      interval_seconds = 300, run_on_startup = true, timeout_ms = 30000,
+      interval_seconds = 300,
+      run_on_startup = true,
+      timeout_ms = 30000,
       run = function(ctx)
         for _, c in ipairs(llm_router.credentials.list()) do
           local data = c.data or {}
           if is_token_stale(data) then
             local merged, err = do_refresh(data)
-            if merged then
-              llm_router.credentials.update(c.id, merged)
-            end
+            if merged then llm_router.credentials.update(c.id, merged) end
           end
         end
         return true
@@ -862,8 +949,12 @@ llm_router.register("kiro", {
     local first = creds[1]
     local token = token_of(first.data)
     if token == "" then
-      return nil, { message = "kiro access token is required for model discovery",
-        code = "authentication_error", status = 401 }
+      return nil,
+        {
+          message = "kiro access token is required for model discovery",
+          code = "authentication_error",
+          status = 401,
+        }
     end
     local data = first.data or {}
     local region = runtime_region(first, ctx.provider_config)
@@ -895,12 +986,11 @@ llm_router.register("kiro", {
     local target = discovery_endpoints(region)[1] .. "?origin=AI_EDITOR"
     local arn = data.profile_arn
     if type(arn) ~= "string" or arn == "" then arn = data.profileArn end
-    if type(arn) == "string" and arn ~= "" then
-      target = target .. "&profileArn=" .. arn
-    end
+    if type(arn) == "string" and arn ~= "" then target = target .. "&profileArn=" .. arn end
     local client = llm_router.http_client({ timeout_ms = 15000 })
     local resp, err = client:request({
-      method = "GET", url = target,
+      method = "GET",
+      url = target,
       headers = {
         ["Authorization"] = "Bearer " .. token,
         ["Accept"] = "application/json",
@@ -912,18 +1002,12 @@ llm_router.register("kiro", {
       if type(err) == "table" and type(err.message) == "string" then message = err.message end
       return { status = "unknown", message = message }
     end
-    if resp.status == 200 then
-      return { status = "healthy" }
-    end
-    if resp.status == 401 then
-      return { status = "unhealthy", message = "access token rejected" }
-    end
+    if resp.status == 200 then return { status = "healthy" } end
+    if resp.status == 401 then return { status = "unhealthy", message = "access token rejected" } end
     return { status = "unknown", message = "status " .. tostring(resp.status) }
   end,
 
-  auth_initiate = function(ctx)
-    return start_page("", DEFAULT_REGION, BUILDER_START_URL, "builder-id")
-  end,
+  auth_initiate = function(ctx) return start_page("", DEFAULT_REGION, BUILDER_START_URL, "builder-id") end,
 
   auth_step = function(ctx, input)
     local action = input.action or ""
@@ -943,9 +1027,7 @@ llm_router.register("kiro", {
         return method_page("Choose a device login method to continue.")
       end
       llm_router.storage.set(scope, "method", method)
-      if method == "builder-id" then
-        return builder_page()
-      end
+      if method == "builder-id" then return builder_page() end
       return region_page("", DEFAULT_REGION, BUILDER_START_URL)
     end
 
@@ -962,10 +1044,13 @@ llm_router.register("kiro", {
       if method == "builder-id" then start_url = BUILDER_START_URL end
 
       local client = llm_router.http_client({})
-      local reg_resp, reg_err = client:request({        method = "POST", url = oidc_url(region, "client/register"),
+      local reg_resp, reg_err = client:request({
+        method = "POST",
+        url = oidc_url(region, "client/register"),
         headers = { ["Content-Type"] = "application/json" },
         body = json.encode({
-          clientName = "kiro-oauth-client", clientType = "public",
+          clientName = "kiro-oauth-client",
+          clientType = "public",
           scopes = { "codewhisperer:completions", "codewhisperer:analysis", "codewhisperer:conversations" },
           grantTypes = { "urn:ietf:params:oauth:grant-type:device_code", "refresh_token" },
           issuerUrl = ISSUER_URL,
@@ -979,7 +1064,8 @@ llm_router.register("kiro", {
       end
 
       local dev_resp, dev_err = client:request({
-        method = "POST", url = oidc_url(region, "device_authorization"),
+        method = "POST",
+        url = oidc_url(region, "device_authorization"),
         headers = { ["Content-Type"] = "application/json" },
         body = json.encode({ clientId = reg.clientId, clientSecret = reg.clientSecret, startUrl = start_url }),
       })
@@ -991,9 +1077,13 @@ llm_router.register("kiro", {
       end
 
       local state = {
-        method = method, region = region, start_url = start_url,
-        client_id = reg.clientId, client_secret = reg.clientSecret,
-        device_code = dev.deviceCode, user_code = dev.userCode,
+        method = method,
+        region = region,
+        start_url = start_url,
+        client_id = reg.clientId,
+        client_secret = reg.clientSecret,
+        device_code = dev.deviceCode,
+        user_code = dev.userCode,
         verification_uri = dev.verificationUri or "",
         verification_uri_complete = dev.verificationUriComplete or "",
         expires_at = os.time() + (dev.expiresIn or 600),
@@ -1013,10 +1103,12 @@ llm_router.register("kiro", {
       end
       local client = llm_router.http_client({})
       local resp, err = client:request({
-        method = "POST", url = oidc_url(state.region, "token"),
+        method = "POST",
+        url = oidc_url(state.region, "token"),
         headers = { ["Content-Type"] = "application/json", ["Accept"] = "application/json" },
         body = json.encode({
-          clientId = state.client_id, clientSecret = state.client_secret,
+          clientId = state.client_id,
+          clientSecret = state.client_secret,
           deviceCode = state.device_code,
           grantType = "urn:ietf:params:oauth:grant-type:device_code",
         }),
@@ -1055,23 +1147,24 @@ llm_router.register("kiro", {
     for _, cred in ipairs(llm_router.credentials.list()) do
       for _, px in ipairs(pick_proxies(ctx, 3)) do
         local resp, err = client:request({
-          method = "POST", url = generate_url(cred, ctx.provider_config),
+          method = "POST",
+          url = generate_url(cred, ctx.provider_config),
           headers = generate_headers(cred),
           body = json.encode(build_payload(request, model, thinking, effort)),
           proxy_url = px.url,
-          })
-          if err == nil and resp.status == 200 then
-            return assemble_completion(resp.body, thinking, request.model)
-          elseif err ~= nil then
-            last_err = err
-          else
-            local action, terr = map_upstream(ctx, resp, cred.id)
-            if action == "done" then return nil, terr end
-            last_err = terr
-            if action == "cred" then break end
-          end
+        })
+        if err == nil and resp.status == 200 then
+          return assemble_completion(resp.body, thinking, request.model)
+        elseif err ~= nil then
+          last_err = err
+        else
+          local action, terr = map_upstream(ctx, resp, cred.id)
+          if action == "done" then return nil, terr end
+          last_err = terr
+          if action == "cred" then break end
         end
       end
+    end
     return nil, last_err or { message = "all kiro credentials exhausted", code = "server_error" }
   end,
 
@@ -1084,117 +1177,165 @@ llm_router.register("kiro", {
     local last_err = nil
     for _, cred in ipairs(llm_router.credentials.list()) do
       for _, px in ipairs(pick_proxies(ctx, 3)) do
-    local response_id = "kiro-" .. tostring(os.time())
-    local created = os.time()
-    local buffer = ""
-    local builders = {}
-    local saw_tool = false
-    local first = true
-    local done = false
-    local st = { fatal = false, next_cred = false }
-    local stream_usage = nil
-    local think_state = { thinkingMode = false, pending = "" }
-    local function emit_delta(delta)
-      if first then delta.role = "assistant" end
-      first = false
-      emit({ id = response_id, object = "chat.completion.chunk", created = created,
-        model = model, choices = { { index = 0, delta = delta } } })
-      done = true
-    end
-    local payload = build_payload(request, short_model, thinking, effort)
-    local generate = generate_url(cred, ctx.provider_config)
-    local _, stream_err = client_stream_raw(generate_headers(cred), payload, generate, px.url, cred.id, st, function(bytes)
-      buffer = buffer .. bytes
-      while true do
-        if #buffer < 16 then break end
-        local total = u32be(buffer, 1)
-        if total < 16 or total > #buffer then break end
-        local frame = parse_frame(buffer:sub(1, total))
-        buffer = buffer:sub(total + 1)
-        if frame then
-          local etype = frame.headers[":event-type"]
-          local p = frame.payload
-          if etype == "assistantResponseEvent" or etype == "codeEvent" then
-            if type(p.content) == "string" and p.content ~= "" then
-              if thinking then
-                local content_parts, reasoning_parts = {}, {}
-                split_thinking(think_state, p.content, content_parts, reasoning_parts)
-                local text = table.concat(content_parts, "")
-                local reasoning = table.concat(reasoning_parts, "")
-                if text ~= "" then emit_delta({ content = text }) end
-                if reasoning ~= "" then emit_delta({ reasoning_content = reasoning }) end
-              else
-              local delta = { content = p.content }
-              if first then delta.role = "assistant" end
-              first = false
-              emit({ id = response_id, object = "chat.completion.chunk", created = created,
-                model = model, choices = { { index = 0, delta = delta } } })
-              done = true
+        local response_id = "kiro-" .. tostring(os.time())
+        local created = os.time()
+        local buffer = ""
+        local builders = {}
+        local saw_tool = false
+        local first = true
+        local done = false
+        local st = { fatal = false, next_cred = false }
+        local stream_usage = nil
+        local think_state = { thinkingMode = false, pending = "" }
+        local function emit_delta(delta)
+          if first then delta.role = "assistant" end
+          first = false
+          emit({
+            id = response_id,
+            object = "chat.completion.chunk",
+            created = created,
+            model = model,
+            choices = { { index = 0, delta = delta } },
+          })
+          done = true
+        end
+        local payload = build_payload(request, short_model, thinking, effort)
+        local generate = generate_url(cred, ctx.provider_config)
+        local _, stream_err = client_stream_raw(
+          generate_headers(cred),
+          payload,
+          generate,
+          px.url,
+          cred.id,
+          st,
+          function(bytes)
+            buffer = buffer .. bytes
+            while true do
+              if #buffer < 16 then break end
+              local total = u32be(buffer, 1)
+              if total < 16 or total > #buffer then break end
+              local frame = parse_frame(buffer:sub(1, total))
+              buffer = buffer:sub(total + 1)
+              if frame then
+                local etype = frame.headers[":event-type"]
+                local p = frame.payload
+                if etype == "assistantResponseEvent" or etype == "codeEvent" then
+                  if type(p.content) == "string" and p.content ~= "" then
+                    if thinking then
+                      local content_parts, reasoning_parts = {}, {}
+                      split_thinking(think_state, p.content, content_parts, reasoning_parts)
+                      local text = table.concat(content_parts, "")
+                      local reasoning = table.concat(reasoning_parts, "")
+                      if text ~= "" then emit_delta({ content = text }) end
+                      if reasoning ~= "" then emit_delta({ reasoning_content = reasoning }) end
+                    else
+                      local delta = { content = p.content }
+                      if first then delta.role = "assistant" end
+                      first = false
+                      emit({
+                        id = response_id,
+                        object = "chat.completion.chunk",
+                        created = created,
+                        model = model,
+                        choices = { { index = 0, delta = delta } },
+                      })
+                      done = true
+                    end
+                  end
+                elseif etype == "reasoningContentEvent" then
+                  local text = reasoning_text(p)
+                  if text ~= "" then emit_delta({ reasoning_content = text }) end
+                elseif etype == "toolUseEvent" then
+                  local id = p.toolUseId or ""
+                  if id == "" then id = "call_" .. tostring(os.time()) end
+                  local b = builders[id]
+                  if b == nil then
+                    b = { name = "", args = "" }
+                    builders[id] = b
+                  end
+                  if type(p.name) == "string" and p.name ~= "" then b.name = p.name end
+                  local is_string = false
+                  if p.input ~= nil then
+                    if type(p.input) == "string" then
+                      b.args = b.args .. p.input
+                      is_string = true
+                    else
+                      b.args = json.encode(p.input)
+                    end
+                  end
+                  local should = false
+                  if p.stop == true then
+                    should = true
+                  elseif not is_string and p.input ~= nil and b.name ~= "" then
+                    should = true
+                  end
+                  if should and b.name ~= "" then
+                    local args = b.args:match("^%s*(.-)%s*$")
+                    if args == "" then args = "{}" end
+                    saw_tool = true
+                    local delta = {
+                      tool_calls = {
+                        {
+                          index = 0,
+                          id = id,
+                          type = "function",
+                          ["function"] = { name = b.name, arguments = args },
+                        },
+                      },
+                    }
+                    if first then delta.role = "assistant" end
+                    first = false
+                    emit({
+                      id = response_id,
+                      object = "chat.completion.chunk",
+                      created = created,
+                      model = model,
+                      choices = { { index = 0, delta = delta } },
+                    })
+                    done = true
+                    builders[id] = nil
+                  end
+                elseif etype == "metricsEvent" then
+                  local m = p.metricsEvent or p
+                  local itok = tonumber(m.inputTokens) or 0
+                  local otok = tonumber(m.outputTokens) or 0
+                  if itok > 0 or otok > 0 then
+                    stream_usage = { prompt_tokens = itok, completion_tokens = otok, total_tokens = itok + otok }
+                  end
+                end
               end
             end
-          elseif etype == "reasoningContentEvent" then
-            local text = reasoning_text(p)
-            if text ~= "" then emit_delta({ reasoning_content = text }) end
-          elseif etype == "toolUseEvent" then
-            local id = p.toolUseId or ""
-            if id == "" then id = "call_" .. tostring(os.time()) end
-            local b = builders[id]
-            if b == nil then b = { name = "", args = "" }; builders[id] = b end
-            if type(p.name) == "string" and p.name ~= "" then b.name = p.name end
-            local is_string = false
-            if p.input ~= nil then
-              if type(p.input) == "string" then b.args = b.args .. p.input; is_string = true
-              else b.args = json.encode(p.input) end
-            end
-            local should = false
-            if p.stop == true then should = true
-            elseif not is_string and p.input ~= nil and b.name ~= "" then should = true end
-            if should and b.name ~= "" then
-              local args = b.args:match("^%s*(.-)%s*$")
-              if args == "" then args = "{}" end
-              saw_tool = true
-              local delta = { tool_calls = { { index = 0, id = id, type = "function",
-                ["function"] = { name = b.name, arguments = args } } } }
-              if first then delta.role = "assistant" end
-              first = false
-              emit({ id = response_id, object = "chat.completion.chunk", created = created,
-                model = model, choices = { { index = 0, delta = delta } } })
-              done = true
-              builders[id] = nil
-            end
-          elseif etype == "metricsEvent" then
-            local m = p.metricsEvent or p
-            local itok = tonumber(m.inputTokens) or 0
-            local otok = tonumber(m.outputTokens) or 0
-            if itok > 0 or otok > 0 then
-              stream_usage = { prompt_tokens = itok, completion_tokens = otok,
-                total_tokens = itok + otok }
-            end
           end
+        )
+        if stream_err then
+          last_err = stream_err
+          if st.fatal then return nil, last_err end
+          if st.next_cred then break end
+          -- A stream that emitted already belongs to that attempt: surface
+          -- instead of failing over mid-stream.
+          if done then return nil, last_err end
+        else
+          if thinking and think_state.pending ~= "" then
+            if think_state.thinkingMode then
+              emit_delta({ reasoning_content = think_state.pending })
+            else
+              emit_delta({ content = think_state.pending })
+            end
+            think_state.pending = ""
+          end
+          local finish = "stop"
+          if saw_tool then finish = "tool_calls" end
+          local last = {
+            id = response_id,
+            object = "chat.completion.chunk",
+            created = created,
+            model = model,
+            choices = { { index = 0, delta = {}, finish_reason = finish } },
+          }
+          if stream_usage then last.usage = stream_usage end
+          emit(last)
+          return
         end
-      end
-    end)
-    if stream_err then
-      last_err = stream_err
-      if st.fatal then return nil, last_err end
-      if st.next_cred then break end
-      -- A stream that emitted already belongs to that attempt: surface
-      -- instead of failing over mid-stream.
-      if done then return nil, last_err end
-    else
-      if thinking and think_state.pending ~= "" then
-        if think_state.thinkingMode then emit_delta({ reasoning_content = think_state.pending })
-        else emit_delta({ content = think_state.pending }) end
-        think_state.pending = ""
-      end
-      local finish = "stop"
-      if saw_tool then finish = "tool_calls" end
-      local last = { id = response_id, object = "chat.completion.chunk", created = created,
-        model = model, choices = { { index = 0, delta = {}, finish_reason = finish } } }
-      if stream_usage then last.usage = stream_usage end
-      emit(last)
-      return
-    end
       end
     end
     return nil, last_err or { message = "all kiro credentials exhausted", code = "server_error" }
@@ -1206,12 +1347,14 @@ llm_router.register("kiro", {
 function client_stream_raw(headers, payload, url, proxy_url, cred_id, st, on_bytes)
   local client = llm_router.http_client({})
   return client:stream({
-    method = "POST", url = url,
-    headers = headers, body = json.encode(payload),
+    method = "POST",
+    url = url,
+    headers = headers,
+    body = json.encode(payload),
     proxy_url = proxy_url,
     on_response = function(r)
       if r.status == 200 then return end
-              local action, terr = map_upstream(ctx, r, cred_id)
+      local action, terr = map_upstream(ctx, r, cred_id)
       if action == "done" then st.fatal = true end
       if action == "cred" then st.next_cred = true end
       return terr

@@ -54,8 +54,7 @@ llm_router.register_proxy_source("thespeedx", {
       if line ~= "" then
         local host, port = line:match("^(.+):(%d+)$")
         port = tonumber(port)
-        if type(host) == "string" and host ~= "" and type(port) == "number"
-            and port >= 1 and port <= 65535 then
+        if type(host) == "string" and host ~= "" and type(port) == "number" and port >= 1 and port <= 65535 then
           table.insert(out, { protocol = "http", host = host, port = port, country = "" })
         end
       end

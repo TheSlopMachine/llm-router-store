@@ -12,9 +12,7 @@ local function api_key_of(data)
   return data.api_key or ""
 end
 
-local function invalid_request(message)
-  return { message = message, code = "invalid_request_error", status = 400 }
-end
+local function invalid_request(message) return { message = message, code = "invalid_request_error", status = 400 } end
 
 -- Dead-key bench: shared disable when automation is on (visible in the
 -- dashboard, global to every path), unified cooldown park otherwise.
@@ -47,8 +45,7 @@ end
 -- (dashboard proxy switch) routes through pooled exits.
 local function pick_proxies(ctx, limit)
   local pool = nil
-  if ctx.provider_config and ctx.provider_config.proxy
-    and ctx.provider_config.proxy.pool ~= "" then
+  if ctx.provider_config and ctx.provider_config.proxy and ctx.provider_config.proxy.pool ~= "" then
     pool = ctx.provider_config.proxy.pool
   end
   local proxies = llm_router.proxies.query({ pool = pool, country = "US", limit = limit or 3 })
@@ -71,10 +68,15 @@ local function map_upstream(ctx, resp, cred_id)
     -- Geo-blocked: the proxy exit is at fault, not the request.
     return "proxy", { message = "gemini location block on current exit", code = "server_error", status = 502 }
   end
-  if status == 400 and (string.find(lower, "api key not valid", 1, true)
+  if
+    status == 400
+    and (
+      string.find(lower, "api key not valid", 1, true)
       or string.find(lower, "api_key_invalid", 1, true)
       or string.find(lower, "invalid api key", 1, true)
-      or string.find(lower, "unauthenticated", 1, true)) then
+      or string.find(lower, "unauthenticated", 1, true)
+    )
+  then
     bench(ctx, cred_id, "gemini rejected the api key", 300)
     return "cred", { message = "gemini rejected the api key", code = "authentication_error", status = 401 }
   end
@@ -89,21 +91,25 @@ local function map_upstream(ctx, resp, cred_id)
     llm_router.credentials.park(cred_id, retry_after_secs(resp), "gemini rate limited")
     return "cred", { message = "gemini rate limited", code = "rate_limit", status = 429 }
   end
-  if status == 404 then
-    return "done", { message = "gemini model not found", code = "not_found", status = 404 }
-  end
+  if status == 404 then return "done", { message = "gemini model not found", code = "not_found", status = 404 } end
   if status == 400 or status == 422 then
-    return "done", { message = "gemini rejected the request with status " .. tostring(status),
-      code = "invalid_request_error", status = status }
+    return "done",
+      {
+        message = "gemini rejected the request with status " .. tostring(status),
+        code = "invalid_request_error",
+        status = status,
+      }
   end
-  return "proxy", { message = "gemini returned status " .. tostring(status),
-    code = "server_error", status = status }
+  return "proxy", { message = "gemini returned status " .. tostring(status), code = "server_error", status = status }
 end
 
 local function map_finish_reason(r)
   if r == nil or r == "" then return "stop" end
-  if r == "STOP" then return "stop"
-  elseif r == "MAX_TOKENS" then return "length" end
+  if r == "STOP" then
+    return "stop"
+  elseif r == "MAX_TOKENS" then
+    return "length"
+  end
   -- Every other documented FinishReason is a policy/content block of some
   -- kind; OpenAI has a single content_filter bucket for all of them.
   return "content_filter"
@@ -145,10 +151,7 @@ local function parse_data_url(s)
   local mime, b64 = trimmed:match("^data:([^;,]+);base64,(.+)$")
   if not mime or not b64 or b64 == "" then return nil end
   local family = mime:match("^([^/]+)/")
-  if family ~= "image" and family ~= "audio" and family ~= "video"
-      and mime ~= "application/pdf" then
-    return nil
-  end
+  if family ~= "image" and family ~= "audio" and family ~= "video" and mime ~= "application/pdf" then return nil end
   return mime, b64
 end
 
@@ -161,9 +164,7 @@ local function build_contents(messages)
     if m.role == "assistant" and type(m.tool_calls) == "table" then
       for _, tc in ipairs(m.tool_calls) do
         local fn = tc and tc["function"]
-        if tc and tc.id and tc.id ~= "" and fn and fn.name and fn.name ~= "" then
-          call_names[tc.id] = fn.name
-        end
+        if tc and tc.id and tc.id ~= "" and fn and fn.name and fn.name ~= "" then call_names[tc.id] = fn.name end
       end
     end
   end
@@ -255,20 +256,19 @@ local function build_contents(messages)
           -- strings on this endpoint, and resolution is advisory only.
           return push_binary({ inlineData = { mimeType = mime, data = b64 } })
         end
-        if url ~= "" then
-          return "image URL is not a data: URL; the plugin cannot download remote images"
-        end
+        if url ~= "" then return "image URL is not a data: URL; the plugin cannot download remote images" end
         return nil
       end
       if type(seg.input_audio) == "table" then
         local data = seg.input_audio.data or ""
         local format = (seg.input_audio.format or ""):lower()
         local mime = nil
-        if format == "wav" then mime = "audio/wav"
-        elseif format == "mp3" then mime = "audio/mpeg" end
-        if data == "" or not mime then
-          return "input_audio needs base64 data and format wav or mp3"
+        if format == "wav" then
+          mime = "audio/wav"
+        elseif format == "mp3" then
+          mime = "audio/mpeg"
         end
+        if data == "" or not mime then return "input_audio needs base64 data and format wav or mp3" end
         return push_binary({ inlineData = { mimeType = mime, data = data } })
       end
       local text = text_of_content(seg)
@@ -296,23 +296,23 @@ local function build_contents(messages)
       if text ~= "" then table.insert(system_parts, { text = text }) end
     elseif role == "assistant" then
       local text = text_of_content(m.content)
-      if (m.refusal == nil or m.refusal == "") and text == ""
-          and (not m.tool_calls or #m.tool_calls == 0)
-          and (not m.reasoning_content or m.reasoning_content == "") then
+      if
+        (m.refusal == nil or m.refusal == "")
+        and text == ""
+        and (not m.tool_calls or #m.tool_calls == 0)
+        and (not m.reasoning_content or m.reasoning_content == "")
+      then
         -- skip empty assistant turns (no text, calls, reasoning or refusal)
       else
         if m.reasoning_content and m.reasoning_content ~= "" then
           model_part({ text = m.reasoning_content, thought = true })
         end
         if text ~= "" then model_part({ text = text }) end
-        if m.refusal and m.refusal ~= "" and text == ""
-            and (not m.tool_calls or #m.tool_calls == 0) then
+        if m.refusal and m.refusal ~= "" and text == "" and (not m.tool_calls or #m.tool_calls == 0) then
           model_part({ text = m.refusal })
         end
         for _, tc in ipairs(type(m.tool_calls) == "table" and m.tool_calls or {}) do
-          if type(tc) ~= "table" then
-            return nil, nil, invalid_request("assistant tool call must be an object")
-          end
+          if type(tc) ~= "table" then return nil, nil, invalid_request("assistant tool call must be an object") end
           local fn = tc["function"] or {}
           if type(fn.name) ~= "string" or fn.name == "" then
             return nil, nil, invalid_request("assistant tool call is missing a function name")
@@ -375,9 +375,7 @@ local function build_contents(messages)
   if #contents > 0 and contents[#contents].role == "model" then
     table.insert(contents, { role = "user", parts = { { text = " " } } })
   end
-  if #contents == 0 then
-    return nil, nil, invalid_request("messages produced no content")
-  end
+  if #contents == 0 then return nil, nil, invalid_request("messages produced no content") end
   return contents, system_parts, nil
 end
 
@@ -385,12 +383,28 @@ end
 -- Schema subset survives; unknown keywords (strict, $schema,
 -- additionalProperties, ...) are stripped because Gemini rejects them.
 local SCHEMA_KEYS = {
-  type = true, format = true, title = true, description = true,
-  nullable = true, enum = true, properties = true, required = true,
-  propertyOrdering = true, items = true, anyOf = true,
-  minItems = true, maxItems = true, minLength = true, maxLength = true,
-  pattern = true, minimum = true, maximum = true,
-  minProperties = true, maxProperties = true, example = true, default = true,
+  type = true,
+  format = true,
+  title = true,
+  description = true,
+  nullable = true,
+  enum = true,
+  properties = true,
+  required = true,
+  propertyOrdering = true,
+  items = true,
+  anyOf = true,
+  minItems = true,
+  maxItems = true,
+  minLength = true,
+  maxLength = true,
+  pattern = true,
+  minimum = true,
+  maximum = true,
+  minProperties = true,
+  maxProperties = true,
+  example = true,
+  default = true,
 }
 
 local function sanitize_schema(s)
@@ -400,19 +414,21 @@ local function sanitize_schema(s)
     if SCHEMA_KEYS[k] then
       if k == "properties" and type(v) == "table" then
         local props = {}
-        for pk, pv in pairs(v) do props[pk] = sanitize_schema(pv) end
+        for pk, pv in pairs(v) do
+          props[pk] = sanitize_schema(pv)
+        end
         out[k] = props
       elseif k == "items" then
         out[k] = sanitize_schema(v)
       elseif k == "anyOf" and type(v) == "table" then
         local anys = {}
-        for _, sub in ipairs(v) do table.insert(anys, sanitize_schema(sub)) end
+        for _, sub in ipairs(v) do
+          table.insert(anys, sanitize_schema(sub))
+        end
         out[k] = anys
       elseif k == "required" then
         -- Skip empty required array to avoid Gemini API validation error
-        if type(v) == "table" and next(v) ~= nil then
-          out[k] = v
-        end
+        if type(v) == "table" and next(v) ~= nil then out[k] = v end
       else
         out[k] = v
       end
@@ -421,15 +437,15 @@ local function sanitize_schema(s)
   return out
 end
 
-local function schema_nonempty(s)
-  return type(s) == "table" and next(s) ~= nil
-end
+local function schema_nonempty(s) return type(s) == "table" and next(s) ~= nil end
 
 -- Built-in Gemini tools selectable via provider_config.google_tools, e.g.
 -- {"googleSearch", "codeExecution"}. No OpenAI equivalent exists, so these
 -- are static per-provider opt-ins, not per-request parameters.
 local BUILTIN_TOOLS = {
-  googleSearch = true, codeExecution = true, urlContext = true,
+  googleSearch = true,
+  codeExecution = true,
+  urlContext = true,
 }
 
 -- A request-level function tool named web_search (or google_search) is the
@@ -469,15 +485,11 @@ local function build_tools(request, provider_config)
         table.insert(decls, decl)
       end
     end
-    if #decls > 0 then
-      table.insert(tool_list, 1, { functionDeclarations = decls })
-    end
+    if #decls > 0 then table.insert(tool_list, 1, { functionDeclarations = decls }) end
   end
   if type(provider_config) == "table" and type(provider_config.google_tools) == "table" then
     for _, name in ipairs(provider_config.google_tools) do
-      if not BUILTIN_TOOLS[name] then
-        return nil, nil, invalid_request("unknown built-in tool " .. tostring(name))
-      end
+      if not BUILTIN_TOOLS[name] then return nil, nil, invalid_request("unknown built-in tool " .. tostring(name)) end
       enable_builtin(name)
     end
   end
@@ -487,15 +499,25 @@ local function build_tools(request, provider_config)
   local mode, allowed = nil, nil
   if tc == nil then
     -- omit: Gemini defaults to AUTO
-  elseif tc == "none" then mode = "NONE"
-  elseif tc == "auto" then mode = "AUTO"
-  elseif tc == "required" then mode = "ANY"
+  elseif tc == "none" then
+    mode = "NONE"
+  elseif tc == "auto" then
+    mode = "AUTO"
+  elseif tc == "required" then
+    mode = "ANY"
   elseif type(tc) == "table" then
-    if tc.type == "none" then mode = "NONE"
-    elseif tc.type == "auto" then mode = "AUTO"
-    elseif tc.type == "required" then mode = "ANY"
-    elseif tc.type == "function" and type(tc["function"]) == "table"
-        and tc["function"].name and tc["function"].name ~= "" then
+    if tc.type == "none" then
+      mode = "NONE"
+    elseif tc.type == "auto" then
+      mode = "AUTO"
+    elseif tc.type == "required" then
+      mode = "ANY"
+    elseif
+      tc.type == "function"
+      and type(tc["function"]) == "table"
+      and tc["function"].name
+      and tc["function"].name ~= ""
+    then
       mode = "ANY"
       allowed = { tc["function"].name }
     end
@@ -508,15 +530,11 @@ local function build_tools(request, provider_config)
   return out_tools, tool_config, nil
 end
 
-local function is_gemini3(model)
-  return (model:lower():match("^gemini%-3") ~= nil)
-end
+local function is_gemini3(model) return (model:lower():match("^gemini%-3") ~= nil) end
 
 -- Gemini resource names arrive as "models/<name>" inside the bare model id;
 -- the upstream path wants the name without it.
-local function request_model_name(bare)
-  return ((bare or ""):gsub("^models/", ""))
-end
+local function request_model_name(bare) return ((bare or ""):gsub("^models/", "")) end
 
 local function build_generation_config(request, model)
   local cfg = nil
@@ -525,17 +543,15 @@ local function build_generation_config(request, model)
     return cfg
   end
   local max_tokens = request.max_completion_tokens or request.max_tokens
-  if type(max_tokens) == "number" and max_tokens > 0 then
-    ensure().maxOutputTokens = math.floor(max_tokens)
-  end
-  if request.temperature and request.temperature > 0 then
-    ensure().temperature = request.temperature
-  end
-  if request.top_p and request.top_p > 0 then
-    ensure().topP = request.top_p
-  end
-  if type(request.seed) == "number" and request.seed == math.floor(request.seed)
-      and request.seed >= -2147483648 and request.seed <= 2147483647 then
+  if type(max_tokens) == "number" and max_tokens > 0 then ensure().maxOutputTokens = math.floor(max_tokens) end
+  if request.temperature and request.temperature > 0 then ensure().temperature = request.temperature end
+  if request.top_p and request.top_p > 0 then ensure().topP = request.top_p end
+  if
+    type(request.seed) == "number"
+    and request.seed == math.floor(request.seed)
+    and request.seed >= -2147483648
+    and request.seed <= 2147483647
+  then
     ensure().seed = request.seed
   end
   if request.stop ~= nil then
@@ -544,9 +560,7 @@ local function build_generation_config(request, model)
       if request.stop ~= "" then stops = { request.stop } end
     elseif type(request.stop) == "table" then
       for _, s in ipairs(request.stop) do
-        if (type(s) == "string" and s ~= "") or type(s) == "number" then
-          table.insert(stops, tostring(s))
-        end
+        if (type(s) == "string" and s ~= "") or type(s) == "number" then table.insert(stops, tostring(s)) end
         if #stops >= 5 then break end
       end
     end
@@ -604,9 +618,7 @@ local function build_payload(request, provider_config)
   local contents, system_parts, cerr = build_contents(request.messages)
   if cerr then return nil, cerr end
   local payload = { contents = contents }
-  if #system_parts > 0 then
-    payload.systemInstruction = { parts = system_parts }
-  end
+  if #system_parts > 0 then payload.systemInstruction = { parts = system_parts } end
   local tools, tool_config, terr = build_tools(request, provider_config)
   if terr then return nil, terr end
   if tools then payload.tools = tools end
@@ -625,17 +637,13 @@ local function collect_parts(cand, out, tool_seq)
   for _, p in ipairs(parts) do
     if type(p) == "table" then
       if p.thought == true then
-        if type(p.text) == "string" and p.text ~= "" then
-          table.insert(out.reasoning, p.text)
-        end
+        if type(p.text) == "string" and p.text ~= "" then table.insert(out.reasoning, p.text) end
       elseif type(p.text) == "string" and p.text ~= "" then
         table.insert(out.text, p.text)
       elseif type(p.functionCall) == "table" then
         local fc = p.functionCall
         local args = "{}"
-        if type(fc.args) == "table" and next(fc.args) ~= nil then
-          args = json.encode(fc.args)
-        end
+        if type(fc.args) == "table" and next(fc.args) ~= nil then args = json.encode(fc.args) end
         tool_seq.n = tool_seq.n + 1
         local call_id = (fc.id and fc.id ~= "") and fc.id or string.format("call_%d_%d", cand.index or 0, tool_seq.n)
         local call = {
@@ -656,9 +664,7 @@ local function collect_parts(cand, out, tool_seq)
         -- markdown image so the bytes are not silently dropped.
         local mime = p.inlineData.mimeType or "application/octet-stream"
         local data = p.inlineData.data or ""
-        if data ~= "" then
-          table.insert(out.text, "![" .. mime .. "](data:" .. mime .. ";base64," .. data .. ")")
-        end
+        if data ~= "" then table.insert(out.text, "![" .. mime .. "](data:" .. mime .. ";base64," .. data .. ")") end
       elseif type(p.fileData) == "table" and p.fileData.fileUri then
         table.insert(out.text, "[file](" .. tostring(p.fileData.fileUri) .. ")")
       elseif type(p.executableCode) == "table" then
@@ -740,12 +746,8 @@ local function estimate_rpd(name)
 end
 
 local function model_short_name(entry)
-  if type(entry.name) == "string" and entry.name ~= "" then
-    return entry.name:gsub("^models/", "")
-  end
-  if type(entry.baseModelId) == "string" and entry.baseModelId ~= "" then
-    return entry.baseModelId
-  end
+  if type(entry.name) == "string" and entry.name ~= "" then return entry.name:gsub("^models/", "") end
+  if type(entry.baseModelId) == "string" and entry.baseModelId ~= "" then return entry.baseModelId end
   return "unknown-model"
 end
 
@@ -758,9 +760,7 @@ end
 
 -- TTS preview models speak PCM only; image models (Nano Banana family) also
 -- chat, so they keep chat/completions next to images/generations.
-local function is_tts_model(name)
-  return name:lower():find("tts", 1, true) ~= nil
-end
+local function is_tts_model(name) return name:lower():find("tts", 1, true) ~= nil end
 
 local function is_image_model(name)
   local lower = name:lower()
@@ -773,16 +773,24 @@ local function wrap_wav(pcm, rate, channels)
   local function u32(n)
     return string.char(n % 256, math.floor(n / 256) % 256, math.floor(n / 65536) % 256, math.floor(n / 16777216) % 256)
   end
-  local function u16(n)
-    return string.char(n % 256, math.floor(n / 256) % 256)
-  end
+  local function u16(n) return string.char(n % 256, math.floor(n / 256) % 256) end
   local byte_rate = rate * channels * (bits / 8)
   local block_align = channels * (bits / 8)
   local data_size = #pcm
-  return "RIFF" .. u32(36 + data_size) .. "WAVE"
-    .. "fmt " .. u32(16) .. u16(1) .. u16(channels) .. u32(rate)
-    .. u32(byte_rate) .. u16(block_align) .. u16(bits)
-    .. "data" .. u32(data_size) .. pcm
+  return "RIFF"
+    .. u32(36 + data_size)
+    .. "WAVE"
+    .. "fmt "
+    .. u32(16)
+    .. u16(1)
+    .. u16(channels)
+    .. u32(rate)
+    .. u32(byte_rate)
+    .. u16(block_align)
+    .. u16(bits)
+    .. "data"
+    .. u32(data_size)
+    .. pcm
 end
 
 -- Map an OpenAI size string ("1024x1024") to a Gemini aspect ratio.
@@ -804,7 +812,9 @@ local function aspect_ratio_of(size)
   local best, best_diff = nil, math.huge
   for _, c in ipairs(candidates) do
     local diff = math.abs(c.ratio - r)
-    if diff < best_diff then best, best_diff = c.label, diff end
+    if diff < best_diff then
+      best, best_diff = c.label, diff
+    end
   end
   return best
 end
@@ -817,9 +827,13 @@ local function find_inline_data(g, family_prefix)
     local parts = cand and cand.content and cand.content.parts or {}
     for _, p in ipairs(parts) do
       local inline = type(p) == "table" and p.inlineData or nil
-      if inline and type(inline.data) == "string" and inline.data ~= ""
-          and type(inline.mimeType) == "string"
-          and inline.mimeType:sub(1, #family_prefix) == family_prefix then
+      if
+        inline
+        and type(inline.data) == "string"
+        and inline.data ~= ""
+        and type(inline.mimeType) == "string"
+        and inline.mimeType:sub(1, #family_prefix) == family_prefix
+      then
         return inline
       end
     end
@@ -830,7 +844,8 @@ end
 local function blocked_error(g)
   if g and g.promptFeedback and g.promptFeedback.blockReason then
     -- Content rejected by upstream policy, not a malformed request.
-    return nil, { message = "prompt blocked: " .. tostring(g.promptFeedback.blockReason), code = "content_filter", status = 400 }
+    return nil,
+      { message = "prompt blocked: " .. tostring(g.promptFeedback.blockReason), code = "content_filter", status = 400 }
   end
   return nil, { message = "upstream returned no generated content", code = "server_error", status = 502 }
 end
@@ -839,8 +854,12 @@ end
 local function assemble_completion(body, full_model)
   local g = json.decode(body)
   if (not g.candidates or #g.candidates == 0) and g.promptFeedback and g.promptFeedback.blockReason then
-    return nil, { message = "prompt blocked: " .. tostring(g.promptFeedback.blockReason),
-      code = "content_filter", status = 400 }
+    return nil,
+      {
+        message = "prompt blocked: " .. tostring(g.promptFeedback.blockReason),
+        code = "content_filter",
+        status = 400,
+      }
   end
   local choices = {}
   if g.candidates and #g.candidates > 0 then
@@ -848,14 +867,13 @@ local function assemble_completion(body, full_model)
     local out = { text = {}, reasoning = {}, toolcalls = {} }
     collect_parts(cand, out, { n = 0 })
     local message = { role = "assistant", content = table.concat(out.text, "") }
-    if #out.reasoning > 0 then
-      message.reasoning_content = table.concat(out.reasoning, "")
-    end
+    if #out.reasoning > 0 then message.reasoning_content = table.concat(out.reasoning, "") end
     if #out.toolcalls > 0 then
       local calls = {}
       for _, tc in ipairs(out.toolcalls) do
         local call = {
-          id = tc.id, type = "function",
+          id = tc.id,
+          type = "function",
           ["function"] = { name = tc.name, arguments = tc.arguments },
         }
         -- Preserve thought_signature for round-trip back to Gemini
@@ -878,8 +896,10 @@ local function assemble_completion(body, full_model)
   end
   return {
     id = (g.responseId and g.responseId ~= "") and g.responseId or ("google-" .. tostring(os.time())),
-    object = "chat.completion", created = os.time(),
-    model = full_model, choices = choices,
+    object = "chat.completion",
+    created = os.time(),
+    model = full_model,
+    choices = choices,
     usage = build_usage(g.usageMetadata) or { prompt_tokens = 0, completion_tokens = 0, total_tokens = 0 },
   }
 end
@@ -890,13 +910,16 @@ llm_router.register("google", {
   proxy_schema = {},
 
   credential_schema = {
-    { type = "section", title = "Google AI Studio",
+    {
+      type = "section",
+      title = "Google AI Studio",
       subtitle = "Get your API key from Google AI Studio.",
       content = {
         { type = "link", text = "Open AI Studio", url = "https://aistudio.google.com/app/apikey" },
         { type = "secret", name = "api_key", label = "API Key", required = true },
         { type = "button", text = "Save", form_action = "submit" },
-      } },
+      },
+    },
   },
 
   validate_credentials = function(data)
@@ -904,9 +927,7 @@ llm_router.register("google", {
     if key == nil or key == "" then
       return false, { message = "api_key is required", code = "invalid_request_error" }
     end
-    if #key < 20 then
-      return false, { message = "api_key: minimum 20 characters", code = "invalid_request_error" }
-    end
+    if #key < 20 then return false, { message = "api_key: minimum 20 characters", code = "invalid_request_error" } end
     return true
   end,
 
@@ -921,13 +942,18 @@ llm_router.register("google", {
     local infos = {}
     while url do
       local resp, err = client:request({
-        method = "GET", url = url,
+        method = "GET",
+        url = url,
         headers = { ["x-goog-api-key"] = key },
       })
       if err then return nil, err end
       if resp.status ~= 200 then
-        return nil, { message = "google model discovery failed with status " .. tostring(resp.status),
-          code = "server_error", status = resp.status }
+        return nil,
+          {
+            message = "google model discovery failed with status " .. tostring(resp.status),
+            code = "server_error",
+            status = resp.status,
+          }
       end
       local page = json.decode(resp.body)
       for _, entry in ipairs(page.models or {}) do
@@ -960,9 +986,18 @@ llm_router.register("google", {
           local out_modalities = { "text" }
           local endpoints = nil
           local params = {
-            "tools", "tool_choice", "response_format", "structured_outputs",
-            "temperature", "top_p", "max_tokens", "seed", "stop",
-            "reasoning", "reasoning_effort", "web_search",
+            "tools",
+            "tool_choice",
+            "response_format",
+            "structured_outputs",
+            "temperature",
+            "top_p",
+            "max_tokens",
+            "seed",
+            "stop",
+            "reasoning",
+            "reasoning_effort",
+            "web_search",
           }
           if is_embedding then
             -- Embedding models take text in and return vectors; no chat.
@@ -982,8 +1017,11 @@ llm_router.register("google", {
             endpoints = { "chat/completions", "images/generations" }
           end
           local info = {
-            name = name, display_name = display,
-            rpm = estimate_rpm(name), tpm = estimate_tpm(name), rpd = estimate_rpd(name),
+            name = name,
+            display_name = display,
+            rpm = estimate_rpm(name),
+            tpm = estimate_tpm(name),
+            rpd = estimate_rpd(name),
             context_window = entry.inputTokenLimit or 0,
             max_tokens = entry.outputTokenLimit or 0,
             input_modalities = in_modalities,
@@ -1017,7 +1055,8 @@ llm_router.register("google", {
     if key == "" then return { status = "unhealthy", message = "api_key is required" } end
     local client = llm_router.http_client({ timeout_ms = 15000 })
     local resp, err = client:request({
-      method = "GET", url = BASE_URL .. "/models",
+      method = "GET",
+      url = BASE_URL .. "/models",
       headers = { ["x-goog-api-key"] = key },
     })
     if err then
@@ -1025,21 +1064,19 @@ llm_router.register("google", {
       if type(err) == "table" and type(err.message) == "string" then message = err.message end
       return { status = "unknown", message = message }
     end
-    if resp.status == 200 then
-      return { status = "healthy" }
-    end
+    if resp.status == 200 then return { status = "healthy" } end
     if resp.status == 400 then
       local lower = string.lower(tostring(resp.body or ""))
-      if string.find(lower, "api key not valid", 1, true)
-          or string.find(lower, "api_key_invalid", 1, true)
-          or string.find(lower, "invalid api key", 1, true)
-          or string.find(lower, "unauthenticated", 1, true) then
+      if
+        string.find(lower, "api key not valid", 1, true)
+        or string.find(lower, "api_key_invalid", 1, true)
+        or string.find(lower, "invalid api key", 1, true)
+        or string.find(lower, "unauthenticated", 1, true)
+      then
         return { status = "unhealthy", message = "api key rejected" }
       end
     end
-    if resp.status == 401 then
-      return { status = "unhealthy", message = "api key rejected" }
-    end
+    if resp.status == 401 then return { status = "unhealthy", message = "api key rejected" } end
     return { status = "unknown", message = "status " .. tostring(resp.status) }
   end,
 
@@ -1052,7 +1089,8 @@ llm_router.register("google", {
       local key = api_key_of(cred.data)
       for _, px in ipairs(pick_proxies(ctx, 3)) do
         local resp, err = client:request({
-          method = "POST", url = BASE_URL .. "/models/" .. request_model_name(request.model_name) .. ":generateContent",
+          method = "POST",
+          url = BASE_URL .. "/models/" .. request_model_name(request.model_name) .. ":generateContent",
           headers = { ["x-goog-api-key"] = key, ["Content-Type"] = "application/json" },
           body = json.encode(payload),
           proxy_url = px.url,
@@ -1083,95 +1121,102 @@ llm_router.register("google", {
       local key = api_key_of(cred.data)
       for _, px in ipairs(pick_proxies(ctx, 3)) do
         local tool_seq = { n = 0 }
-          -- Once any tool call is emitted, every later finish in this stream
-          -- means "run the tools": Gemini sends a bare STOP after the call.
-          local saw_tools = false
-          local done = false
-          local fatal = false
-          local next_cred = false
-          local resp, stream_err = client:stream({
-            method = "POST",
-            url = BASE_URL .. "/models/" .. request_model_name(request.model_name) .. ":streamGenerateContent?alt=sse",
-            headers = { ["x-goog-api-key"] = key, ["Content-Type"] = "application/json" },
-            body = json.encode(payload),
-            proxy_url = px.url,
-            on_response = function(r)
-              if r.status == 200 then return end
-              local action, terr = map_upstream(ctx, r, cred.id)
-              if action == "done" then fatal = true end
-              if action == "cred" then next_cred = true end
-              return terr
-            end,
-      on_line = function(line)
-        if line:sub(1, 6) ~= "data: " then return end
-        local data = line:sub(7)
-        if data == "[DONE]" then return end
-        local ok, g = pcall(json.decode, data)
-        if not ok or type(g) ~= "table" then return end
-        local cand = g.candidates and g.candidates[1]
-        if cand then
-          local out = { text = {}, reasoning = {}, toolcalls = {} }
-          collect_parts(cand, out, tool_seq)
-          local delta = {}
-          if #out.reasoning > 0 then delta.reasoning_content = table.concat(out.reasoning, "") end
-          if #out.text > 0 then delta.content = table.concat(out.text, "") end
-          if #out.toolcalls > 0 then
-            local calls = {}
-            for i, tc in ipairs(out.toolcalls) do
-              table.insert(calls, {
-                index = i - 1, id = tc.id, type = "function",
-                ["function"] = { name = tc.name, arguments = tc.arguments },
-              })
+        -- Once any tool call is emitted, every later finish in this stream
+        -- means "run the tools": Gemini sends a bare STOP after the call.
+        local saw_tools = false
+        local done = false
+        local fatal = false
+        local next_cred = false
+        local resp, stream_err = client:stream({
+          method = "POST",
+          url = BASE_URL .. "/models/" .. request_model_name(request.model_name) .. ":streamGenerateContent?alt=sse",
+          headers = { ["x-goog-api-key"] = key, ["Content-Type"] = "application/json" },
+          body = json.encode(payload),
+          proxy_url = px.url,
+          on_response = function(r)
+            if r.status == 200 then return end
+            local action, terr = map_upstream(ctx, r, cred.id)
+            if action == "done" then fatal = true end
+            if action == "cred" then next_cred = true end
+            return terr
+          end,
+          on_line = function(line)
+            if line:sub(1, 6) ~= "data: " then return end
+            local data = line:sub(7)
+            if data == "[DONE]" then return end
+            local ok, g = pcall(json.decode, data)
+            if not ok or type(g) ~= "table" then return end
+            local cand = g.candidates and g.candidates[1]
+            if cand then
+              local out = { text = {}, reasoning = {}, toolcalls = {} }
+              collect_parts(cand, out, tool_seq)
+              local delta = {}
+              if #out.reasoning > 0 then delta.reasoning_content = table.concat(out.reasoning, "") end
+              if #out.text > 0 then delta.content = table.concat(out.text, "") end
+              if #out.toolcalls > 0 then
+                local calls = {}
+                for i, tc in ipairs(out.toolcalls) do
+                  table.insert(calls, {
+                    index = i - 1,
+                    id = tc.id,
+                    type = "function",
+                    ["function"] = { name = tc.name, arguments = tc.arguments },
+                  })
+                end
+                delta.tool_calls = calls
+              end
+              local choice = { index = cand.index or 0, delta = delta }
+              if cand.finishReason and cand.finishReason ~= "" then
+                choice.finish_reason = map_finish_reason(cand.finishReason)
+              end
+              if #out.toolcalls > 0 then
+                saw_tools = true
+                choice.finish_reason = "tool_calls"
+              elseif saw_tools and choice.finish_reason then
+                choice.finish_reason = "tool_calls"
+              end
+              if delta.content or delta.reasoning_content or delta.tool_calls or choice.finish_reason then
+                emit({
+                  id = chunk_id,
+                  object = "chat.completion.chunk",
+                  created = os.time(),
+                  model = full_model,
+                  choices = { choice },
+                })
+                done = true
+              end
             end
-            delta.tool_calls = calls
-          end
-          local choice = { index = cand.index or 0, delta = delta }
-          if cand.finishReason and cand.finishReason ~= "" then
-            choice.finish_reason = map_finish_reason(cand.finishReason)
-          end
-          if #out.toolcalls > 0 then
-            saw_tools = true
-            choice.finish_reason = "tool_calls"
-          elseif saw_tools and choice.finish_reason then
-            choice.finish_reason = "tool_calls"
-          end
-          if delta.content or delta.reasoning_content or delta.tool_calls or choice.finish_reason then
-            emit({
-              id = chunk_id, object = "chat.completion.chunk", created = os.time(),
-              model = full_model, choices = { choice },
-            })
-            done = true
-          end
+            local usage = build_usage(g.usageMetadata)
+            if usage then
+              emit({
+                id = chunk_id,
+                object = "chat.completion.chunk",
+                created = os.time(),
+                model = full_model,
+                choices = {},
+                usage = usage,
+              })
+              done = true
+            end
+          end,
+        })
+        if stream_err then
+          last_err = stream_err
+        else
+          return
         end
-        local usage = build_usage(g.usageMetadata)
-        if usage then
-          emit({
-            id = chunk_id, object = "chat.completion.chunk", created = os.time(),
-            model = full_model, choices = {}, usage = usage,
-          })
-          done = true
-        end
-      end,
-    })
-    if stream_err then
-      last_err = stream_err
-    else
-      return
-    end
-    if fatal then return nil, last_err end
-    if next_cred then break end
-    -- A stream that emitted already belongs to that attempt: surface
-    -- instead of failing over mid-stream.
-    if done then return nil, last_err end
+        if fatal then return nil, last_err end
+        if next_cred then break end
+        -- A stream that emitted already belongs to that attempt: surface
+        -- instead of failing over mid-stream.
+        if done then return nil, last_err end
       end
     end
     return nil, last_err or { message = "all google credentials exhausted", code = "server_error" }
   end,
 
   speech = function(ctx, request)
-    if type(request.input) ~= "string" or request.input == "" then
-      return nil, invalid_request("input is required")
-    end
+    if type(request.input) ~= "string" or request.input == "" then return nil, invalid_request("input is required") end
     local voice = request.voice
     if type(voice) ~= "string" or voice == "" then voice = "Kore" end
     -- Style control on Gemini TTS is prompt-based: "Say cheerfully: ...".
@@ -1194,7 +1239,8 @@ llm_router.register("google", {
       local key = api_key_of(cred.data)
       for _, px in ipairs(pick_proxies(ctx, 3)) do
         local resp, err = client:request({
-          method = "POST", url = BASE_URL .. "/models/" .. request_model_name(request.model_name) .. ":generateContent",
+          method = "POST",
+          url = BASE_URL .. "/models/" .. request_model_name(request.model_name) .. ":generateContent",
           headers = { ["x-goog-api-key"] = key, ["Content-Type"] = "application/json" },
           body = json.encode(payload),
           proxy_url = px.url,
@@ -1209,9 +1255,7 @@ llm_router.register("google", {
           local rate = tonumber(tostring(inline.mimeType):match("rate=(%d+)")) or 24000
           local requested = request.response_format
           if type(requested) ~= "string" or requested == "" then requested = "mp3" end
-          if requested == "pcm" then
-            return { audio_b64 = inline.data, format = "pcm" }
-          end
+          if requested == "pcm" then return { audio_b64 = inline.data, format = "pcm" } end
           local pcm = llm_router.base64_decode(inline.data)
           local wav = wrap_wav(pcm, rate, 1)
           return { audio_b64 = llm_router.base64_encode(wav), format = "wav" }
@@ -1249,53 +1293,50 @@ llm_router.register("google", {
         local data = {}
         local failed = false
         local next_cred = false
-          -- One upstream call per requested image; image models do not take
-          -- candidateCount. A failed batch restarts on the next attempt;
-          -- partial images are discarded, never half-returned.
-          for _ = 1, n do
-            local resp, err = client:request({
-              method = "POST", url = BASE_URL .. "/models/" .. request_model_name(request.model_name) .. ":generateContent",
-              headers = { ["x-goog-api-key"] = key, ["Content-Type"] = "application/json" },
-              body = json.encode(payload),
-              proxy_url = px.url,
-            })
-            if err ~= nil then
-              last_err = err
-              failed = true
-              break
-            end
-            if resp.status ~= 200 then
-              local action, terr = map_upstream(ctx, resp, cred.id)
-              last_err = terr
-              failed = true
-              if action == "done" then return nil, terr end
-              if action == "cred" then next_cred = true end
-              break
-            end
-            local g = json.decode(resp.body)
-            local inline = find_inline_data(g, "image/")
-            if not inline then
-              local _, berr = blocked_error(g)
-              last_err = berr
-              failed = true
-              break
-            end
-            table.insert(data, { b64_json = inline.data })
+        -- One upstream call per requested image; image models do not take
+        -- candidateCount. A failed batch restarts on the next attempt;
+        -- partial images are discarded, never half-returned.
+        for _ = 1, n do
+          local resp, err = client:request({
+            method = "POST",
+            url = BASE_URL .. "/models/" .. request_model_name(request.model_name) .. ":generateContent",
+            headers = { ["x-goog-api-key"] = key, ["Content-Type"] = "application/json" },
+            body = json.encode(payload),
+            proxy_url = px.url,
+          })
+          if err ~= nil then
+            last_err = err
+            failed = true
+            break
           end
-          if next_cred then break end
-          if not failed then
-            return { created = os.time(), data = data }
+          if resp.status ~= 200 then
+            local action, terr = map_upstream(ctx, resp, cred.id)
+            last_err = terr
+            failed = true
+            if action == "done" then return nil, terr end
+            if action == "cred" then next_cred = true end
+            break
           end
+          local g = json.decode(resp.body)
+          local inline = find_inline_data(g, "image/")
+          if not inline then
+            local _, berr = blocked_error(g)
+            last_err = berr
+            failed = true
+            break
+          end
+          table.insert(data, { b64_json = inline.data })
         end
+        if next_cred then break end
+        if not failed then return { created = os.time(), data = data } end
       end
+    end
     return nil, last_err or { message = "all google credentials exhausted", code = "server_error" }
   end,
 
   embed = function(ctx, request)
     local input = request.input
-    if type(input) ~= "table" or #input == 0 then
-      return nil, invalid_request("input is required")
-    end
+    if type(input) ~= "table" or #input == 0 then return nil, invalid_request("input is required") end
     local model = request_model_name(request.model_name)
     local requests = {}
     for _, text in ipairs(input) do
@@ -1317,7 +1358,8 @@ llm_router.register("google", {
       local key = api_key_of(cred.data)
       for _, px in ipairs(pick_proxies(ctx, 3)) do
         local resp, err = client:request({
-          method = "POST", url = BASE_URL .. "/models/" .. model .. ":batchEmbedContents",
+          method = "POST",
+          url = BASE_URL .. "/models/" .. model .. ":batchEmbedContents",
           headers = { ["x-goog-api-key"] = key, ["Content-Type"] = "application/json" },
           body = json.encode({ requests = requests }),
           proxy_url = px.url,
@@ -1327,12 +1369,14 @@ llm_router.register("google", {
           local data = {}
           for i, item in ipairs(g.embeddings or {}) do
             if type(item.values) ~= "table" or #item.values == 0 then
-              return nil, { message = "upstream returned an empty embedding vector", code = "server_error", status = 502 }
+              return nil,
+                { message = "upstream returned an empty embedding vector", code = "server_error", status = 502 }
             end
             table.insert(data, { index = i - 1, embedding = item.values })
           end
           if #data ~= #input then
-            return nil, { message = "upstream returned fewer embeddings than requested", code = "server_error", status = 502 }
+            return nil,
+              { message = "upstream returned fewer embeddings than requested", code = "server_error", status = 502 }
           end
           return { data = data }
         elseif err ~= nil then

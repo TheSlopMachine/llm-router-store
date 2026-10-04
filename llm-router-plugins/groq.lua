@@ -55,8 +55,7 @@ local function pick_proxies(ctx, limit)
   -- Unconfigured providers go direct: only an explicit pool selection
   -- (dashboard proxy switch) routes through pooled exits.
   local pool = nil
-  if ctx.provider_config and ctx.provider_config.proxy
-    and ctx.provider_config.proxy.pool ~= "" then
+  if ctx.provider_config and ctx.provider_config.proxy and ctx.provider_config.proxy.pool ~= "" then
     pool = ctx.provider_config.proxy.pool
   end
   local proxies = llm_router.proxies.query({ pool = pool, limit = limit or 3 })
@@ -77,9 +76,7 @@ local function build_payload(request, stream)
   end
   payload.model = request.model_name
   payload.stream = stream
-  if not stream then
-    payload.stream_options = nil
-  end
+  if not stream then payload.stream_options = nil end
   return payload
 end
 
@@ -89,13 +86,16 @@ llm_router.register("groq", {
   proxy_schema = {},
 
   credential_schema = {
-    { type = "section", title = "Groq",
+    {
+      type = "section",
+      title = "Groq",
       subtitle = "Get your API key from the Groq console.",
       content = {
         { type = "link", text = "Open Groq Console", url = "https://console.groq.com/keys" },
         { type = "secret", name = "api_key", label = "API Key", required = true },
         { type = "button", text = "Save", form_action = "submit" },
-      } },
+      },
+    },
   },
 
   validate_credentials = function(data)
@@ -103,9 +103,7 @@ llm_router.register("groq", {
     if key == nil or key == "" then
       return false, { message = "api_key is required", code = "invalid_request_error" }
     end
-    if #key < 20 then
-      return false, { message = "api_key: minimum 20 characters", code = "invalid_request_error" }
-    end
+    if #key < 20 then return false, { message = "api_key: minimum 20 characters", code = "invalid_request_error" } end
     return true
   end,
 
@@ -116,12 +114,18 @@ llm_router.register("groq", {
     end
     local client = llm_router.http_client({})
     local resp, err = client:request({
-      method = "GET", url = BASE_URL .. "/models",
+      method = "GET",
+      url = BASE_URL .. "/models",
       headers = { ["Authorization"] = "Bearer " .. api_key_of(creds[1].data) },
     })
     if err then return nil, err end
     if resp.status ~= 200 then
-      return nil, { message = "groq model discovery failed with status " .. tostring(resp.status), code = "server_error", status = resp.status }
+      return nil,
+        {
+          message = "groq model discovery failed with status " .. tostring(resp.status),
+          code = "server_error",
+          status = resp.status,
+        }
     end
     local page = json.decode(resp.body)
     local infos = {}
@@ -130,7 +134,9 @@ llm_router.register("groq", {
       -- text-in/text-out are chat. Text-in/audio-out (playai-tts) waits for
       -- the speech endpoint.
       local function has(list, v)
-        for _, x in ipairs(list or {}) do if x == v then return true end end
+        for _, x in ipairs(list or {}) do
+          if x == v then return true end
+        end
         return false
       end
       if m.active and has(m.input_modalities, "audio") and has(m.output_modalities, "text") then
@@ -138,7 +144,9 @@ llm_router.register("groq", {
         table.insert(infos, {
           name = m.id,
           display_name = (m.name and m.name ~= "") and m.name or m.id,
-          rpm = limits.rpm, tpm = limits.tpm, rpd = limits.rpd,
+          rpm = limits.rpm,
+          tpm = limits.tpm,
+          rpd = limits.rpd,
           input_modalities = m.input_modalities,
           output_modalities = m.output_modalities,
           endpoints = { "audio/transcriptions" },
@@ -179,7 +187,9 @@ llm_router.register("groq", {
         table.insert(infos, {
           name = m.id,
           display_name = (m.name and m.name ~= "") and m.name or m.id,
-          rpm = limits.rpm, tpm = limits.tpm, rpd = limits.rpd,
+          rpm = limits.rpm,
+          tpm = limits.tpm,
+          rpd = limits.rpd,
           context_window = m.context_window or 0,
           max_tokens = m.max_completion_tokens or 0,
           input_modalities = m.input_modalities,
@@ -202,7 +212,8 @@ llm_router.register("groq", {
     if key == "" then return { status = "unhealthy", message = "api_key is required" } end
     local client = llm_router.http_client({ timeout_ms = 15000 })
     local resp, err = client:request({
-      method = "GET", url = BASE_URL .. "/models",
+      method = "GET",
+      url = BASE_URL .. "/models",
       headers = { ["Authorization"] = "Bearer " .. key },
     })
     if err then
@@ -210,12 +221,8 @@ llm_router.register("groq", {
       if type(err) == "table" and type(err.message) == "string" then message = err.message end
       return { status = "unknown", message = message }
     end
-    if resp.status == 200 then
-      return { status = "healthy" }
-    end
-    if resp.status == 401 then
-      return { status = "unhealthy", message = "api key rejected" }
-    end
+    if resp.status == 200 then return { status = "healthy" } end
+    if resp.status == 401 then return { status = "unhealthy", message = "api key rejected" } end
     return { status = "unknown", message = "status " .. tostring(resp.status) }
   end,
 
@@ -226,7 +233,8 @@ llm_router.register("groq", {
       local key = api_key_of(cred.data)
       for _, px in ipairs(pick_proxies(ctx, 3)) do
         local resp, err = client:request({
-          method = "POST", url = BASE_URL .. "/chat/completions",
+          method = "POST",
+          url = BASE_URL .. "/chat/completions",
           headers = { ["Authorization"] = "Bearer " .. key, ["Content-Type"] = "application/json" },
           body = json.encode(build_payload(request, false)),
           proxy_url = px.url,
@@ -239,7 +247,8 @@ llm_router.register("groq", {
           last_err = err
         elseif resp.status == 401 then
           -- Groq answers 401 for bad keys: bench the credential.
-          bench(ctx, cred.id, "groq rejected the api key", 300) break
+          bench(ctx, cred.id, "groq rejected the api key", 300)
+          break
         elseif resp.status == 403 then
           -- 403 ("Forbidden", "Access denied. Please check your network
           -- settings.") is the Cloudflare egress-IP block: the exit is
@@ -248,15 +257,24 @@ llm_router.register("groq", {
         elseif resp.status == 429 then
           local lower = string.lower(tostring(resp.body or ""))
           if string.find(lower, "per day", 1, true) then
-            llm_router.credentials.park(cred.id, retry_after_secs(resp), "groq daily quota exhausted") break
+            llm_router.credentials.park(cred.id, retry_after_secs(resp), "groq daily quota exhausted")
+            break
           end
-          llm_router.credentials.park(cred.id, retry_after_secs(resp), "groq rate limited") break
+          llm_router.credentials.park(cred.id, retry_after_secs(resp), "groq rate limited")
+          break
         elseif resp.status == 400 or resp.status == 404 or resp.status == 422 then
-          return nil, { message = "groq rejected the request with status " .. tostring(resp.status),
-            code = "invalid_request_error", status = resp.status }
+          return nil,
+            {
+              message = "groq rejected the request with status " .. tostring(resp.status),
+              code = "invalid_request_error",
+              status = resp.status,
+            }
         else
-          last_err = { message = "groq returned status " .. tostring(resp.status),
-            code = "server_error", status = resp.status }
+          last_err = {
+            message = "groq returned status " .. tostring(resp.status),
+            code = "server_error",
+            status = resp.status,
+          }
         end
       end
     end
@@ -273,7 +291,8 @@ llm_router.register("groq", {
         local done = false
         local next_cred = false
         local resp, stream_err = client:stream({
-          method = "POST", url = BASE_URL .. "/chat/completions",
+          method = "POST",
+          url = BASE_URL .. "/chat/completions",
           headers = { ["Authorization"] = "Bearer " .. key, ["Content-Type"] = "application/json" },
           body = json.encode(build_payload(request, true)),
           proxy_url = px.url,
@@ -292,8 +311,11 @@ llm_router.register("groq", {
               return { message = "groq rate limited", code = "rate_limit", status = 429 }
             end
             if r.status ~= 200 then
-              return { message = "groq returned status " .. tostring(r.status),
-                code = "server_error", status = r.status }
+              return {
+                message = "groq returned status " .. tostring(r.status),
+                code = "server_error",
+                status = r.status,
+              }
             end
           end,
           on_line = function(line)
@@ -340,11 +362,15 @@ llm_router.register("groq", {
     if request.temperature then parts[#parts + 1] = { name = "temperature", value = tostring(request.temperature) } end
     local gran = {}
     local function add_gran(g)
-      for _, x in ipairs(gran) do if x == g then return end end
+      for _, x in ipairs(gran) do
+        if x == g then return end
+      end
       gran[#gran + 1] = g
     end
     if request.needs_segments then add_gran("segment") end
-    for _, g in ipairs(request.timestamp_granularities or {}) do add_gran(g) end
+    for _, g in ipairs(request.timestamp_granularities or {}) do
+      add_gran(g)
+    end
     for _, g in ipairs(gran) do
       parts[#parts + 1] = { name = "timestamp_granularities[]", value = g }
     end
@@ -354,7 +380,8 @@ llm_router.register("groq", {
       local key = api_key_of(cred.data)
       for _, px in ipairs(pick_proxies(ctx, 3)) do
         local resp, err = client:request({
-          method = "POST", url = BASE_URL .. "/audio/transcriptions",
+          method = "POST",
+          url = BASE_URL .. "/audio/transcriptions",
           headers = { ["Authorization"] = "Bearer " .. key, ["Content-Type"] = ctype },
           body = body,
           proxy_url = px.url,
@@ -364,15 +391,24 @@ llm_router.register("groq", {
         elseif err ~= nil then
           last_err = err
         elseif resp.status == 401 then
-          bench(ctx, cred.id, "groq rejected the api key", 300) break
+          bench(ctx, cred.id, "groq rejected the api key", 300)
+          break
         elseif resp.status == 429 then
-          llm_router.credentials.park(cred.id, retry_after_secs(resp), "groq rate limited") break
+          llm_router.credentials.park(cred.id, retry_after_secs(resp), "groq rate limited")
+          break
         elseif resp.status == 400 or resp.status == 404 or resp.status == 422 then
-          return nil, { message = "groq rejected the request with status " .. tostring(resp.status),
-            code = "invalid_request_error", status = resp.status }
+          return nil,
+            {
+              message = "groq rejected the request with status " .. tostring(resp.status),
+              code = "invalid_request_error",
+              status = resp.status,
+            }
         else
-          last_err = { message = "groq returned status " .. tostring(resp.status),
-            code = "server_error", status = resp.status }
+          last_err = {
+            message = "groq returned status " .. tostring(resp.status),
+            code = "server_error",
+            status = resp.status,
+          }
         end
       end
     end

@@ -5,16 +5,13 @@
 --- @description OpenAI/Anthropic/Google compatible paid provider OpenCode Zen (API key required)
 --- @allow_host opencode.ai
 
-
 local BASE_URL = "https://opencode.ai/zen/v1"
 
 -- Protocol families first: muse-spark/gpt/grok serve /responses even for
 -- their -free variants. Remaining -free models are chat-protocol.
 local function endpoint_for_model(model)
   local m = model:lower()
-  if m:match("^gpt%-") or m:match("muse%-spark") or m:match("^grok%-") then
-    return "/responses"
-  end
+  if m:match("^gpt%-") or m:match("muse%-spark") or m:match("^grok%-") then return "/responses" end
   return "/chat/completions"
 end
 
@@ -142,8 +139,7 @@ local function pick_proxies(ctx, limit)
   -- Unconfigured providers go direct: only an explicit pool selection
   -- (dashboard proxy switch) routes through pooled exits.
   local pool = nil
-  if ctx.provider_config and ctx.provider_config.proxy
-    and ctx.provider_config.proxy.pool ~= "" then
+  if ctx.provider_config and ctx.provider_config.proxy and ctx.provider_config.proxy.pool ~= "" then
     pool = ctx.provider_config.proxy.pool
   end
   local proxies = llm_router.proxies.query({ pool = pool, limit = limit or 3 })
@@ -167,8 +163,8 @@ local function map_upstream(ctx, resp, cred_id)
     return "cred", { message = "zen rejected the api key", code = "authentication_error", status = 401 }
   end
   if resp.status ~= 429 then
-    return "done", { message = "zen returned status " .. tostring(resp.status),
-      code = "server_error", status = resp.status }
+    return "done",
+      { message = "zen returned status " .. tostring(resp.status), code = "server_error", status = resp.status }
   end
   local body_str = tostring(resp.body or "")
   local etype = ""
@@ -236,14 +232,10 @@ local function build_responses_input(messages)
     local role = m.role
     if role == "system" then
       local text = message_text(m)
-      if text ~= "" then
-        table.insert(input, { role = "system", content = text })
-      end
+      if text ~= "" then table.insert(input, { role = "system", content = text }) end
     elseif role == "user" then
       local text = message_text(m)
-      if text ~= "" then
-        table.insert(input, { role = "user", content = { { type = "input_text", text = text } } })
-      end
+      if text ~= "" then table.insert(input, { role = "user", content = { { type = "input_text", text = text } } }) end
     elseif role == "assistant" then
       local text = message_text(m)
       if text ~= "" then
@@ -258,12 +250,13 @@ local function build_responses_input(messages)
         end
       end
     elseif role == "tool" then
-      table.insert(input, { type = "function_call_output", call_id = m.tool_call_id or "call_unknown", output = message_text(m) })
+      table.insert(
+        input,
+        { type = "function_call_output", call_id = m.tool_call_id or "call_unknown", output = message_text(m) }
+      )
     end
   end
-  if #input == 0 then
-    table.insert(input, { role = "user", content = { { type = "input_text", text = "ping" } } })
-  end
+  if #input == 0 then table.insert(input, { role = "user", content = { { type = "input_text", text = "ping" } } }) end
   return input
 end
 
@@ -311,9 +304,7 @@ local function extract_responses_reasoning(raw)
   for _, item in ipairs(output) do
     if type(item) == "table" and item.type == "reasoning" and type(item.summary) == "table" then
       for _, s in ipairs(item.summary) do
-        if type(s) == "table" and type(s.text) == "string" and s.text ~= "" then
-          table.insert(parts, s.text)
-        end
+        if type(s) == "table" and type(s.text) == "string" and s.text ~= "" then table.insert(parts, s.text) end
       end
     end
   end
@@ -362,13 +353,15 @@ local function do_responses_unary(client, request, model, api_key, ses, msg, pro
   if #tools > 0 then payload.tools = tools end
   local headers = opencode_headers(api_key, ses, msg)
   local resp, err = client:request({
-    method = "POST", url = BASE_URL .. "/responses",
-    headers = headers, body = json.encode(payload),
+    method = "POST",
+    url = BASE_URL .. "/responses",
+    headers = headers,
+    body = json.encode(payload),
     proxy_url = proxy_url,
   })
   if err then return nil, "retry", err end
   if resp.status ~= 200 then
-      local action, terr = map_upstream(ctx, resp, cred_id)
+    local action, terr = map_upstream(ctx, resp, cred_id)
     return nil, action, terr
   end
   local raw = json.decode(resp.body)
@@ -376,8 +369,7 @@ local function do_responses_unary(client, request, model, api_key, ses, msg, pro
   local reasoning = extract_responses_reasoning(raw)
   local tool_calls = extract_responses_tool_calls(raw)
   local finish = "stop"
-  if type(raw.incomplete_details) == "table"
-      and raw.incomplete_details.reason == "max_output_tokens" then
+  if type(raw.incomplete_details) == "table" and raw.incomplete_details.reason == "max_output_tokens" then
     finish = "length"
   end
   if #tool_calls > 0 then finish = "tool_calls" end
@@ -390,7 +382,9 @@ local function do_responses_unary(client, request, model, api_key, ses, msg, pro
   local message = { role = "assistant", content = text, tool_calls = tool_calls }
   if reasoning ~= "" then message.reasoning_content = reasoning end
   return {
-    id = "zen-" .. tostring(os.time()), object = "chat.completion", created = os.time(),
+    id = "zen-" .. tostring(os.time()),
+    object = "chat.completion",
+    created = os.time(),
     model = request.model,
     choices = {
       { index = 0, message = message, finish_reason = finish },
@@ -413,14 +407,15 @@ local function do_chat_unary(client, request, model, endpoint, api_key, ses, msg
   if type(request.response_format) == "table" then payload.response_format = request.response_format end
   local headers = opencode_headers(api_key, ses, msg)
   local resp, err = client:request({
-    method = "POST", url = BASE_URL .. endpoint,
+    method = "POST",
+    url = BASE_URL .. endpoint,
     headers = headers,
     body = json.encode(payload),
     proxy_url = proxy_url,
   })
   if err then return nil, "retry", err end
   if resp.status ~= 200 then
-      local action, terr = map_upstream(ctx, resp, cred_id)
+    local action, terr = map_upstream(ctx, resp, cred_id)
     return nil, action, terr
   end
   local out = json.decode(resp.body)
@@ -437,8 +432,14 @@ local function do_responses_stream(client, request, model, api_key, ses, msg, pr
   if request.temperature and request.temperature > 0 then payload.temperature = request.temperature end
   if request.top_p and request.top_p > 0 then payload.top_p = request.top_p end
   local effort = request.reasoning_effort
-  if effort == "low" or effort == "medium" or effort == "high" or effort == "xhigh"
-      or effort == "minimal" or effort == "max" then
+  if
+    effort == "low"
+    or effort == "medium"
+    or effort == "high"
+    or effort == "xhigh"
+    or effort == "minimal"
+    or effort == "max"
+  then
     payload.reasoning = { effort = effort, summary = "auto" }
   end
   local tools = build_responses_tools(request.tools)
@@ -448,13 +449,14 @@ local function do_responses_stream(client, request, model, api_key, ses, msg, pr
   end
   local headers = opencode_headers(api_key, ses, msg)
   local _, stream_err = client:stream({
-    method = "POST", url = BASE_URL .. "/responses",
+    method = "POST",
+    url = BASE_URL .. "/responses",
     headers = headers,
     body = json.encode(payload),
     proxy_url = proxy_url,
     on_response = function(r)
       if r.status == 200 then return end
-              local action, terr = map_upstream(ctx, r, cred_id)
+      local action, terr = map_upstream(ctx, r, cred_id)
       if action == "done" then st.fatal = true end
       if action == "cred" then st.next_cred = true end
       return terr
@@ -472,7 +474,20 @@ local function do_responses_stream(client, request, model, api_key, ses, msg, pr
   return stream_err
 end
 
-local function do_chat_stream(client, request, model, endpoint, api_key, ses, msg, proxy_url, cred_id, full_model, emit, st)
+local function do_chat_stream(
+  client,
+  request,
+  model,
+  endpoint,
+  api_key,
+  ses,
+  msg,
+  proxy_url,
+  cred_id,
+  full_model,
+  emit,
+  st
+)
   local payload = { model = model, messages = request.messages, stream = true }
   if request.max_tokens and request.max_tokens > 0 then payload.max_tokens = request.max_tokens end
   if request.temperature and request.temperature > 0 then payload.temperature = request.temperature end
@@ -486,13 +501,14 @@ local function do_chat_stream(client, request, model, endpoint, api_key, ses, ms
   if type(request.response_format) == "table" then payload.response_format = request.response_format end
   local headers = opencode_headers(api_key, ses, msg)
   local _, stream_err = client:stream({
-    method = "POST", url = BASE_URL .. endpoint,
+    method = "POST",
+    url = BASE_URL .. endpoint,
     headers = headers,
     body = json.encode(payload),
     proxy_url = proxy_url,
     on_response = function(r)
       if r.status == 200 then return end
-              local action, terr = map_upstream(ctx, r, cred_id)
+      local action, terr = map_upstream(ctx, r, cred_id)
       if action == "done" then st.fatal = true end
       if action == "cred" then st.next_cred = true end
       return terr
@@ -519,13 +535,15 @@ llm_router.register("opencode-zen", {
   proxy_schema = {},
 
   credential_schema = {
-    { type = "section", title = "OpenCode Zen",
+    {
+      type = "section",
+      title = "OpenCode Zen",
       content = {
-        { type = "banner", variant = "info",
-          text = "Zen API key required. Paid models only." },
+        { type = "banner", variant = "info", text = "Zen API key required. Paid models only." },
         { type = "secret", name = "api_key", label = "API Key", required = true },
         { type = "button", text = "Save", form_action = "submit" },
-      } },
+      },
+    },
   },
 
   validate_credentials = function(data)
@@ -533,9 +551,7 @@ llm_router.register("opencode-zen", {
     if key == nil or key == "" then
       return false, { message = "api_key is required", code = "invalid_request_error" }
     end
-    if #key < 20 then
-      return false, { message = "api_key: minimum 20 characters", code = "invalid_request_error" }
-    end
+    if #key < 20 then return false, { message = "api_key: minimum 20 characters", code = "invalid_request_error" } end
     return true
   end,
 
@@ -543,36 +559,27 @@ llm_router.register("opencode-zen", {
     local creds = llm_router.credentials.list()
     local key = ""
     if #creds > 0 then key = api_key_of(creds[1].data) end
-    if key == "" then
-      return with_limits(FALLBACK_MODELS)
-    end
+    if key == "" then return with_limits(FALLBACK_MODELS) end
     local client = llm_router.http_client({})
     local ses, msg = mint_ids()
     local headers = opencode_headers(key, ses, msg)
     local resp, err = client:request({
-      method = "GET", url = BASE_URL .. "/models",
+      method = "GET",
+      url = BASE_URL .. "/models",
       headers = headers,
     })
     if err then
       -- Upstream listing failed: fall back to the known model set.
       return with_limits(FALLBACK_MODELS)
     end
-    if resp.status ~= 200 then
-      return with_limits(FALLBACK_MODELS)
-    end
+    if resp.status ~= 200 then return with_limits(FALLBACK_MODELS) end
     local ok, parsed = pcall(json.decode, resp.body)
-    if not ok or not parsed or type(parsed.data) ~= "table" then
-      return with_limits(FALLBACK_MODELS)
-    end
+    if not ok or not parsed or type(parsed.data) ~= "table" then return with_limits(FALLBACK_MODELS) end
     local infos = {}
     for _, m in ipairs(parsed.data) do
-      if type(m.id) == "string" and m.id ~= "" then
-        table.insert(infos, { name = m.id, display_name = m.id })
-      end
+      if type(m.id) == "string" and m.id ~= "" then table.insert(infos, { name = m.id, display_name = m.id }) end
     end
-    if #infos == 0 then
-      return with_limits(FALLBACK_MODELS)
-    end
+    if #infos == 0 then return with_limits(FALLBACK_MODELS) end
     return with_limits(infos)
   end,
 
@@ -585,7 +592,8 @@ llm_router.register("opencode-zen", {
     local client = llm_router.http_client({ timeout_ms = 15000 })
     local ses, msg = mint_ids()
     local resp, err = client:request({
-      method = "GET", url = BASE_URL .. "/models",
+      method = "GET",
+      url = BASE_URL .. "/models",
       headers = opencode_headers(key, ses, msg),
     })
     if err then
@@ -593,12 +601,8 @@ llm_router.register("opencode-zen", {
       if type(err) == "table" and type(err.message) == "string" then message = err.message end
       return { status = "unknown", message = message }
     end
-    if resp.status == 200 then
-      return { status = "healthy" }
-    end
-    if resp.status == 401 then
-      return { status = "unhealthy", message = "api key rejected" }
-    end
+    if resp.status == 200 then return { status = "healthy" } end
+    if resp.status == 401 then return { status = "unhealthy", message = "api key rejected" } end
     return { status = "unknown", message = "status " .. tostring(resp.status) }
   end,
 
@@ -620,12 +624,8 @@ llm_router.register("opencode-zen", {
           else
             resp, action, err = do_chat_unary(client, request, model, endpoint, api_key, ses, msg, px.url, cred.id)
           end
-          if resp then
-            return resp
-          end
-          if action == "done" then
-            return nil, err
-          end
+          if resp then return resp end
+          if action == "done" then return nil, err end
           last_err = err
           if action == "cred" then break end
         end
@@ -652,11 +652,10 @@ llm_router.register("opencode-zen", {
           if endpoint == "/responses" then
             stream_err = do_responses_stream(client, request, model, api_key, ses, msg, px.url, cred.id, emit, st)
           else
-            stream_err = do_chat_stream(client, request, model, endpoint, api_key, ses, msg, px.url, cred.id, full_model, emit, st)
+            stream_err =
+              do_chat_stream(client, request, model, endpoint, api_key, ses, msg, px.url, cred.id, full_model, emit, st)
           end
-          if stream_err == nil then
-            return
-          end
+          if stream_err == nil then return end
           last_err = stream_err
           if st.fatal then return nil, last_err end
           if st.next_cred then break end
@@ -667,5 +666,4 @@ llm_router.register("opencode-zen", {
     end
     return nil, last_err or { message = "all zen credentials exhausted", code = "server_error" }
   end,
-
 })
