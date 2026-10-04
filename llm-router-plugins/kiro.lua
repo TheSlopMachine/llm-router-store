@@ -1,6 +1,6 @@
 --- @plugin Kiro AI
 --- @author TheSlopMachine
---- @version 4.0.3
+--- @version 4.0.4
 --- @router_version 0.7.0
 --- @description AWS Kiro models via device login (OAuth2 with proactive refresh)
 --- @allow_host codewhisperer.us-east-1.amazonaws.com
@@ -12,6 +12,8 @@ local DEFAULT_REGION = "us-east-1"
 local BUILDER_START_URL = "https://view.awsapps.com/start"
 local ISSUER_URL = "https://identitycenter.amazonaws.com/ssoins-722374e8c3c8e6c6"
 local CONVERSATION_NS = "34f7193f-561d-4050-bc84-9547d953d6bf"
+-- Router maximum for http_client timeout_ms (whole-exchange cap, default 60s).
+local STREAM_TIMEOUT_MS = 300000
 
 local function oidc_url(region, path) return "https://oidc." .. region .. ".amazonaws.com/" .. path end
 
@@ -1142,7 +1144,7 @@ llm_router.register("kiro", {
     local effort = resolve_effort(request)
     local model, thinking, alias_err = resolve_model(request.model_name, effort)
     if alias_err then return nil, alias_err end
-    local client = llm_router.http_client({})
+    local client = llm_router.http_client({ timeout_ms = STREAM_TIMEOUT_MS })
     local last_err = nil
     for _, cred in ipairs(llm_router.credentials.list()) do
       for _, px in ipairs(pick_proxies(ctx, 3)) do
@@ -1173,7 +1175,6 @@ llm_router.register("kiro", {
     local effort = resolve_effort(request)
     local short_model, thinking, alias_err = resolve_model(request.model_name, effort)
     if alias_err then return nil, alias_err end
-    local client = llm_router.http_client({})
     local last_err = nil
     for _, cred in ipairs(llm_router.credentials.list()) do
       for _, px in ipairs(pick_proxies(ctx, 3)) do
@@ -1202,6 +1203,7 @@ llm_router.register("kiro", {
         local payload = build_payload(request, short_model, thinking, effort)
         local generate = generate_url(cred, ctx.provider_config)
         local _, stream_err = client_stream_raw(
+          ctx,
           generate_headers(cred),
           payload,
           generate,
@@ -1344,8 +1346,10 @@ llm_router.register("kiro", {
 
 -- Raw event-stream POST with chunked delivery. Declared after register so
 -- the closure above resolves it at call time, not at load time.
-function client_stream_raw(headers, payload, url, proxy_url, cred_id, st, on_bytes)
-  local client = llm_router.http_client({})
+function client_stream_raw(ctx, headers, payload, url, proxy_url, cred_id, st, on_bytes)
+  -- The router applies timeout_ms to the whole exchange including the body
+  -- read, so the 60s default kills any stream that runs past a minute.
+  local client = llm_router.http_client({ timeout_ms = STREAM_TIMEOUT_MS })
   return client:stream({
     method = "POST",
     url = url,
