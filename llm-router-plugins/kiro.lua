@@ -1,6 +1,6 @@
 --- @plugin Kiro AI
 --- @author TheSlopMachine
---- @version 4.0.4
+--- @version 4.0.7
 --- @router_version 0.7.0
 --- @description AWS Kiro models via device login (OAuth2 with proactive refresh)
 --- @allow_host codewhisperer.us-east-1.amazonaws.com
@@ -14,6 +14,13 @@ local ISSUER_URL = "https://identitycenter.amazonaws.com/ssoins-722374e8c3c8e6c6
 local CONVERSATION_NS = "34f7193f-561d-4050-bc84-9547d953d6bf"
 -- Router maximum for http_client timeout_ms (whole-exchange cap, default 60s).
 local STREAM_TIMEOUT_MS = 300000
+-- A quota-exhausted account stays parked at least this long (router cap: 90d).
+-- The dashboard still offers a manual unpark, e.g. after topping up credit.
+local QUOTA_PARK_SECS = 7 * 24 * 3600
+local MAX_PARK_SECS = 90 * 24 * 3600
+-- Short-lived markers that survive the router hiding parked accounts, so the
+-- final error can say what the pool is waiting on (see final_error).
+local STATE_SCOPE = "cred_state"
 
 local function oidc_url(region, path) return "https://oidc." .. region .. ".amazonaws.com/" .. path end
 
@@ -746,11 +753,17 @@ local function bench(ctx, cred_id, reason, wait_secs)
   end
 end
 
+-- Kiro's 429 (AWS ThrottlingException) carries no Retry-After in practice:
+-- the AWS SDK itself logs retry_after=None and backs off client-side. A
+-- numeric header is still honoured if one ever appears. The default is a tiny
+-- park that only exists so a fallback does not hit the same account again
+-- within the same moment.
+local DEFAULT_RATE_LIMIT_PARK_SECS = 5
 local function retry_after_secs(resp)
   local headers = resp.headers or {}
   local n = tonumber(headers["retry-after"] or headers["retry_after"])
   if n ~= nil and n > 0 then return math.floor(n) end
-  return 60
+  return DEFAULT_RATE_LIMIT_PARK_SECS
 end
 
 local function pick_proxies(ctx, limit)
@@ -771,26 +784,105 @@ end
 -- Kiro status mapping: 429 quota wording parks the OAuth account, other
 -- outcomes move on. Returns "proxy" (next exit, same credential), "cred"
 -- (next credential) or "done" (terminal, return at once).
+-- Remembers that some account is parked for `kind` ("rate_limit" | "quota")
+-- until now+secs. Keeps the later expiry when several accounts report.
+local function note_state(kind, secs)
+  local until_ts = os.time() + secs
+  local ok, cur = pcall(llm_router.storage.get, STATE_SCOPE, kind)
+  if ok and type(cur) == "table" and tonumber(cur.until_ts) and tonumber(cur.until_ts) >= until_ts then return end
+  pcall(llm_router.storage.set, STATE_SCOPE, kind, { until_ts = until_ts }, { ttl = secs })
+end
+
+local function has_state(kind)
+  local ok, v = pcall(llm_router.storage.get, STATE_SCOPE, kind)
+  return ok and v ~= nil
+end
+
+-- Parks an account whose quota is spent: at least a week, longer when the
+-- upstream asks for more.
+local function park_quota(cred_id, resp)
+  local secs = math.min(math.max(QUOTA_PARK_SECS, retry_after_secs(resp)), MAX_PARK_SECS)
+  llm_router.credentials.park(cred_id, secs, "kiro quota exhausted")
+  note_state("quota", secs)
+end
+
+-- Error returned when every attempt failed. Parked accounts are invisible
+-- to credentials.list(), so the last error alone can name a dead account
+-- (quota) while another one only needs a minute. A retriable rate limit
+-- wins over a quota error; an empty rotation reports what the markers say.
+local function final_error(last_err)
+  local code = last_err and last_err.code
+  if last_err == nil or code == "insufficient_quota" then
+    if has_state("rate_limit") then
+      return { message = "kiro rate limited", code = "rate_limit", status = 429 }
+    end
+  end
+  if last_err ~= nil then return last_err end
+  if has_state("quota") then
+    return { message = "kiro quota exhausted on every account", code = "insufficient_quota", status = 429 }
+  end
+  return { message = "all kiro credentials exhausted", code = "server_error" }
+end
+
+-- Short readable reason from an upstream error body ({message, reason} JSON
+-- or raw text), so a rejected request says why instead of only its status.
+local function upstream_detail(body)
+  body = tostring(body or "")
+  local text = ""
+  local ok, parsed = pcall(json.decode, body)
+  if ok and type(parsed) == "table" then
+    local msg = type(parsed.message) == "string" and parsed.message or ""
+    local reason = type(parsed.reason) == "string" and parsed.reason or ""
+    text = msg
+    if reason ~= "" then text = (text ~= "" and (text .. " ") or "") .. "[" .. reason .. "]" end
+  end
+  if text == "" then text = body end
+  text = text:gsub("%s+", " ")
+  if #text > 300 then text = text:sub(1, 300) .. "..." end
+  return text
+end
+
 local function map_upstream(ctx, resp, cred_id)
   if resp.status == 401 then
     bench(ctx, cred_id, "kiro rejected the access token", 300)
     return "cred", { message = "kiro rejected the access token", code = "authentication_error", status = 401 }
   end
+  if resp.status == 402 then
+    park_quota(cred_id, resp)
+    return "cred", { message = "kiro quota exhausted", code = "insufficient_quota", status = 402 }
+  end
   if resp.status == 429 then
-    llm_router.credentials.park(cred_id, retry_after_secs(resp), "kiro rate limited")
     local lower = string.lower(tostring(resp.body or ""))
-    if string.find(lower, "quota", 1, true) then
+    -- Monthly-limit 429s read "Maximum ... reached for this month" and never
+    -- say "quota"; the short-window throttle says "Too many requests".
+    if
+      string.find(lower, "quota", 1, true)
+      or string.find(lower, "this month", 1, true)
+      or string.find(lower, "monthly", 1, true)
+    then
+      park_quota(cred_id, resp)
       return "cred", { message = "kiro quota exhausted", code = "insufficient_quota", status = 429 }
     end
+    local secs = retry_after_secs(resp)
+    llm_router.credentials.park(cred_id, secs, "kiro rate limited")
+    note_state("rate_limit", secs)
     return "cred", { message = "kiro rate limited", code = "rate_limit", status = 429 }
   end
   if resp.status == 400 or resp.status == 404 then
-    return "done",
-      {
-        message = "kiro rejected the request with status " .. tostring(resp.status),
-        code = "invalid_request_error",
-        status = resp.status,
-      }
+    local raw = tostring(resp.body or "")
+    print("[kiro] upstream " .. tostring(resp.status) .. " body: " .. raw:sub(1, 1000))
+    local detail = upstream_detail(raw)
+    -- Kiro answers an oversized conversation with a 400 naming
+    -- CONTENT_LENGTH_EXCEEDS_THRESHOLD ("input is too long"). The OpenAI
+    -- code lets clients compact and retry instead of treating it as a bug.
+    local upper = raw:upper()
+    local code = "invalid_request_error"
+    if upper:find("CONTENT_LENGTH_EXCEEDS_THRESHOLD", 1, true) or upper:find("TOO LONG", 1, true) then
+      code = "context_length_exceeded"
+    end
+    local message = "kiro rejected the request with status " .. tostring(resp.status)
+    if detail ~= "" then message = message .. ": " .. detail end
+    return "done", { message = message, code = code, status = resp.status }
   end
   return "proxy",
     { message = "kiro returned status " .. tostring(resp.status), code = "server_error", status = resp.status }
@@ -1167,7 +1259,7 @@ llm_router.register("kiro", {
         end
       end
     end
-    return nil, last_err or { message = "all kiro credentials exhausted", code = "server_error" }
+    return nil, final_error(last_err)
   end,
 
   complete_stream = function(ctx, request, emit)
@@ -1340,7 +1432,7 @@ llm_router.register("kiro", {
         end
       end
     end
-    return nil, last_err or { message = "all kiro credentials exhausted", code = "server_error" }
+    return nil, final_error(last_err)
   end,
 })
 
@@ -1350,14 +1442,16 @@ function client_stream_raw(ctx, headers, payload, url, proxy_url, cred_id, st, o
   -- The router applies timeout_ms to the whole exchange including the body
   -- read, so the 60s default kills any stream that runs past a minute.
   local client = llm_router.http_client({ timeout_ms = STREAM_TIMEOUT_MS })
+  local body = json.encode(payload)
   return client:stream({
     method = "POST",
     url = url,
     headers = headers,
-    body = json.encode(payload),
+    body = body,
     proxy_url = proxy_url,
     on_response = function(r)
       if r.status == 200 then return end
+      print("[kiro] stream rejected: status=" .. tostring(r.status) .. " request_bytes=" .. tostring(#body))
       local action, terr = map_upstream(ctx, r, cred_id)
       if action == "done" then st.fatal = true end
       if action == "cred" then st.next_cred = true end
