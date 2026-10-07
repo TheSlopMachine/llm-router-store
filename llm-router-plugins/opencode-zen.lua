@@ -1,7 +1,7 @@
 --- @plugin OpenCode Zen
 --- @author TheSlopMachine
---- @version 5.0.3
---- @router_version 0.7.0
+--- @version 6.0.0
+--- @plugin_api 1.0
 --- @description OpenAI/Anthropic/Google compatible paid provider OpenCode Zen (API key required)
 --- @allow_host opencode.ai
 
@@ -142,12 +142,14 @@ local function pick_proxies(ctx, limit)
   if ctx.provider_config and ctx.provider_config.proxy and ctx.provider_config.proxy.pool ~= "" then
     pool = ctx.provider_config.proxy.pool
   end
-  local proxies = llm_router.proxies.query({ pool = pool, limit = limit or 3 })
-  if #proxies == 0 then
-    -- Empty pool degrades to one direct attempt, never to silence.
+  -- The pool acquires exits on demand: it searches for a live proxy when none
+  -- is ready and waits for one. A direct pool, the wait deadline or a
+  -- cancelled request degrade to one direct attempt, never to silence.
+  local res = llm_router.proxies.require({ pool = pool, limit = limit or 3, fallback = "direct" })
+  if not res or #res.proxies == 0 then
     return { {} }
   end
-  return proxies
+  return res.proxies
 end
 
 -- Paid-tier limit semantics: quota wording binds to the account, plain rate

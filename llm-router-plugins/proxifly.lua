@@ -1,7 +1,7 @@
 --- @plugin Proxifly Proxy List
 --- @author TheSlopMachine
---- @version 5.1.0
---- @router_version 0.7.0
+--- @version 6.0.0
+--- @plugin_api 1.0
 --- @description Free proxy list from proxifly (proxies/all/data.json; http/https/socks4/socks5)
 --- @allow_host cdn.jsdelivr.net
 

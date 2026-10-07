@@ -1,7 +1,7 @@
 --- @plugin Monosans Proxy List
 --- @author TheSlopMachine
---- @version 2.1.0
---- @router_version 0.7.0
+--- @version 3.0.0
+--- @plugin_api 1.0
 --- @description Free proxy list from monosans (proxies/all.txt; http/socks4/socks5)
 --- @allow_host cdn.jsdelivr.net
 

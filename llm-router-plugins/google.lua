@@ -1,7 +1,7 @@
 --- @plugin Google AI Studio
 --- @author TheSlopMachine
---- @version 4.0.5
---- @router_version 0.7.0
+--- @version 5.0.0
+--- @plugin_api 1.0
 --- @description Google Gemini models via AI Studio API
 --- @allow_host generativelanguage.googleapis.com
 
@@ -41,6 +41,8 @@ local function retry_after_secs(resp)
 end
 
 -- Gemini serves US exits: proxy selection filters the pool accordingly.
+local PROXY_COUNTRIES = { "US" }
+
 -- Unconfigured providers go direct: only an explicit pool selection
 -- (dashboard proxy switch) routes through pooled exits.
 local function pick_proxies(ctx, limit)
@@ -48,13 +50,30 @@ local function pick_proxies(ctx, limit)
   if ctx.provider_config and ctx.provider_config.proxy and ctx.provider_config.proxy.pool ~= "" then
     pool = ctx.provider_config.proxy.pool
   end
-  local proxies = llm_router.proxies.query({ pool = pool, country = "US", limit = limit or 3 })
-  if #proxies == 0 then
-    -- Empty pool degrades to one direct attempt, never to silence. A
-    -- non-US direct egress fails loudly as a location block below.
+  -- The pool searches for a live US exit and waits for one. No exit within
+  -- the wait deadline fails the request: Gemini rejects other regions, so a
+  -- direct attempt would only fail later with a location block.
+  local res, err = llm_router.proxies.require({
+    pool = pool,
+    countries = PROXY_COUNTRIES,
+    limit = limit or 3,
+    fallback = "fail",
+  })
+  if not res then
+    if err == "timeout" then
+      return nil, { message = "no live US proxy became available in time", code = "server_error", status = 503 }
+    end
+    if err == "no_match" then
+      return nil, { message = "proxy pool has no US exit for gemini", code = "server_error", status = 503 }
+    end
+    return nil, { message = "proxy acquisition was cancelled", code = "server_error", status = 499 }
+  end
+  if #res.proxies == 0 then
+    -- Direct pool: one direct attempt. A non-US direct egress fails loudly
+    -- as a location block below.
     return { {} }
   end
-  return proxies
+  return res.proxies
 end
 
 -- Google specifics: geo/auth wording on 400s, key+model-bound quotas.
@@ -1087,7 +1106,9 @@ llm_router.register("google", {
     local last_err = nil
     for _, cred in ipairs(llm_router.credentials.list()) do
       local key = api_key_of(cred.data)
-      for _, px in ipairs(pick_proxies(ctx, 3)) do
+      local exits, exits_err = pick_proxies(ctx, 3)
+      if not exits then return nil, exits_err end
+      for _, px in ipairs(exits) do
         local resp, err = client:request({
           method = "POST",
           url = BASE_URL .. "/models/" .. request_model_name(request.model_name) .. ":generateContent",
@@ -1119,7 +1140,9 @@ llm_router.register("google", {
     local last_err = nil
     for _, cred in ipairs(llm_router.credentials.list()) do
       local key = api_key_of(cred.data)
-      for _, px in ipairs(pick_proxies(ctx, 3)) do
+      local exits, exits_err = pick_proxies(ctx, 3)
+      if not exits then return nil, exits_err end
+      for _, px in ipairs(exits) do
         local tool_seq = { n = 0 }
         -- Once any tool call is emitted, every later finish in this stream
         -- means "run the tools": Gemini sends a bare STOP after the call.
@@ -1237,7 +1260,9 @@ llm_router.register("google", {
     local last_err = nil
     for _, cred in ipairs(llm_router.credentials.list()) do
       local key = api_key_of(cred.data)
-      for _, px in ipairs(pick_proxies(ctx, 3)) do
+      local exits, exits_err = pick_proxies(ctx, 3)
+      if not exits then return nil, exits_err end
+      for _, px in ipairs(exits) do
         local resp, err = client:request({
           method = "POST",
           url = BASE_URL .. "/models/" .. request_model_name(request.model_name) .. ":generateContent",
@@ -1289,7 +1314,9 @@ llm_router.register("google", {
     local last_err = nil
     for _, cred in ipairs(llm_router.credentials.list()) do
       local key = api_key_of(cred.data)
-      for _, px in ipairs(pick_proxies(ctx, 3)) do
+      local exits, exits_err = pick_proxies(ctx, 3)
+      if not exits then return nil, exits_err end
+      for _, px in ipairs(exits) do
         local data = {}
         local failed = false
         local next_cred = false
@@ -1356,7 +1383,9 @@ llm_router.register("google", {
     local last_err = nil
     for _, cred in ipairs(llm_router.credentials.list()) do
       local key = api_key_of(cred.data)
-      for _, px in ipairs(pick_proxies(ctx, 3)) do
+      local exits, exits_err = pick_proxies(ctx, 3)
+      if not exits then return nil, exits_err end
+      for _, px in ipairs(exits) do
         local resp, err = client:request({
           method = "POST",
           url = BASE_URL .. "/models/" .. model .. ":batchEmbedContents",

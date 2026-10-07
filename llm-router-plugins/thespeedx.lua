@@ -1,7 +1,7 @@
 --- @plugin TheSpeedX Proxy List
 --- @author TheSlopMachine
---- @version 2.1.0
---- @router_version 0.7.0
+--- @version 3.0.0
+--- @plugin_api 1.0
 --- @description Free proxy list from TheSpeedX (http.txt, socks4.txt, socks5.txt)
 --- @allow_host cdn.jsdelivr.net
 

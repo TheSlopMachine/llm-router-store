@@ -1,7 +1,7 @@
 --- @plugin OpenCode Free
 --- @author TheSlopMachine
---- @version 5.1.0
---- @router_version 0.7.0
+--- @version 6.0.0
+--- @plugin_api 1.0
 --- @description OpenAI/Anthropic/Google compatible free provider OpenCode Free (no key required)
 --- @allow_host opencode.ai
 
@@ -371,6 +371,18 @@ local RL_SCOPE = "exit_limited"
 local RL_TTL = 6 * 3600
 local RL_NS = "6d3c2b0e-8f55-4c0a-9d4e-1b7a5e2f9c31"
 local MAX_PROXY_CANDIDATES = 30
+-- Exits tried per request. 403 denials are common on shared egress and fail
+-- fast, so the budget leaves room for several of them.
+local EXIT_ATTEMPTS = 5
+local MAX_PICK_ROUNDS = 4
+-- A 403 marks the exit for an hour: blocked egress addresses recover sooner
+-- than rate-limited ones.
+local FORBIDDEN_TTL = 3600
+-- Country filter for pooled exits. Empty accepts any country.
+local PROXY_COUNTRIES = {}
+-- Exits that answered 403 during this request (the plugin state is fresh per
+-- request), reported as one aggregated error when every attempt is denied.
+local denied = 0
 
 -- Keys hash the proxy URL so embedded credentials never land in storage.
 -- The empty URL (direct connection) maps to its own fixed key.
@@ -387,13 +399,15 @@ local function exit_limited(px)
   return ok and v ~= nil
 end
 
-local function mark_exit_limited(px, reason)
-  pcall(llm_router.storage.set, RL_SCOPE, exit_key(px), { at = os.time(), reason = reason }, { ttl = RL_TTL })
+local function mark_exit_limited(px, reason, ttl)
+  pcall(llm_router.storage.set, RL_SCOPE, exit_key(px), { at = os.time(), reason = reason }, { ttl = ttl or RL_TTL })
 end
 
 -- Returns (exits, skipped): up to `limit` exits not currently marked, and
--- how many marked exits were bypassed. An empty pool degrades to one direct
--- attempt, and the direct leg obeys the same mark.
+-- how many marked exits were bypassed. The pool searches for live exits and
+-- waits for them; the wait deadline is shared by every round of the request.
+-- A direct pool or an expired wait degrades to one direct attempt, and the
+-- direct leg obeys the same mark.
 local function pick_proxies(ctx, limit)
   limit = limit or 3
   -- Unconfigured providers go direct: only an explicit pool selection
@@ -402,17 +416,39 @@ local function pick_proxies(ctx, limit)
   if ctx.provider_config and ctx.provider_config.proxy and ctx.provider_config.proxy.pool ~= "" then
     pool = ctx.provider_config.proxy.pool
   end
-  -- Query wider than the attempt budget so marked exits at the head of the
-  -- pool do not starve the fresh ones behind them.
-  local candidates = llm_router.proxies.query({ pool = pool, limit = MAX_PROXY_CANDIDATES })
-  if #candidates == 0 then candidates = { {} } end
   local usable, skipped = {}, 0
-  for _, px in ipairs(candidates) do
-    if exit_limited(px) then
-      skipped = skipped + 1
-    elseif #usable < limit then
-      table.insert(usable, px)
+  local seen = {}
+  for _ = 1, MAX_PICK_ROUNDS do
+    -- Ask wider than the attempt budget so marked exits at the head of the
+    -- pool do not starve the fresh ones behind them. Once something usable
+    -- exists, later rounds never wait for more.
+    local opts = {
+      pool = pool,
+      countries = PROXY_COUNTRIES,
+      exclude = seen,
+      limit = MAX_PROXY_CANDIDATES,
+      fallback = "direct",
+    }
+    if #usable > 0 then opts.timeout_ms = 1 end
+    local res = llm_router.proxies.require(opts)
+    if not res then break end
+    if #res.proxies == 0 then
+      -- Direct pool or wait deadline: the direct exit, unless exits are in hand.
+      if #usable == 0 then
+        local direct = {}
+        if exit_limited(direct) then skipped = skipped + 1 else table.insert(usable, direct) end
+      end
+      break
     end
+    for _, px in ipairs(res.proxies) do
+      table.insert(seen, px.url)
+      if exit_limited(px) then
+        skipped = skipped + 1
+      elseif #usable < limit then
+        table.insert(usable, px)
+      end
+    end
+    if #usable >= limit then break end
   end
   if skipped > 0 then
     debug_log("EXITS", "usable=" .. tostring(#usable) .. " skipped_rate_limited=" .. tostring(skipped))
@@ -430,6 +466,20 @@ local function exits_exhausted(skipped)
     }
   end
   return { message = "all free-tier exits exhausted", code = "server_error" }
+end
+
+-- Final error of an exhausted attempt loop. When every attempted exit was
+-- denied with 403 the client gets one aggregated error, never the answer of
+-- a single arbitrary exit.
+local function exhausted_error(last_err, skipped)
+  if denied > 0 and (last_err == nil or last_err.status == 403) then
+    return {
+      message = "free tier denied every attempted exit with HTTP 403 (" .. tostring(denied) .. " tried)",
+      code = "server_error",
+      status = 502,
+    }
+  end
+  return last_err or exits_exhausted(skipped)
 end
 
 -- Free-tier mapping. The tier is anonymous and every 429 binds to the exit
@@ -469,6 +519,14 @@ local function map_upstream(resp, model_name, px)
       return "proxy", { message = "free-tier quota exhausted", code = "insufficient_quota", status = 429 }
     end
     return "proxy", { message = "free tier rate limited on current exit", code = "rate_limit", status = 429 }
+  end
+  if resp.status == 403 then
+    -- Blocked egress address: the exit is at fault, not the request. Mark it
+    -- for an hour and move to the next one.
+    denied = denied + 1
+    debug_log("FORBIDDEN", "exit=" .. exit_key(px) .. " body=" .. body_str:sub(1, 200))
+    mark_exit_limited(px, "forbidden", FORBIDDEN_TTL)
+    return "proxy", { message = "free tier denied the current exit", code = "server_error", status = 403 }
   end
   if resp.status == 400 or resp.status == 404 or resp.status == 422 then
     return "done",
@@ -1072,7 +1130,7 @@ llm_router.register("opencode-free", {
         .. debug_json(request.tool_choice)
     )
 
-    local exits, skipped = pick_proxies(ctx, 3)
+    local exits, skipped = pick_proxies(ctx, EXIT_ATTEMPTS)
     for _, px in ipairs(exits) do
       local ses = stable_session()
       local msg = mint_msg(mint_ms())
@@ -1115,7 +1173,7 @@ llm_router.register("opencode-free", {
         last_err = err
       end
     end
-    return nil, last_err or exits_exhausted(skipped)
+    return nil, exhausted_error(last_err, skipped)
   end,
 
   complete_stream = function(ctx, request, emit)
@@ -1140,7 +1198,7 @@ llm_router.register("opencode-free", {
     local full_model = request.model
     local last_err = nil
 
-    local exits, skipped = pick_proxies(ctx, 3)
+    local exits, skipped = pick_proxies(ctx, EXIT_ATTEMPTS)
     for _, px in ipairs(exits) do
       local ses = stable_session()
       local msg = mint_msg(mint_ms())
@@ -1349,7 +1407,7 @@ llm_router.register("opencode-free", {
         end
       end
     end
-    return nil, last_err or exits_exhausted(skipped)
+    return nil, exhausted_error(last_err, skipped)
   end,
 
   -- Verified reasoning support the upstream catalog does not advertise.
