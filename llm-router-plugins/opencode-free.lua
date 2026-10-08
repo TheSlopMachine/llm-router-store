@@ -1,9 +1,10 @@
 --- @plugin OpenCode Free
 --- @author TheSlopMachine
---- @version 6.0.0
+--- @version 6.2.0
 --- @plugin_api 1.0
 --- @description OpenAI/Anthropic/Google compatible free provider OpenCode Free (no key required)
 --- @allow_host opencode.ai
+--- @allow_host models.opencode.ai
 
 local BASE_URL = "https://opencode.ai/zen/v1"
 
@@ -540,54 +541,100 @@ local function map_upstream(resp, model_name, px)
     { message = "free tier returned status " .. tostring(resp.status), code = "server_error", status = resp.status }
 end
 
--- Free models only: the anonymous /models listing serves the free tier.
--- This fallback mirrors it when the listing fails.
-local FALLBACK_MODELS = {
-  { name = "nemotron-3-ultra-free", display_name = "Nemotron 3 Ultra Free" },
-  { name = "nemotron-3.5-lightning-free", display_name = "Nemotron 3.5 Lightning Free" },
-  { name = "mimo-v2.5-free", display_name = "MiMo V2.5 Free" },
-  { name = "big-pickle", display_name = "Big Pickle" },
-  { name = "muse-spark-1.2-contributor-free", display_name = "Muse Spark 1.2 Contributor Free" },
-  { name = "muse-spark-1.3-contributor-free", display_name = "Muse Spark 1.3 Contributor Free" },
-}
+-- Dynamic model catalog. Zen /models supplies the membership whitelist
+-- (ids only); models.opencode.ai/api.json enriches whitelisted ids with
+-- limits, modalities and reasoning flags, and enrichment for ids outside
+-- the whitelist is discarded. Rows cache in plugin storage for a day: a
+-- miss or an expired entry forces a refresh, and any fetch or parse
+-- failure serves an empty list, never stale or hardcoded rows.
+local MODELS_DEV_URL = "https://models.opencode.ai/api.json"
+local MODEL_CACHE_SCOPE = "model_catalog"
+local MODEL_CACHE_TTL = 86400
+-- Router-required constants the catalog does not provide, plus the
+-- conservative fallback for whitelisted ids the catalog does not enrich.
+local MODEL_CACHE_RPM = 60
+local MODEL_CACHE_TPM = 100000
+local MODEL_CACHE_RPD = 500
+local MODEL_DEFAULT_CONTEXT_WINDOW = 200000
+local MODEL_DEFAULT_MAX_TOKENS = 32000
 
-local function filter_free_models(infos)
+local function string_list(value, fallback)
+  if type(value) ~= "table" then return fallback end
   local out = {}
-  for _, m in ipairs(infos) do
-    if type(m) == "table" and is_free_model(m.name) then table.insert(out, m) end
+  for i = 1, #value do
+    if type(value[i]) == "string" and value[i] ~= "" then table.insert(out, value[i]) end
   end
+  if #out == 0 then return fallback end
   return out
 end
 
--- Upstream /models carries no capability metadata, so reasoning support
--- is matched by model family. Conservative: known-thinking families only.
--- (Declared before with_limits: Lua binds the name used inside a function
--- at compile time, so a later local would resolve to a nil global.)
-local function supports_reasoning(name)
-  local m = name:lower()
-  if m:find("claude") then return true end
-  if m:find("^gpt%-5") or m:match("^o[0-9]") then return true end
-  if m:find("gemini") and not m:find("tts") and not m:find("image") then return true end
-  if m:find("grok%-4") or m:find("grok%-code") then return true end
-  return false
+-- One router-shaped row from a whitelisted id plus its enrichment entry
+-- (nil when the catalog lacks the id, which keeps the safe defaults).
+local function build_model_row(name, entry)
+  local row = { name = name, display_name = name }
+  local limit = {}
+  if type(entry) == "table" and type(entry.limit) == "table" then limit = entry.limit end
+  local context_window = math.floor(tonumber(limit.context) or 0)
+  if context_window <= 0 then context_window = MODEL_DEFAULT_CONTEXT_WINDOW end
+  row.context_window = context_window
+  local max_tokens = math.floor(tonumber(limit.output) or 0)
+  if max_tokens <= 0 then max_tokens = MODEL_DEFAULT_MAX_TOKENS end
+  row.max_tokens = max_tokens
+  row.rpm = MODEL_CACHE_RPM
+  row.tpm = MODEL_CACHE_TPM
+  row.rpd = MODEL_CACHE_RPD
+  row.supported_parameters = { "tools", "tool_choice", "response_format", "temperature", "top_p", "max_tokens" }
+  local modalities = {}
+  if type(entry) == "table" and type(entry.modalities) == "table" then modalities = entry.modalities end
+  row.input_modalities = string_list(modalities.input, { "text" })
+  row.output_modalities = string_list(modalities.output, { "text" })
+  row.endpoints = { "chat/completions" }
+  if type(entry) == "table" and entry.reasoning == true then row.reasoning = { default_enabled = true } end
+  return row
 end
 
-local function with_limits(infos)
-  for _, m in ipairs(infos) do
-    m.context_window = 200000
-    m.max_tokens = 32000
-    m.rpm = 60
-    m.tpm = 100000
-    m.rpd = 500
-    m.supported_parameters = { "tools", "tool_choice", "response_format", "temperature", "top_p", "max_tokens" }
-    m.input_modalities = { "text" }
-    m.output_modalities = { "text" }
-    m.endpoints = { "chat/completions" }
-    if supports_reasoning(m.name or "") then
-      m.reasoning = { default_enabled = true, supported_efforts = { "high", "medium", "low" } }
+local function refresh_model_catalog()
+  local client = llm_router.http_client({})
+  local ses = stable_session()
+  local msg = mint_msg(mint_ms())
+  local resp, err = client:request({
+    method = "GET",
+    url = BASE_URL .. "/models",
+    headers = opencode_headers(ses, msg),
+  })
+  if err or resp.status ~= 200 then return nil end
+  local ok, parsed = pcall(json.decode, resp.body)
+  if not ok or not parsed or type(parsed.data) ~= "table" then return nil end
+  local whitelist = {}
+  for _, m in ipairs(parsed.data) do
+    if type(m) == "table" and type(m.id) == "string" and is_free_model(m.id) then whitelist[m.id] = true end
+  end
+  local enriched = {}
+  local catalog_client = llm_router.http_client({ timeout_ms = 60000 })
+  local eres, eerr = catalog_client:request({ method = "GET", url = MODELS_DEV_URL, headers = {} })
+  if not eerr and eres.status == 200 then
+    local ok2, catalog = pcall(json.decode, eres.body)
+    if ok2 and type(catalog) == "table" and type(catalog.opencode) == "table" then
+      if type(catalog.opencode.models) == "table" then enriched = catalog.opencode.models end
     end
   end
-  return infos
+  -- Sorted names keep the served catalog deterministic across refreshes.
+  local names = {}
+  for name, _ in pairs(whitelist) do
+    if type(name) == "string" and name ~= "" then table.insert(names, name) end
+  end
+  table.sort(names)
+  local rows = {}
+  for _, name in ipairs(names) do
+    table.insert(rows, build_model_row(name, enriched[name]))
+  end
+  -- An empty refresh stores nothing, so the next call retries instead of
+  -- pinning an empty catalog for the TTL. A failed cache write still
+  -- serves the fresh rows to this caller. Nil (never an empty table: the
+  -- router rejects {} but maps nil to an empty model list) reports failure.
+  if #rows == 0 then return nil end
+  pcall(llm_router.storage.set, MODEL_CACHE_SCOPE, "infos", rows, { ttl = MODEL_CACHE_TTL })
+  return rows
 end
 
 -- Responses requires call_id values no longer than 64 characters.
@@ -1079,31 +1126,9 @@ llm_router.register("opencode-free", {
   proxy_schema = {},
 
   get_model_infos = function(ctx)
-    local client = llm_router.http_client({})
-    local ses = stable_session()
-    local msg = mint_msg(mint_ms())
-    local headers = opencode_headers(ses, msg)
-    local resp, err = client:request({
-      method = "GET",
-      url = BASE_URL .. "/models",
-      headers = headers,
-    })
-    if err then
-      -- Upstream listing failed: fall back to the known model set.
-      return with_limits(filter_free_models(FALLBACK_MODELS))
-    end
-    if resp.status ~= 200 then return with_limits(filter_free_models(FALLBACK_MODELS)) end
-    local ok, parsed = pcall(json.decode, resp.body)
-    if not ok or not parsed or type(parsed.data) ~= "table" then
-      return with_limits(filter_free_models(FALLBACK_MODELS))
-    end
-    local infos = {}
-    for _, m in ipairs(parsed.data) do
-      if type(m.id) == "string" and m.id ~= "" then table.insert(infos, { name = m.id, display_name = m.id }) end
-    end
-    infos = filter_free_models(infos)
-    if #infos == 0 then return with_limits(filter_free_models(FALLBACK_MODELS)) end
-    return with_limits(infos)
+    local cached = llm_router.storage.get(MODEL_CACHE_SCOPE, "infos")
+    if type(cached) == "table" and #cached > 0 then return cached end
+    return refresh_model_catalog()
   end,
 
   complete = function(ctx, request)
@@ -1413,7 +1438,7 @@ llm_router.register("opencode-free", {
   -- Verified reasoning support the upstream catalog does not advertise.
   -- Effort sets match the opencode-go registry measurements.
   model_specs = {
-    ["mimo-v2.5-free"] = {
+    ["mimo-v2.6-flash-free"] = {
       reasoning = { supported_efforts = { "high", "max" } },
       input_modalities = { "text", "image" },
       output_modalities = { "text" },
