@@ -1,6 +1,6 @@
 --- @plugin OpenCode Free
 --- @author TheSlopMachine
---- @version 6.3.14
+--- @version 6.3.17
 --- @plugin_api 1.0
 --- @description OpenAI/Anthropic/Google compatible free provider OpenCode Free (no key required)
 --- @allow_host opencode.ai
@@ -35,6 +35,16 @@ local function debug_json(value)
   local ok, encoded = pcall(json.encode, value)
   if ok and type(encoded) == "string" then return encoded end
   return "<json.encode failed: " .. tostring(encoded) .. ">"
+end
+
+-- Serializes an upstream payload. Empty Lua tables encode as JSON objects,
+-- but reasoning items require a real empty array: the validator rejects
+-- `"summary":{}` and the fingerprint gate rejects a missing summary key,
+-- so only the exact `"summary":[]` bytes pass. The substitution is scoped
+-- to that literal; no other emitted shape uses a summary key.
+local function wire_body(payload)
+  local body = debug_json(payload)
+  return body:gsub('"summary":{}', '"summary":[]')
 end
 
 local function debug_log(tag, message)
@@ -989,9 +999,46 @@ local function normalize_call_id(raw)
   return normalized
 end
 
+-- Reasoning identity persists per conversation (10-minute TTL): each
+-- completed turn stores its reasoning {id, blob} pairs; the builder replays
+-- them FIFO with their server-issued ids. Items without a stored pair are
+-- omitted (the validator rejects reconstructed shells).
+local BLOB_SCOPE = "reasoning_blobs"
+local BLOB_TTL = 600
+
+local function blob_store_key(request, model) return conv_key(request, model) end
+
+local function blob_push(request, model, pairs)
+  if #pairs == 0 then return end
+  pcall(llm_router.storage.set, BLOB_SCOPE, blob_store_key(request, model), pairs, { ttl = BLOB_TTL })
+end
+
+local function blob_take_all(request, model)
+  local ok, pairs = pcall(llm_router.storage.get, BLOB_SCOPE, blob_store_key(request, model))
+  if ok and type(pairs) == "table" then return pairs end
+  return {}
+end
+
+local function collect_pairs(raw)
+  local pairs = {}
+  if type(raw) ~= "table" or type(raw.output) ~= "table" then return pairs end
+  for _, item in ipairs(raw.output) do
+    if
+      type(item) == "table"
+      and item.type == "reasoning"
+      and type(item.encrypted_content) == "string"
+      and item.encrypted_content ~= ""
+    then
+      table.insert(pairs, { id = item.id, blob = item.encrypted_content })
+    end
+  end
+  return pairs
+end
+
 -- Build the OpenAI Responses input from chat messages.
-local function build_responses_input(messages)
+local function build_responses_input(messages, pairs)
   local input = {}
+  local pair_idx = 1
   for _, m in ipairs(messages or {}) do
     local role = m.role
     if role == "system" then
@@ -1006,11 +1053,17 @@ local function build_responses_input(messages)
       -- content through the chat protocol, so only the summary reshapes.
       local rc = m.reasoning_content
       if type(rc) ~= "string" or rc == "" then rc = m.reasoning end
+      local rc = m.reasoning_content
+      if type(rc) ~= "string" or rc == "" then rc = m.reasoning end
       if type(rc) == "string" and rc ~= "" then
-        debug_log("REASONING_PASSTHROUGH", "chars=" .. tostring(#rc))
-        -- Reasoning items are never emitted: Zen's strict input validator
-        -- rejects reconstructed ones (empty summaries and replayed blobs
-        -- alike). Thinking still round-trips via reasoning_content outputs.
+        local pair = pairs[pair_idx]
+        pair_idx = pair_idx + 1
+        if type(pair) == "table" and type(pair.blob) == "string" and pair.blob ~= "" then
+          local item = { type = "reasoning", summary = json.decode("[]"), encrypted_content = pair.blob }
+          if type(pair.id) == "string" and pair.id ~= "" then item.id = pair.id end
+          debug_log("REASONING_REPLAY", "id=" .. tostring(item.id))
+          table.insert(input, item)
+        end
       end
       local text = message_text(m)
       if text ~= "" then
@@ -1099,7 +1152,7 @@ local function build_anon_responses_payload(request, model, ses)
   local head, err = agent_prompt(model)
   if head == nil then return nil, err end
   local input = { { role = "developer", content = head } }
-  for _, item in ipairs(build_responses_input(request.messages)) do
+  for _, item in ipairs(build_responses_input(request.messages, blob_take_all(request, model))) do
     table.insert(input, item)
   end
   local payload = {
@@ -1196,6 +1249,7 @@ local function assemble_responses_stream(body, model, request)
           elseif (et == "response.completed" or et == "response.incomplete") and type(ev.response) == "table" then
             local r = ev.response
             if type(r.model) == "string" and r.model ~= "" then out_model = r.model end
+            blob_push(request, model, collect_pairs(r))
             if type(r.usage) == "table" then
               prompt_tokens = r.usage.input_tokens or 0
               completion_tokens = r.usage.output_tokens or 0
@@ -1416,7 +1470,7 @@ llm_router.register("opencode-free", {
         local payload, perr = build_anon_responses_payload(request, model, ses)
         if payload == nil then return nil, perr end
         local headers = opencode_headers(endpoint, ses, msg)
-        local body = debug_json(payload)
+        local body = wire_body(payload)
         debug_log("HTTP", "POST " .. BASE_URL .. "/responses body_len=" .. tostring(#body))
         local raw_body, action, err = fetch_body(resp_client, BASE_URL .. "/responses", headers, body, model, px)
         if raw_body then return assemble_responses_stream(raw_body, model, request) end
@@ -1429,7 +1483,7 @@ llm_router.register("opencode-free", {
         local payload, perr = build_anon_chat_payload(request, model)
         if payload == nil then return nil, perr end
         local headers = opencode_headers(endpoint, ses, msg)
-        local body = debug_json(payload)
+        local body = wire_body(payload)
         debug_log("HTTP", "POST " .. BASE_URL .. "/chat/completions body_len=" .. tostring(#body))
         local raw_body, action, err = fetch_body(client, BASE_URL .. "/chat/completions", headers, body, model, px)
         if raw_body then return assemble_chat_response(raw_body, request.model) end
@@ -1475,7 +1529,7 @@ llm_router.register("opencode-free", {
         local payload, perr = build_anon_chat_payload(request, model)
         if payload == nil then return nil, perr end
         local headers = opencode_headers(endpoint, ses, msg)
-        local body = debug_json(payload)
+        local body = wire_body(payload)
         debug_log("HTTP_STREAM", "POST " .. BASE_URL .. "/chat/completions body_len=" .. tostring(#body))
         local _, stream_err = client:stream({
           method = "POST",
@@ -1525,7 +1579,7 @@ llm_router.register("opencode-free", {
         local payload, perr = build_anon_responses_payload(request, model, ses)
         if payload == nil then return nil, perr end
         local headers = opencode_headers(endpoint, ses, msg)
-        local body = debug_json(payload)
+        local body = wire_body(payload)
         debug_log("HTTP_STREAM", "POST " .. BASE_URL .. "/responses body_len=" .. tostring(#body))
         local fn_state = {}
         local usage = nil
@@ -1620,6 +1674,7 @@ llm_router.register("opencode-free", {
               acc_for_delta.args = acc_for_delta.args .. ev.delta
             elseif (et == "response.completed" or et == "response.incomplete") and type(ev.response) == "table" then
               local r = ev.response
+              blob_push(request, model, collect_pairs(r))
               if type(r.usage) == "table" then
                 usage = {
                   prompt_tokens = r.usage.input_tokens or 0,
