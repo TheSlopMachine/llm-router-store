@@ -1,6 +1,6 @@
 --- @plugin OpenCode Free
 --- @author TheSlopMachine
---- @version 6.3.9
+--- @version 6.3.14
 --- @plugin_api 1.0
 --- @description OpenAI/Anthropic/Google compatible free provider OpenCode Free (no key required)
 --- @allow_host opencode.ai
@@ -989,32 +989,9 @@ local function normalize_call_id(raw)
   return normalized
 end
 
--- Upstream reasoning blobs persist per conversation (10-minute TTL): the
--- router speaks chat protocol, so encrypted_content never arrives in the
--- request. The assembler stores each completed turn's blobs; the builder
--- replays them FIFO against assistant turns carrying reasoning text.
-local BLOB_SCOPE = "reasoning_blobs"
-local BLOB_TTL = 600
-
-local function blob_store_key(request, model) return conv_key(request, model) end
-
-local function blob_push(request, model, blobs)
-  if #blobs == 0 then return end
-  pcall(llm_router.storage.set, BLOB_SCOPE, blob_store_key(request, model), blobs, { ttl = BLOB_TTL })
-end
-
-local function blob_take_all(request, model)
-  local ok, blobs = pcall(llm_router.storage.get, BLOB_SCOPE, blob_store_key(request, model))
-  if ok and type(blobs) == "table" then return blobs end
-  return {}
-end
-
--- Build the OpenAI Responses input from chat messages. Reasoning items
--- replay stored encrypted blobs FIFO; without a blob the item carries an
--- empty summary, the closest shape the chat protocol allows.
-local function build_responses_input(messages, blobs)
+-- Build the OpenAI Responses input from chat messages.
+local function build_responses_input(messages)
   local input = {}
-  local blob_idx = 1
   for _, m in ipairs(messages or {}) do
     local role = m.role
     if role == "system" then
@@ -1031,20 +1008,13 @@ local function build_responses_input(messages, blobs)
       if type(rc) ~= "string" or rc == "" then rc = m.reasoning end
       if type(rc) == "string" and rc ~= "" then
         debug_log("REASONING_PASSTHROUGH", "chars=" .. tostring(#rc))
-        local blob = blobs[blob_idx]
-        blob_idx = blob_idx + 1
-        if type(blob) == "string" and blob ~= "" then
-          table.insert(input, { type = "reasoning", encrypted_content = blob, summary = json.decode("[]") })
-        else
-          table.insert(input, { type = "reasoning", summary = json.decode("[]") })
-        end
+        -- Reasoning items are never emitted: Zen's strict input validator
+        -- rejects reconstructed ones (empty summaries and replayed blobs
+        -- alike). Thinking still round-trips via reasoning_content outputs.
       end
       local text = message_text(m)
       if text ~= "" then
-        table.insert(
-          input,
-          { role = "assistant", content = { { type = "output_text", text = text } }, phase = "commentary" }
-        )
+        table.insert(input, { role = "assistant", content = { { type = "output_text", text = text } } })
       end
       for _, tc in ipairs(m.tool_calls or {}) do
         local name = tc["function"] and tc["function"].name or ""
@@ -1129,7 +1099,7 @@ local function build_anon_responses_payload(request, model, ses)
   local head, err = agent_prompt(model)
   if head == nil then return nil, err end
   local input = { { role = "developer", content = head } }
-  for _, item in ipairs(build_responses_input(request.messages, blob_take_all(request, model))) do
+  for _, item in ipairs(build_responses_input(request.messages)) do
     table.insert(input, item)
   end
   local payload = {
@@ -1180,18 +1150,6 @@ local function build_anon_responses_payload(request, model, ses)
   return payload
 end
 
--- Collect encrypted reasoning blobs from a completed Responses envelope.
-local function collect_blobs(raw)
-  local blobs = {}
-  if type(raw) ~= "table" or type(raw.output) ~= "table" then return blobs end
-  for _, item in ipairs(raw.output) do
-    if type(item) == "table" and item.type == "reasoning" and type(item.encrypted_content) == "string" then
-      table.insert(blobs, item.encrypted_content)
-    end
-  end
-  return blobs
-end
-
 -- Assemble one chat.completion from a streamed Responses SSE body.
 local function assemble_responses_stream(body, model, request)
   local text_parts = {}
@@ -1201,7 +1159,6 @@ local function assemble_responses_stream(body, model, request)
   local prompt_tokens, completion_tokens, total_tokens = 0, 0, 0
   local out_model = model
   local terminal_finish = nil
-  local blobs = {}
   local function fn_slot(index)
     local acc = fn_by_index[index]
     if not acc then
@@ -1239,7 +1196,6 @@ local function assemble_responses_stream(body, model, request)
           elseif (et == "response.completed" or et == "response.incomplete") and type(ev.response) == "table" then
             local r = ev.response
             if type(r.model) == "string" and r.model ~= "" then out_model = r.model end
-            blobs = collect_blobs(r)
             if type(r.usage) == "table" then
               prompt_tokens = r.usage.input_tokens or 0
               completion_tokens = r.usage.output_tokens or 0
@@ -1264,7 +1220,6 @@ local function assemble_responses_stream(body, model, request)
       end
     end
   end
-  blob_push(request, model, blobs)
   table.sort(fn_order)
   local tool_calls = {}
   for _, idx in ipairs(fn_order) do
@@ -1464,7 +1419,7 @@ llm_router.register("opencode-free", {
         local body = debug_json(payload)
         debug_log("HTTP", "POST " .. BASE_URL .. "/responses body_len=" .. tostring(#body))
         local raw_body, action, err = fetch_body(resp_client, BASE_URL .. "/responses", headers, body, model, px)
-        if raw_body then return assemble_responses_stream(raw_body, request.model, request) end
+        if raw_body then return assemble_responses_stream(raw_body, model, request) end
         debug_log("HTTP_ERROR", debug_json(err))
         if action == "done" then return nil, err end
       else
@@ -1576,7 +1531,6 @@ llm_router.register("opencode-free", {
         local usage = nil
         local finish = "stop"
         local saw_tools = false
-        local blobs = {}
         local function fn_acc(index)
           local acc = fn_state[index]
           if not acc then
@@ -1666,7 +1620,6 @@ llm_router.register("opencode-free", {
               acc_for_delta.args = acc_for_delta.args .. ev.delta
             elseif (et == "response.completed" or et == "response.incomplete") and type(ev.response) == "table" then
               local r = ev.response
-              blobs = collect_blobs(r)
               if type(r.usage) == "table" then
                 usage = {
                   prompt_tokens = r.usage.input_tokens or 0,
@@ -1688,7 +1641,6 @@ llm_router.register("opencode-free", {
             end
           end,
         })
-        blob_push(request, model, blobs)
         if stream_err then
           debug_log("HTTP_STREAM_ERROR", debug_json(stream_err))
           last_err = stream_err
