@@ -1,7 +1,7 @@
 --- @plugin OpenCode Free
 --- @author TheSlopMachine
---- @version 6.3.17
---- @plugin_api 1.0
+--- @version 6.4.0
+--- @plugin_api 1.1
 --- @description OpenAI/Anthropic/Google compatible free provider OpenCode Free (no key required)
 --- @allow_host opencode.ai
 --- @allow_host models.opencode.ai
@@ -746,24 +746,19 @@ local function terminal_error(skipped, attempted, observed)
   end
   local extra = ""
   if denied > 0 then extra = " (" .. tostring(denied) .. " exits denied with 403)" end
+  local retry_after = "30"
+  local why = "tried everything known"
   if attempted == 0 and skipped > 0 then
-    return {
-      message = what .. ", retry in ~30 seconds (all known exits parked)" .. extra,
-      code = code,
-      status = 429,
-    }
-  end
-  if observed > attempted then
-    return {
-      message = what .. ", retry in ~3 seconds (untried exits remain)" .. extra,
-      code = code,
-      status = 429,
-    }
+    why = "all known exits parked"
+  elseif observed > attempted then
+    retry_after = "3"
+    why = "untried exits remain"
   end
   return {
-    message = what .. ", retry in ~30 seconds" .. extra,
+    message = what .. ", retry in ~" .. retry_after .. " seconds (" .. why .. ")" .. extra,
     code = code,
     status = 429,
+    headers = { ["retry-after"] = retry_after },
   }
 end
 
