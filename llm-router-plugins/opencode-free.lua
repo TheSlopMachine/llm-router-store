@@ -1,6 +1,6 @@
 --- @plugin OpenCode Free
 --- @author TheSlopMachine
---- @version 6.3.2
+--- @version 6.3.4
 --- @plugin_api 1.0
 --- @description OpenAI/Anthropic/Google compatible free provider OpenCode Free (no key required)
 --- @allow_host opencode.ai
