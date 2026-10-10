@@ -1,12 +1,18 @@
 --- @plugin OpenCode Free
 --- @author TheSlopMachine
---- @version 6.2.0
+--- @version 6.3.2
 --- @plugin_api 1.0
 --- @description OpenAI/Anthropic/Google compatible free provider OpenCode Free (no key required)
 --- @allow_host opencode.ai
 --- @allow_host models.opencode.ai
+--- @allow_host registry.npmjs.org
+--- @allow_host raw.githubusercontent.com
 
 local BASE_URL = "https://opencode.ai/zen/v1"
+local MODELS_DEV_URL = "https://models.opencode.ai/api.json"
+local NPM_VERSION_URL = "https://registry.npmjs.org/opencode-ai/latest"
+local RAW_BASE = "https://raw.githubusercontent.com/anomalyco/opencode/"
+local RAW_BRANCHES = { "dev", "main" }
 
 -- Protocol families first: muse-spark/gpt/grok serve /responses even for
 -- their -free variants. Remaining -free models are chat-protocol.
@@ -83,7 +89,7 @@ local function normalize_tools(tools)
   end
 
   -- Map-shaped input iterates in undefined order. Sort by name so the
-  -- upstream tool list (and the cache-key canonical form) is stable.
+  -- upstream tool list is stable.
   for _, value in pairs(tools) do
     add_tool(value)
   end
@@ -99,51 +105,313 @@ local function output_token_budget(request)
   return value
 end
 
--- Anonymous free-tier requests must carry the exact wire shape of the
--- genuine client, verified by differential probing against the live API:
--- released-version User-Agent, Bearer public, x-opencode-* session headers
--- with ULID-shaped ids, stream:true, temperature + max_tokens present, and
--- a leading system message carrying the known client prompt fingerprint.
-local GOOD_UA = "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
+-- Remote text cache: every fingerprint-critical byte (CLI version, prompt
+-- heads, tool descriptions) arrives over the wire and refreshes on TTL.
+-- Fetch failures serve last-cached bytes; prompt callers fail closed when
+-- nothing is cached, since a wrong fingerprint is worse than an error.
+local TEXT_CACHE_SCOPE = "remote_text"
 
--- First 1000 chars of the genuine title-generator system prompt, the
--- minimal fragment the free-tier gate accepts. Stored with literal \r\n
--- escapes and decoded below, so the source file stays plain LF text.
-local FINGERPRINT_SRC =
-  [[You are a title generator. You output ONLY a thread title. Nothing else.\r\n\r\n<task>\r\nGenerate a brief title that would help the user find this conversation later.\r\n\r\nFollow all rules in <rules>\r\nUse the <examples> so you know what a good title looks like.\r\nYour output must be:\r\n- A single line\r\n- ≤50 characters\r\n- No explanations\r\n</task>\r\n\r\n<rules>\r\n- you MUST use the same language as the user message you are summarizing\r\n- Title must be grammatically correct and read naturally - no word salad\r\n- Never include tool names in the title (e.g. "read tool", "bash tool", "edit tool")\r\n- Focus on the main topic or question the user needs to retrieve\r\n- Vary your phrasing - avoid repetitive patterns like always starting with "Analyzing"\r\n- When a file is mentioned, focus on WHAT the user wants to do WITH the file, not just that they shared it\r\n- Keep exact: technical terms, numbers, filenames, HTTP codes\r\n- Remove: the, this, my, a, an\r\n- Never assume tech stack\r\n- Never use tools\r\n- NEVER res]]
-local FINGERPRINT = FINGERPRINT_SRC:gsub("\\r\\n", "\r\n")
-
--- Full genuine agent system prompt for multi-turn shapes. The gate only
--- accepts assistant history beside this prompt, not the title fragment.
--- Stored with literal \r\n and \n escapes, decoded in order below.
-local AGENT_SRC =
-  [==[You are opencode, an interactive CLI tool that helps users with software engineering tasks. Use the instructions below and the tools available to you to assist the user.\r\n\r\nIMPORTANT: You must NEVER generate or guess URLs for the user unless you are confident that the URLs are for helping the user with programming. You may use URLs provided by the user in their messages or local files.\r\n\r\nIf the user asks for help or wants to give feedback inform them of the following:\r\n- /help: Get help with using opencode\r\n- To give feedback, users should report the issue at https://github.com/anomalyco/opencode/issues\r\n\r\nWhen the user directly asks about opencode (eg 'can opencode do...', 'does opencode have...') or asks in second person (eg 'are you able...', 'can you do...'), first use the WebFetch tool to gather information to answer the question from opencode docs at https://opencode.ai\r\n\r\n# Tone and style\r\nYou should be concise, direct, and to the point. When you run a non-trivial bash command, you should explain what the command does and why you are running it, to make sure the user understands what you are doing (this is especially important when you are running a command that will make changes to the user's system).\r\nRemember that your output will be displayed on a command line interface. Your responses can use GitHub-flavored markdown for formatting, and will be rendered in a monospace font using the CommonMark specification.\r\nOutput text to communicate with the user; all text you output outside of tool use is displayed to the user. Only use tools to complete tasks. Never use tools like Bash or code comments as means to communicate with the user during the session.\r\nIf you cannot or will not help the user with something, please do not say why or what it could lead to, since this comes across as preachy and annoying. Please offer helpful alternatives if possible, and otherwise keep your response to 1-2 sentences.\r\nOnly use emojis if the user explicitly requests it. Avoid using emojis in all communication unless asked.\r\nIMPORTANT: You should minimize output tokens as much as possible while maintaining helpfulness, quality, and accuracy. Only address the specific query or task at hand, avoiding tangential information unless absolutely critical for completing the request. If you can answer in 1-3 sentences or a short paragraph, please do.\r\nIMPORTANT: You should NOT answer with unnecessary preamble or postamble (such as explaining your code or summarizing your action), unless the user asks you to.\r\nIMPORTANT: Keep your responses short, since they will be displayed on a command line interface. You MUST answer concisely with fewer than 4 lines (not including tool use or code generation), unless user asks for detail. Answer the user's question directly, without elaboration, explanation, or details. One word answers are best. Avoid introductions, conclusions, and explanations. You MUST avoid text before/after your response, such as "The answer is <answer>.", "Here is the content of the file..." or "Based on the information provided, the answer is..." or "Here is what I will do next...". Here are some examples to demonstrate appropriate verbosity:\r\n<example>\r\nuser: what is 2+2?\r\nassistant: 4\r\n</example>\r\n\r\n<example>\r\nuser: is 11 a prime number?\r\nassistant: Yes\r\n</example>\r\n\r\n<example>\r\nuser: what command should I run to list files in the current directory?\r\nassistant: ls\r\n</example>\r\n\r\n<example>\r\nuser: what command should I run to watch files in the current directory?\r\nassistant: [use the ls tool to list the files in the current directory, then read docs/commands in the relevant file to find out how to watch files]\r\nnpm run dev\r\n</example>\r\n\r\n<example>\r\nuser: what files are in the directory src/?\r\nassistant: [runs ls and sees foo.c, bar.c, baz.c]\r\nuser: which file contains the implementation of foo?\r\nassistant: src/foo.c\r\n</example>\r\n\r\n<example>\r\nuser: write tests for new feature\r\nassistant: [uses grep and glob search tools to find where similar tests are defined, uses concurrent read file tool use blocks in one tool call to read relevant files at the same time, uses edit file tool to write new tests]\r\n</example>\r\n\r\n# Proactiveness\r\nYou are allowed to be proactive, but only when the user asks you to do something. You should strive to strike a balance between:\r\n1. Doing the right thing when asked, including taking actions and follow-up actions\r\n2. Not surprising the user with actions you take without asking\r\nFor example, if the user asks you how to approach something, you should do your best to answer their question first, and not immediately jump into taking actions.\r\n3. Do not add additional code explanation summary unless requested by the user. After working on a file, just stop, rather than providing an explanation of what you did.\r\n\r\n# Following conventions\r\nWhen making changes to files, first understand the file's code conventions. Mimic code style, use existing libraries and utilities, and follow existing patterns.\r\n- NEVER assume that a given library is available, even if it is well known. Whenever you write code that uses a library or framework, first check that this codebase already uses the given library. For example, you might look at neighboring files, or check the package.json (or cargo.toml, and so on depending on the language).\r\n- When you create a new component, first look at existing components to see how they're written; then consider framework choice, naming conventions, typing, and other conventions.\r\n- When you edit a piece of code, first look at the code's surrounding context (especially its imports) to understand the code's choice of frameworks and libraries. Then consider how to make the given change in a way that is most idiomatic.\r\n- Always follow security best practices. Never introduce code that exposes or logs secrets and keys. Never commit secrets or keys to the repository.\r\n\r\n# Code style\r\n- IMPORTANT: DO NOT ADD ***ANY*** COMMENTS unless asked\r\n\r\n# Doing tasks\r\nThe user will primarily request you perform software engineering tasks. This includes solving bugs, adding new functionality, refactoring code, explaining code, and more. For these tasks the following steps are recommended:\r\n- Use the available search tools to understand the codebase and the user's query. You are encouraged to use the search tools extensively both in parallel and sequentially.\r\n- Implement the solution using all tools available to you\r\n- Verify the solution if possible with tests. NEVER assume specific test framework or test script. Check the README or search codebase to determine the testing approach.\r\n- VERY IMPORTANT: When you have completed a task, you MUST run the lint and typecheck commands (e.g. npm run lint, npm run typecheck, ruff, etc.) with Bash if they were provided to you to ensure your code is correct. If you are unable to find the correct command, ask the user for the command to run and if they supply it, proactively suggest writing it to AGENTS.md so that you will know to run it next time.\r\nNEVER commit changes unless the user explicitly asks you to. It is VERY IMPORTANT to only commit when explicitly asked, otherwise the user will feel that you are being too proactive.\r\n\r\n- Tool results and user messages may include <system-reminder> tags. <system-reminder> tags contain useful information and reminders. They are NOT part of the user's provided input or the tool result.\r\n\r\n# Tool usage policy\r\n- When doing file search, prefer to use the Task tool in order to reduce context usage.\r\n- You have the capability to call multiple tools in a single response. When multiple independent pieces of information are requested, batch your tool calls together for optimal performance. When making multiple bash tool calls, you MUST send a single message with multiple tools calls to run the calls in parallel. For example, if you need to run "git status" and "git diff", send a single message with two tool calls to run the calls in parallel.\r\n\r\nYou MUST answer concisely with fewer than 4 lines of text (not including tool use or code generation), unless user asks for detail.\r\n\r\nIMPORTANT: Before you begin work, think about what the code you're editing is supposed to do based on the filenames directory structure.\r\n\r\n# Code References\r\n\r\nWhen referencing specific functions or pieces of code include the pattern `file_path:line_number` to allow the user to easily navigate to the source code location.\r\n\r\n<example>\r\nuser: Where are errors from the client handled?\r\nassistant: Clients are marked as failed in the `connectToServer` function in src/services/process.ts:712.\r\n</example>\r\n\nYou are powered by the model named nemotron-3.5-lightning-free. The exact model ID is opencode/nemotron-3.5-lightning-free\nHere is some useful information about the environment you are running in:\n<env>\n  Working directory: C:\Users\Thinker\AppData\Local\Temp\opencode\n  Workspace root folder: /\n  Is directory a git repo: no\n  Platform: win32\n  Today's date: Thu Sep 17 2026\n</env>\nSkills provide specialized instructions and workflows for specific tasks.\nUse the skill tool to load a skill when a task matches its description.\n<available_skills>\n  <skill>\n    <name>customize-opencode</name>\n    <description>Use ONLY when the user is editing or creating opencode's own configuration: opencode.json, opencode.jsonc, files under .opencode/, or files under ~/.config/opencode/. Also use when creating or fixing opencode agents, subagents, skills, plugins, MCP servers, or permission rules. Do not use for the user's own application code, or for any project that is not configuring opencode itself.</description>\n    <location>&lt;built-in&gt;</location>\n  </skill>\n  <skill>\n    <name>git-commit</name>\n    <description>git commit, conventional commit, commit changes. Use ONLY when user explicitly invokes the git-commit skill or asks to commit changes with a conventional commit message.</description>\n    <location>C:\Users\Thinker\.config\opencode\skills\git-commit\SKILL.md</location>\n  </skill>\n  <skill>\n    <name>svelte5-best-practices</name>\n    <description>Svelte 5 runes, snippets, SvelteKit patterns, and modern best practices for TypeScript and component development. Use when writing, reviewing, or refactoring Svelte 5 components and SvelteKit applications. Triggers on: Svelte components, runes ($state, $derived, $effect, $props, $bindable, $inspect), snippets ({#snippet}, {@render}), event handling, SvelteKit data loading, form actions, Svelte 4 to Svelte 5 migration, store to rune migration, slots to snippets migration, TypeScript props typing, generic components, SSR state isolation, performance optimization, or component testing.</description>\n    <location>C:\Users\Thinker\.agents\skills\svelte5-best-practices\SKILL.md</location>\n  </skill>\n</available_skills>]==]
-local AGENT_SYS = AGENT_SRC:gsub("\\r\\n", "\r\n"):gsub("\\n", "\n")
-
--- Six genuine built-in tool definitions (bash, edit, read, write, glob,
--- grep). Multi-turn shapes only pass with these present; client tools are
--- merged in, never replaced.
-local TOOLS_JSON_SRC =
-  [==[[{"type": "function", "function": {"name": "bash", "description": "Executes a given PowerShell (7+) command with optional timeout, ensuring proper handling and security measures.\r\n\r\nBe aware: OS: win32, Shell: pwsh\r\n\r\nAll commands run in the current working directory by default. Use the `workdir` parameter if you need to run a command in a different directory. AVOID changing directories inside the command - use `workdir` instead.\r\n\r\nUse `C:\\Users\\Thinker\\AppData\\Local\\Temp\\opencode` for temporary work outside the workspace. This directory has already been created, already exists, and is pre-approved for external directory access.\r\n\r\nIMPORTANT: This tool is for terminal operations like git, npm, docker, etc. DO NOT use it for file operations (reading, writing, editing, searching, finding files) - use the specialized tools for this instead.\r\n\r\n# PowerShell (7+) shell notes\n- This cross-platform shell supports pipeline chain operators (`&&` and `||`).\n- Use double quotes for interpolated strings (`\"Hello $name\"`), single quotes for verbatim strings.\n- Prefer full cmdlet names like `Get-ChildItem`, `Set-Content`, `Remove-Item`, and `New-Item` over aliases.\n- Use `$(...)` for subexpressions. Use `@(...)` for array expressions.\n- To call a native executable whose path contains spaces, use the call operator: `& \"path/to/exe\" args`.\n- Escape special characters with the PowerShell backtick character.\n\nBefore executing the command, please follow these steps:\n\n1. Directory Verification:\n   - If the command will create new directories or files, first use `Test-Path -LiteralPath <parent>` to verify the parent directory exists and is the correct location\n   - For example, before creating `foo\\bar`, first use `Test-Path -LiteralPath \"foo\"` to check that `foo` exists and is the intended parent directory\n\n2. Command Execution:\n   - Always quote file paths that contain spaces with double quotes (e.g., Remove-Item -LiteralPath \"path with spaces\\file.txt\")\n   - Examples of proper quoting:\n     - New-Item -ItemType Directory -Path \"My Documents\" (correct)\n     - New-Item -ItemType Directory -Path My Documents (incorrect - path is split)\n     - & \"path with spaces\\script.ps1\" (correct)\n     - path with spaces\\script.ps1 (incorrect - path is split and not invoked)\n   - After ensuring proper quoting, execute the command.\n   - Capture the output of the command.\n\nUsage notes:\n  - The command argument is required.\n  - You can specify an optional timeout in milliseconds. If not specified, commands will time out after 120000ms.\n  - If the output exceeds 2000 lines or 51200 bytes, it will be truncated and the full output will be written to a file. You can use Read with offset/limit to read specific sections or Grep to search the full content. Do NOT use `Select-Object -First`, `Select-Object -Last`, or other truncation commands to limit output; the full output will already be captured to a file for more precise searching.\n\n  - Avoid using Shell with PowerShell file/content cmdlets unless explicitly instructed or when these cmdlets are truly necessary for the task. Instead, always prefer using the dedicated tools for these commands:\n    - File search: Use Glob (NOT Get-ChildItem)\n    - Content search: Use Grep (NOT Select-String)\n    - Read files: Use Read (NOT Get-Content)\n    - Edit files: Use Edit (NOT Set-Content)\n    - Write files: Use Write (NOT Set-Content/Out-File or here-strings)\n    - Communication: Output text directly (NOT Write-Output/Write-Host)\n  - When issuing multiple commands:\n    - If the commands are independent and can run in parallel, make multiple bash tool calls in a single message. For example, if you need to run \"git status\" and \"git diff\", send a single message with two bash tool calls in parallel.\n    - If the commands depend on each other and must run sequentially, use a single bash tool call with '&&' to chain them together (e.g., `git add . && git commit -m \"message\" && git push`). For instance, if one operation must complete before another starts (like New-Item before Copy-Item, Write before bash for git operations, or git add before git commit), run these operations sequentially instead.\n    - Use `;` only when you need to run commands sequentially but don't care if earlier commands fail\n    - DO NOT use newlines to separate commands (newlines are ok in quoted strings)\n  - AVOID changing directories inside the command. Use the `workdir` parameter to change directories instead.\n    <good-example>\n    Use workdir=\"project\\subdir\" with command: pytest tests\n    </good-example>\n    <bad-example>\n    Set-Location -LiteralPath \"project\\subdir\" && pytest tests\n    </bad-example>\r\n\r\n# Git and GitHub\r\n- Only commit, amend, push, or create PRs when explicitly requested.\r\n- Before committing, inspect `git status`, `git diff`, and `git log --oneline -10`; stage only intended files and never commit secrets.\r\n- Write a concise commit message that matches the repo style.\r\n- Do not update git config, skip hooks, use interactive `-i`, force-push, or create empty commits unless explicitly requested.\r\n- If a commit fails or hooks reject it, fix the issue and create a new commit; do not amend the failed commit.\r\n- Before creating a PR, inspect status, diff, remote tracking, recent commits, and the diff from the base branch.\r\n- Review all commits included in the PR, not just the latest commit.\r\n- Use `gh` for GitHub tasks, including PRs, issues, checks, and releases; return the PR URL when done.\r\n", "parameters": {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object", "properties": {"command": {"type": "string", "description": "The command to execute"}, "timeout": {"minimum": -9007199254740991, "exclusiveMinimum": 0, "type": "integer", "maximum": 9007199254740991, "description": "Optional timeout in milliseconds"}, "workdir": {"type": "string", "description": "The working directory to run the command in. Defaults to the current directory. Use this instead of 'cd' commands."}}, "required": ["command"]}}}, {"type": "function", "function": {"name": "edit", "description": "Performs exact string replacements in files. \r\n\r\nUsage:\r\n- You must use your `Read` tool at least once in the conversation before editing. This tool will error if you attempt an edit without reading the file. \r\n- When editing text from Read tool output, ensure you preserve the exact indentation (tabs/spaces) as it appears AFTER the line number prefix. The line number prefix format is: line number + colon + space (e.g., `1: `). Everything after that space is the actual file content to match. Never include any part of the line number prefix in the oldString or newString.\r\n- ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.\r\n- Only use emojis if the user explicitly requests it. Avoid adding emojis to files unless asked.\r\n- The edit will FAIL if `oldString` is not found in the file with an error \"oldString not found in content\".\r\n- The edit will FAIL if `oldString` is found multiple times in the file with an error \"Found multiple matches for oldString. Provide more surrounding lines in oldString to identify the correct match.\" Either provide a larger string with more surrounding context to make it unique or use `replaceAll` to change every instance of `oldString`. \r\n- Use `replaceAll` for replacing and renaming strings across the file. This parameter is useful if you want to rename a variable for instance.\r\n", "parameters": {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object", "properties": {"filePath": {"type": "string", "description": "The absolute path to the file to modify"}, "oldString": {"type": "string", "description": "The text to replace"}, "newString": {"type": "string", "description": "The text to replace it with (must be different from oldString)"}, "replaceAll": {"type": "boolean", "description": "Replace all occurrences of oldString (default false)"}}, "required": ["filePath", "oldString", "newString"]}}}, {"type": "function", "function": {"name": "glob", "description": "- Fast file pattern matching tool that works with any codebase size\r\n- Supports glob patterns like \"**/*.js\" or \"src/**/*.ts\"\r\n- Returns matching file paths\r\n- Use this tool when you need to find files by name patterns\r\n- When you are doing an open-ended search that may require multiple rounds of globbing and grepping, use the Task tool instead\r\n- You have the capability to call multiple tools in a single response. It is always better to speculatively perform multiple searches as a batch that are potentially useful.\r\n", "parameters": {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object", "properties": {"pattern": {"type": "string", "description": "The glob pattern to match files against"}, "path": {"type": "string", "description": "The directory to search in. If not specified, the current working directory will be used. IMPORTANT: Omit this field to use the default directory. DO NOT enter \"undefined\" or \"null\" - simply omit it for the default behavior. Must be a valid directory path if provided."}}, "required": ["pattern"]}}}, {"type": "function", "function": {"name": "grep", "description": "- Fast content search tool that works with any codebase size\r\n- Searches file contents using regular expressions\r\n- Supports full regex syntax (eg. \"log.*Error\", \"function\\s+\\w+\", etc.)\r\n- Filter files by pattern with the include parameter (eg. \"*.js\", \"*.{ts,tsx}\")\r\n- Returns file paths and line numbers with matching lines\r\n- Use this tool when you need to find files containing specific patterns\r\n- If you need to identify/count the number of matches within files, use the Bash tool with `rg` (ripgrep) directly. Do NOT use `grep`.\r\n- When you are doing an open-ended search that may require multiple rounds of globbing and grepping, use the Task tool instead\r\n", "parameters": {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object", "properties": {"pattern": {"type": "string", "description": "The regex pattern to search for in file contents"}, "path": {"type": "string", "description": "The directory to search in. Defaults to the current working directory."}, "include": {"type": "string", "description": "File pattern to include in the search (e.g. \"*.js\", \"*.{ts,tsx}\")"}}, "required": ["pattern"]}}}, {"type": "function", "function": {"name": "read", "description": "Read a file or directory from the local filesystem. If the path does not exist, an error is returned.\r\n\r\nUsage:\r\n- The filePath parameter should be an absolute path.\r\n- By default, this tool returns up to 2000 lines from the start of the file.\r\n- The offset parameter is the line number to start from (1-indexed).\r\n- To read later sections, call this tool again with a larger offset.\r\n- Use the grep tool to find specific content in large files or files with long lines.\r\n- If you are unsure of the correct file path, use the glob tool to look up filenames by glob pattern.\r\n- Contents are returned with each line prefixed by its line number as `<line>: <content>`. For example, if a file has contents \"foo\\n\", you will receive \"1: foo\\n\". For directories, entries are returned one per line (without line numbers) with a trailing `/` for subdirectories.\r\n- Any line longer than 2000 characters is truncated.\r\n- Call this tool in parallel when you know there are multiple files you want to read.\r\n- Avoid tiny repeated slices (30 line chunks). If you need more context, read a larger window.\r\n- This tool can read image files and PDFs and return them as file attachments.\r\n", "parameters": {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object", "properties": {"filePath": {"type": "string", "description": "The absolute path to the file or directory to read"}, "offset": {"minimum": 0, "type": "integer", "maximum": 9007199254740991, "description": "The line number to start reading from (1-indexed)"}, "limit": {"minimum": 0, "type": "integer", "maximum": 9007199254740991, "description": "The maximum number of lines to read (defaults to 2000)"}}, "required": ["filePath"]}}}, {"type": "function", "function": {"name": "write", "description": "Writes a file to the local filesystem.\r\n\r\nUsage:\r\n- This tool will overwrite the existing file if there is one at the provided path.\r\n- If this is an existing file, you MUST use the Read tool first to read the file's contents. This tool will fail if you did not read the file first.\r\n- ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.\r\n- NEVER proactively create documentation files (*.md) or README files. Only create documentation files if explicitly requested by the User.\r\n- Only use emojis if the user explicitly requests it. Avoid writing emojis to files unless asked.\r\n", "parameters": {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object", "properties": {"content": {"type": "string", "description": "The content to write to the file"}, "filePath": {"type": "string", "description": "The absolute path to the file to write (must be absolute, not relative)"}}, "required": ["content", "filePath"]}}}]]==]
-local INJECTED_TOOLS = json.decode(TOOLS_JSON_SRC)
-if type(INJECTED_TOOLS) ~= "table" or #INJECTED_TOOLS < 6 then
-  error("opencode-free: embedded tool definitions failed to decode")
+local function fetch_text_cached(url, cache_key, ttl)
+  local ok, cached = pcall(llm_router.storage.get, TEXT_CACHE_SCOPE, cache_key)
+  if ok and type(cached) == "string" and cached ~= "" then return cached end
+  local client = llm_router.http_client({ timeout_ms = 30000 })
+  local resp, err = client:request({ method = "GET", url = url, headers = {} })
+  if err or resp == nil or resp.status ~= 200 or type(resp.body) ~= "string" or resp.body == "" then
+    return nil
+  end
+  pcall(llm_router.storage.set, TEXT_CACHE_SCOPE, cache_key, resp.body, { ttl = ttl })
+  return resp.body
 end
 
--- Flat Responses-protocol view of the same definitions.
-local INJECTED_TOOLS_RESP = {}
-for _, t in ipairs(INJECTED_TOOLS) do
-  local fn = t["function"] or {}
-  table.insert(INJECTED_TOOLS_RESP, {
-    type = "function",
-    name = fn.name or "",
-    description = fn.description or "",
-    parameters = fn.parameters or { type = "object", properties = {} },
-  })
+-- CLI version for the User-Agent, from the npm registry metadata the
+-- official upgrade path prefers over the rate-limited GitHub API.
+-- Verified live: /latest answers {"version": "1.18.35", ...} with no auth.
+local VERSION_TTL = 86400
+local VERSION_FALLBACK = "1.18.35"
+
+local function opencode_version()
+  local body = fetch_text_cached(NPM_VERSION_URL, "npm_version", VERSION_TTL)
+  if type(body) == "string" and body ~= "" then
+    local ok, parsed = pcall(json.decode, body)
+    if ok and type(parsed) == "table" and type(parsed.version) == "string" and parsed.version ~= "" then
+      return parsed.version
+    end
+  end
+  return VERSION_FALLBACK
+end
+
+-- provider-utils sub-version has no live source; the observed constants are
+-- keyed by endpoint family (chat 4.0.23, responses 4.0.40 on 1.18.35).
+local function user_agent(endpoint)
+  local sdk = "4.0.23"
+  if endpoint == "/responses" then sdk = "4.0.40" end
+  return "opencode/" .. opencode_version() .. " ai-sdk/provider-utils/" .. sdk .. " runtime/bun/1.3.14"
+end
+
+local function catalog_ua() return "opencode/latest/" .. opencode_version() .. "/cli" end
+
+-- Prompt heads fetched from the opencode repository (dev branch first, main
+-- as fallback). SystemPrompt.provider owns the family mapping; the same
+-- text serves both protocols, only the role wrapper differs.
+local PROMPT_TTL = 86400
+local PROMPT_DIR = "packages/opencode/src/session/prompt/"
+
+local function fetch_repo_text(path, cache_key)
+  local ok, cached = pcall(llm_router.storage.get, TEXT_CACHE_SCOPE, cache_key)
+  if ok and type(cached) == "string" and cached ~= "" then return cached end
+  for _, branch in ipairs(RAW_BRANCHES) do
+    local body = fetch_text_cached(RAW_BASE .. branch .. "/" .. path, cache_key .. ":" .. branch, PROMPT_TTL)
+    if type(body) == "string" and body ~= "" then
+      pcall(llm_router.storage.set, TEXT_CACHE_SCOPE, cache_key, body, { ttl = PROMPT_TTL })
+      return body
+    end
+  end
+  if ok and type(cached) == "string" then return cached end
+  return nil
+end
+
+local function prompt_file_for_model(model)
+  local m = model:lower()
+  if m:find("muse", 1, true) then return "meta.txt", true end
+  if m:find("gpt-4", 1, true) or m:find("o1", 1, true) or m:find("o3", 1, true) then return "beast.txt", false end
+  if m:find("gpt", 1, true) then
+    if m:find("gpt-6", 1, true) then return "gpt-astra.txt", false end
+    if m:find("codex", 1, true) then return "codex.txt", false end
+    return "gpt.txt", false
+  end
+  if m:find("gemini-", 1, true) then return "gemini.txt", false end
+  if m:find("claude", 1, true) then return "anthropic.txt", false end
+  if m:find("trinity", 1, true) then return "trinity.txt", false end
+  if m:find("kimi", 1, true) then return "kimi.txt", false end
+  return "default.txt", false
+end
+
+-- Head text only: the live tail (working directory, skills, MCP
+-- instructions) is machine-specific and unreproducible, so it is omitted.
+-- Returns (nil, err) when neither fresh nor cached bytes exist.
+local function agent_prompt(model)
+  local file, is_meta = prompt_file_for_model(model)
+  local head = fetch_repo_text(PROMPT_DIR .. file, "prompt:" .. file)
+  if type(head) ~= "string" or head == "" then
+    return nil, { message = "agent prompt unavailable (" .. file .. ")", code = "server_error", status = 502 }
+  end
+  if is_meta then
+    local name = "Muse Spark"
+    if model:lower():find("muse-glimmer", 1, true) then name = "Muse Glimmer" end
+    head = head:gsub("{{MODEL_NAME}}", name)
+  end
+  return head
+end
+
+-- Tool description prose fetched from the tool sibling .txt files.
+-- Parameter schemas below are structural (TS-annotation-sourced) and pinned
+-- against live captures, not prose.
+local TOOL_DESC_DIR = "packages/opencode/src/tool/"
+local TOOL_DESC_FILES = {
+  read = "read.txt",
+  write = "write.txt",
+  edit = "edit.txt",
+  glob = "glob.txt",
+  grep = "grep.txt",
+}
+
+local function tool_description(name)
+  local file = TOOL_DESC_FILES[name]
+  if file == nil then return nil end
+  return fetch_repo_text(TOOL_DESC_DIR .. file, "tooldesc:" .. name)
+end
+
+-- pwsh/win32 render of tool/shell/shell.txt, ported from
+-- tool/shell/prompt.ts (powershellCommandSection + chainGuidance PS branch,
+-- limits 2000 lines / 51200 bytes, 120000ms default timeout).
+-- The tmp path is machine-specific upstream; the fallback preserves the
+-- proven Windows-client bytes and is documented, not derived.
+local SHELL_TMP_FALLBACK = "C:\\Users\\Thinker\\AppData\\Local\\Temp\\opencode"
+
+local function shell_description()
+  local template = fetch_repo_text(TOOL_DESC_DIR .. "shell/shell.txt", "tooldesc:shell-template")
+  if type(template) ~= "string" or template == "" then return nil end
+  local chain = "If the commands depend on each other and must run sequentially, use a single bash tool call with '&&' to chain them together (e.g., `git add . && git commit -m \"message\" && git push`). For instance, if one operation must complete before another starts (like New-Item before Copy-Item, Write before bash for git operations, or git add before git commit), run these operations sequentially instead."
+  local notes = "# PowerShell (7+) shell notes\n"
+    .. "- This cross-platform shell supports pipeline chain operators (`&&` and `||`).\n"
+    .. "- Use double quotes for interpolated strings (`\"Hello $name\"`), single quotes for verbatim strings.\n"
+    .. "- Prefer full cmdlet names like `Get-ChildItem`, `Set-Content`, `Remove-Item`, and `New-Item` over aliases.\n"
+    .. "- Use `$(...)` for subexpressions. Use `@(...)` for array expressions.\n"
+    .. "- To call a native executable whose path contains spaces, use the call operator: `& \"path/to/exe\" args`.\n"
+    .. "- Escape special characters with the PowerShell backtick character."
+  local command_section = notes
+    .. "\n\nBefore executing the command, please follow these steps:\n\n"
+    .. "1. Directory Verification:\n"
+    .. "   - If the command will create new directories or files, first use `Test-Path -LiteralPath <parent>` to verify the parent directory exists and is the correct location\n"
+    .. "   - For example, before creating `foo\\bar`, first use `Test-Path -LiteralPath \"foo\"` to check that `foo` exists and is the intended parent directory\n"
+    .. "\n2. Command Execution:\n"
+    .. "   - Always quote file paths that contain spaces with double quotes (e.g., Remove-Item -LiteralPath \"path with spaces\\file.txt\")\n"
+    .. "   - Examples of proper quoting:\n"
+    .. "     - New-Item -ItemType Directory -Path \"My Documents\" (correct)\n"
+    .. "     - New-Item -ItemType Directory -Path My Documents (incorrect - path is split)\n"
+    .. "     - & \"path with spaces\\script.ps1\" (correct)\n"
+    .. "     - path with spaces\\script.ps1 (incorrect - path is split and not invoked)\n"
+    .. "   - After ensuring proper quoting, execute the command.\n"
+    .. "   - Capture the output of the command.\n"
+    .. "\nUsage notes:\n"
+    .. "   - The command argument is required.\n"
+    .. "   - You can specify an optional timeout in milliseconds. If not specified, commands will time out after 120000ms.\n"
+    .. "   - If the output exceeds 2000 lines or 51200 bytes, it will be truncated and the full output will be written to a file. You can use Read with offset/limit to read specific sections or Grep to search the full content. Do NOT use `Select-Object -First`, `Select-Object -Last`, or other truncation commands to limit output; the full output will already be captured to a file for more precise searching.\n"
+    .. "\n   - Avoid using Shell with PowerShell file/content cmdlets unless explicitly instructed or when these cmdlets are truly necessary for the task. Instead, always prefer using the dedicated tools for these commands:\n"
+    .. "     - File search: Use Glob (NOT Get-ChildItem)\n"
+    .. "     - Content search: Use Grep (NOT Select-String)\n"
+    .. "     - Read files: Use Read (NOT Get-Content)\n"
+    .. "     - Edit files: Use Edit (NOT Set-Content)\n"
+    .. "     - Write files: Use Write (NOT Set-Content/Out-File or here-strings)\n"
+    .. "     - Communication: Output text directly (NOT Write-Output/Write-Host)\n"
+    .. "   - When issuing multiple commands:\n"
+    .. "     - If the commands are independent and can run in parallel, make multiple bash tool calls in a single message. For example, if you need to run \"git status\" and \"git diff\", send a single message with two bash tool calls in parallel.\n"
+    .. "     - "
+    .. chain
+    .. "\n     - Use `;` only when you need to run commands sequentially but don't care if earlier commands fail\n"
+    .. "     - DO NOT use newlines to separate commands (newlines are ok in quoted strings)\n"
+    .. "   - AVOID changing directories inside the command. Use the `workdir` parameter to change directories instead.\n"
+    .. "     <good-example>\n"
+    .. "     Use workdir=\"project\\subdir\" with command: pytest tests\n"
+    .. "     </good-example>\n"
+    .. "     <bad-example>\n"
+    .. "     Set-Location -LiteralPath \"project\\subdir\" && pytest tests\n"
+    .. "     </bad-example>"
+  local workdir_section = "All commands run in the current working directory by default. Use the `workdir` parameter if you need to run a command in a different directory. AVOID changing directories inside the command - use `workdir` instead."
+  local rendered = template
+  rendered = rendered:gsub(
+    "${intro}",
+    "Executes a given PowerShell (7+) command with optional timeout, ensuring proper handling and security measures.",
+    1
+  )
+  rendered = rendered:gsub("${os}", "win32", 1)
+  rendered = rendered:gsub("${shell}", "pwsh", 1)
+  rendered = rendered:gsub("${tmp}", SHELL_TMP_FALLBACK, 1)
+  rendered = rendered:gsub("${workdirSection}", workdir_section, 1)
+  rendered = rendered:gsub("${commandSection}", command_section, 1)
+  return rendered
+end
+
+local SCHEMA_DRAFT = "https://json-schema.org/draft/2020-12/schema"
+local HUGE_INT = 9007199254740991
+
+local function tool_params(name)
+  if name == "bash" then
+    return {
+      ["$schema"] = SCHEMA_DRAFT,
+      type = "object",
+      properties = {
+        command = { type = "string", description = "The command to execute" },
+        timeout = { minimum = -HUGE_INT, exclusiveMinimum = 0, type = "integer", maximum = HUGE_INT },
+        workdir = { type = "string" },
+      },
+      required = { "command" },
+    }
+  elseif name == "read" then
+    return {
+      ["$schema"] = SCHEMA_DRAFT,
+      type = "object",
+      properties = {
+        filePath = { type = "string", description = "The absolute path to the file or directory to read" },
+        offset = { minimum = 0, type = "integer", maximum = HUGE_INT },
+        limit = { minimum = 0, type = "integer", maximum = HUGE_INT },
+      },
+      required = { "filePath" },
+    }
+  elseif name == "write" then
+    return {
+      ["$schema"] = SCHEMA_DRAFT,
+      type = "object",
+      properties = {
+        content = { type = "string", description = "The content to write to the file" },
+        filePath = {
+          type = "string",
+          description = "The absolute path to the file to write (must be absolute, not relative)",
+        },
+      },
+      required = { "content", "filePath" },
+    }
+  elseif name == "edit" then
+    return {
+      ["$schema"] = SCHEMA_DRAFT,
+      type = "object",
+      properties = {
+        filePath = { type = "string", description = "The absolute path to the file to modify" },
+        oldString = { type = "string", description = "The text to replace" },
+        newString = { type = "string", description = "The text to replace it with (must be different from oldString)" },
+        replaceAll = { type = "boolean", description = "Replace all occurrences of oldString (default false)" },
+      },
+      required = { "filePath", "oldString", "newString" },
+    }
+  elseif name == "glob" then
+    return {
+      ["$schema"] = SCHEMA_DRAFT,
+      type = "object",
+      properties = {
+        pattern = { type = "string", description = "The glob pattern to match files against" },
+        path = { type = "string", description = "The directory to search in. If not specified, the current working directory will be used. IMPORTANT: Omit this field to use the default directory. DO NOT enter \"undefined\" or \"null\" - simply omit it for the default behavior. Must be a valid directory path if provided." },
+      },
+      required = { "pattern" },
+    }
+  elseif name == "grep" then
+    return {
+      ["$schema"] = SCHEMA_DRAFT,
+      type = "object",
+      properties = {
+        pattern = { type = "string", description = "The regex pattern to search for in file contents" },
+        path = { type = "string", description = "The directory to search in. Defaults to the current working directory." },
+        include = { type = "string", description = 'File pattern to include in the search (e.g. "*.js", "*.{ts,tsx}")' },
+      },
+      required = { "pattern" },
+    }
+  end
+  return nil
+end
+
+local INJECTED_TOOL_NAMES = { "bash", "read", "write", "edit", "glob", "grep" }
+
+-- Genuine main turns always carry tools. When the caller sends none, inject
+-- the six built-ins (descriptions fetched, schemas structural). Returns
+-- (nil, err) when a description is unavailable.
+local function injected_tools()
+  local out = {}
+  for _, name in ipairs(INJECTED_TOOL_NAMES) do
+    local desc
+    if name == "bash" then
+      desc = shell_description()
+    else
+      desc = tool_description(name)
+    end
+    if type(desc) ~= "string" or desc == "" then
+      return nil, { message = "tool description unavailable (" .. name .. ")", code = "server_error", status = 502 }
+    end
+    table.insert(out, {
+      type = "function",
+      ["function"] = { name = name, description = desc, parameters = tool_params(name) },
+    })
+  end
+  return out
+end
+
+local function merge_tools(client_tools)
+  local out = json.decode("[]")
+  local seen = {}
+  for _, t in ipairs(normalize_tools(client_tools)) do
+    local name = tool_name(t)
+    if name ~= "" then seen[name] = true end
+    table.insert(out, t)
+  end
+  local injected, err = injected_tools()
+  if injected == nil then return nil, err end
+  for _, t in ipairs(injected) do
+    local name = tool_name(t)
+    if name == "" or not seen[name] then table.insert(out, t) end
+  end
+  return out
 end
 
 local function merge_tools_resp(client_tools)
-  local out = json.decode("[]") -- Ensure it's an array
+  local out = json.decode("[]")
   local seen = {}
   for _, t in ipairs(client_tools or {}) do
     local name = ""
@@ -167,8 +435,17 @@ local function merge_tools_resp(client_tools)
       })
     end
   end
-  for _, t in ipairs(INJECTED_TOOLS_RESP) do
-    if t.name == "" or not seen[t.name] then table.insert(out, t) end
+  local injected, err = injected_tools()
+  if injected == nil then return nil, err end
+  for _, t in ipairs(injected) do
+    local fn = t["function"] or {}
+    local resp_tool = {
+      type = "function",
+      name = fn.name or "",
+      description = fn.description or "",
+      parameters = fn.parameters or { type = "object", properties = {} },
+    }
+    if resp_tool.name == "" or not seen[resp_tool.name] then table.insert(out, resp_tool) end
   end
   return out
 end
@@ -211,10 +488,8 @@ local function ulid_tail()
   return table.concat(out)
 end
 
--- Fresh ULID-shaped session/message ids per request. The time head uses
--- the current second plus a uniform sub-second part, matching the genuine
--- millisecond distribution; the message counter follows the session
--- counter, preserving request ordering.
+-- ULID-shaped ids. The time head uses the current second plus a uniform
+-- sub-second part, matching the genuine millisecond distribution.
 local function mint_ms()
   local jitter = tonumber(rand_bytes(2):sub(1, 4), 16) or 0
   return os.time() * 1000 + (jitter % 1000)
@@ -224,124 +499,33 @@ local function mint_session(ms) return "ses_" .. time_head(true, ms, 1) .. ulid_
 
 local function mint_msg(ms) return "msg_" .. time_head(false, ms, 2) .. ulid_tail() end
 
-local function mint_ids()
-  local ms = mint_ms()
-  return mint_session(ms), mint_msg(ms)
+-- Session id stable per conversation: keyed by the router's stable
+-- cross-turn partition, minted once per key, 10-minute TTL so abandoned
+-- sessions expire. The same id serves as prompt_cache_key verbatim.
+local SESSION_SCOPE = "session_v2"
+local SESSION_TTL = 600
+
+local function conv_key(request, model)
+  if type(request.cache_key) == "string" and request.cache_key ~= "" then
+    return model .. "|" .. request.cache_key
+  end
+  local first = ""
+  if type(request.messages) == "table" and type(request.messages[1]) == "table" then
+    first = debug_json(request.messages[1]):sub(1, 256)
+  end
+  return model .. "|" .. first
 end
 
--- Anonymous usage is attributed per session upstream, so the session id
--- stays stable per credential (24h rotation) instead of per request.
--- Loss fails open to a fresh id: continuity degrades, nothing breaks.
-local SESSION_SCOPE = "session"
-local SESSION_TTL = 24 * 3600
-
-local function stable_session()
-  local ses, at = nil, 0
-  local ok, v = pcall(llm_router.storage.get, SESSION_SCOPE, "ses")
-  if ok and type(v) == "string" and v ~= "" then ses = v end
-  local ok2, v2 = pcall(llm_router.storage.get, SESSION_SCOPE, "ses_at")
-  if ok2 and tonumber(v2) then at = tonumber(v2) end
-  if ses ~= nil and os.time() - at < SESSION_TTL then return ses end
+local function stable_session(request, model)
+  local key = conv_key(request, model)
+  local ok, ses = pcall(llm_router.storage.get, SESSION_SCOPE, key)
+  if ok and type(ses) == "string" and ses ~= "" then
+    pcall(llm_router.storage.set, SESSION_SCOPE, key, ses, { ttl = SESSION_TTL })
+    return ses
+  end
   local fresh = mint_session(mint_ms())
-  pcall(llm_router.storage.set, SESSION_SCOPE, "ses", fresh, { ttl = SESSION_TTL })
-  pcall(llm_router.storage.set, SESSION_SCOPE, "ses_at", os.time(), { ttl = SESSION_TTL })
+  pcall(llm_router.storage.set, SESSION_SCOPE, key, fresh, { ttl = SESSION_TTL })
   return fresh
-end
-
--- Deterministic encoder for the cache-key canonical form: object keys sort,
--- arrays keep order, so equal conversations hash equal regardless of how the
--- request tables were built.
-local function stable_encode(value)
-  local t = type(value)
-  if t == "string" then
-    local ok, enc = pcall(json.encode, value)
-    if ok then return enc end
-    return '""'
-  elseif t == "number" or t == "boolean" then
-    return tostring(value)
-  elseif t ~= "table" then
-    return "null"
-  end
-  local numeric, other, max_index = 0, 0, 0
-  for k, _ in pairs(value) do
-    if type(k) == "number" and k >= 1 and k % 1 == 0 then
-      numeric = numeric + 1
-      if k > max_index then max_index = k end
-    else
-      other = other + 1
-    end
-  end
-  if other == 0 and max_index == numeric then
-    local parts = {}
-    for i = 1, max_index do
-      table.insert(parts, stable_encode(value[i]))
-    end
-    return "[" .. table.concat(parts, ",") .. "]"
-  end
-  local keys = {}
-  for k, _ in pairs(value) do
-    table.insert(keys, k)
-  end
-  table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
-  local parts = {}
-  for _, k in ipairs(keys) do
-    table.insert(parts, stable_encode(tostring(k)) .. ":" .. stable_encode(value[k]))
-  end
-  return "{" .. table.concat(parts, ",") .. "}"
-end
-
--- Prefix-cache partition shared across turns: the key hashes the
--- conversation root (model, first message, sorted tool names), which
--- appends keep identical. The router may supply request.cache_key
--- (Go-side hash); otherwise hash the canonical form here. Empty histories
--- use a constant key.
-local CACHE_KEY_NAMESPACE = "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
-local CACHE_KEY_BOOT = "opencode-free-boot"
-
-local function prefix_cache_key(request, model)
-  if type(request.cache_key) == "string" and request.cache_key ~= "" then return request.cache_key end
-  if type(request.messages) ~= "table" or #request.messages == 0 then return CACHE_KEY_BOOT end
-  local names = {}
-  for _, t in ipairs(normalize_tools(request.tools)) do
-    local name = tool_name(t)
-    if name ~= "" then table.insert(names, name) end
-  end
-  table.sort(names)
-  local canonical = stable_encode({ model = model, first = request.messages[1], tools = names })
-  local ok, hashed = pcall(llm_router.uuid_v5, CACHE_KEY_NAMESPACE, canonical)
-  if ok and type(hashed) == "string" and hashed ~= "" then return hashed end
-  return CACHE_KEY_BOOT
-end
-
--- Free tier is anonymous: every request carries Bearer public.
-local function opencode_headers(ses, msg)
-  return {
-    ["User-Agent"] = GOOD_UA,
-    ["Content-Type"] = "application/json",
-    ["Accept"] = "application/json",
-    ["Authorization"] = "Bearer public",
-    ["x-opencode-client"] = "cli",
-    ["x-opencode-project"] = "global",
-    ["x-opencode-session"] = ses,
-    ["x-opencode-request"] = msg,
-  }
-end
-
--- Plain-text view of a chat message. Content arrives either as a string
--- or as an array of content parts (multimodal/tool messages).
-local function message_text(m)
-  local content = m.content
-  if type(content) == "string" then return content end
-  if type(content) ~= "table" then return "" end
-  local parts = {}
-  for _, p in ipairs(content) do
-    if type(p) == "string" then
-      if p ~= "" then table.insert(parts, p) end
-    elseif type(p) == "table" and type(p.text) == "string" and p.text ~= "" then
-      table.insert(parts, p.text)
-    end
-  end
-  return table.concat(parts, "\n")
 end
 
 -- Free-tier identity: -free suffix or the known keyless set. Unknown
@@ -361,6 +545,39 @@ local function is_free_model(id)
   if EXCLUDED_FREE[id] then return false end
   if id:sub(-5) == "-free" then return true end
   return KNOWN_FREE[id] == true
+end
+
+-- Free tier is anonymous: every request carries Bearer public, the
+-- ULID-shaped session pair, and the run-scoped request id.
+local function opencode_headers(endpoint, ses, msg)
+  return {
+    ["User-Agent"] = user_agent(endpoint),
+    ["Content-Type"] = "application/json",
+    ["Accept"] = "application/json",
+    ["Authorization"] = "Bearer public",
+    ["x-opencode-client"] = "cli",
+    ["x-opencode-project"] = "global",
+    ["x-opencode-session"] = ses,
+    ["x-opencode-session-id"] = ses,
+    ["x-opencode-request"] = msg,
+  }
+end
+
+-- Plain-text view of a chat message. Content arrives either as a string
+-- or as an array of content parts (multimodal/tool messages).
+local function message_text(m)
+  local content = m.content
+  if type(content) == "string" then return content end
+  if type(content) ~= "table" then return "" end
+  local parts = {}
+  for _, p in ipairs(content) do
+    if type(p) == "string" then
+      if p ~= "" then table.insert(parts, p) end
+    elseif type(p) == "table" and type(p.text) == "string" and p.text ~= "" then
+      table.insert(parts, p.text)
+    end
+  end
+  return table.concat(parts, "\n")
 end
 
 -- Exit-IP rate-limit memory. The anonymous tier enforces its quota per exit
@@ -547,7 +764,6 @@ end
 -- the whitelist is discarded. Rows cache in plugin storage for a day: a
 -- miss or an expired entry forces a refresh, and any fetch or parse
 -- failure serves an empty list, never stale or hardcoded rows.
-local MODELS_DEV_URL = "https://models.opencode.ai/api.json"
 local MODEL_CACHE_SCOPE = "model_catalog"
 local MODEL_CACHE_TTL = 86400
 -- Router-required constants the catalog does not provide, plus the
@@ -558,6 +774,8 @@ local MODEL_CACHE_RPD = 500
 local MODEL_DEFAULT_CONTEXT_WINDOW = 200000
 local MODEL_DEFAULT_MAX_TOKENS = 32000
 
+-- The catalog fetch is anonymous upstream (UA opencode/latest/<ver>/cli,
+-- no auth or session headers), so it uses a bare client, not opencode_headers.
 local function string_list(value, fallback)
   if type(value) ~= "table" then return fallback end
   local out = {}
@@ -595,12 +813,10 @@ end
 
 local function refresh_model_catalog()
   local client = llm_router.http_client({})
-  local ses = stable_session()
-  local msg = mint_msg(mint_ms())
   local resp, err = client:request({
     method = "GET",
     url = BASE_URL .. "/models",
-    headers = opencode_headers(ses, msg),
+    headers = { ["User-Agent"] = catalog_ua(), ["Accept"] = "application/json" },
   })
   if err or resp.status ~= 200 then return nil end
   local ok, parsed = pcall(json.decode, resp.body)
@@ -611,7 +827,11 @@ local function refresh_model_catalog()
   end
   local enriched = {}
   local catalog_client = llm_router.http_client({ timeout_ms = 60000 })
-  local eres, eerr = catalog_client:request({ method = "GET", url = MODELS_DEV_URL, headers = {} })
+  local eres, eerr = catalog_client:request({
+    method = "GET",
+    url = MODELS_DEV_URL,
+    headers = { ["User-Agent"] = catalog_ua(), ["Accept"] = "application/json" },
+  })
   if not eerr and eres.status == 200 then
     local ok2, catalog = pcall(json.decode, eres.body)
     if ok2 and type(catalog) == "table" and type(catalog.opencode) == "table" then
@@ -657,9 +877,32 @@ local function normalize_call_id(raw)
   return normalized
 end
 
--- Build the OpenAI Responses input from chat messages.
-local function build_responses_input(messages)
+-- Upstream reasoning blobs persist per conversation (10-minute TTL): the
+-- router speaks chat protocol, so encrypted_content never arrives in the
+-- request. The assembler stores each completed turn's blobs; the builder
+-- replays them FIFO against assistant turns carrying reasoning text.
+local BLOB_SCOPE = "reasoning_blobs"
+local BLOB_TTL = 600
+
+local function blob_store_key(request, model) return conv_key(request, model) end
+
+local function blob_push(request, model, blobs)
+  if #blobs == 0 then return end
+  pcall(llm_router.storage.set, BLOB_SCOPE, blob_store_key(request, model), blobs, { ttl = BLOB_TTL })
+end
+
+local function blob_take_all(request, model)
+  local ok, blobs = pcall(llm_router.storage.get, BLOB_SCOPE, blob_store_key(request, model))
+  if ok and type(blobs) == "table" then return blobs end
+  return {}
+end
+
+-- Build the OpenAI Responses input from chat messages. Reasoning items
+-- replay stored encrypted blobs FIFO; without a blob the item carries an
+-- empty summary, the closest shape the chat protocol allows.
+local function build_responses_input(messages, blobs)
   local input = {}
+  local blob_idx = 1
   for _, m in ipairs(messages or {}) do
     local role = m.role
     if role == "system" then
@@ -676,11 +919,20 @@ local function build_responses_input(messages)
       if type(rc) ~= "string" or rc == "" then rc = m.reasoning end
       if type(rc) == "string" and rc ~= "" then
         debug_log("REASONING_PASSTHROUGH", "chars=" .. tostring(#rc))
-        table.insert(input, { type = "reasoning", summary = { { type = "summary_text", text = rc } } })
+        local blob = blobs[blob_idx]
+        blob_idx = blob_idx + 1
+        if type(blob) == "string" and blob ~= "" then
+          table.insert(input, { type = "reasoning", encrypted_content = blob, summary = json.decode("[]") })
+        else
+          table.insert(input, { type = "reasoning", summary = json.decode("[]") })
+        end
       end
       local text = message_text(m)
       if text ~= "" then
-        table.insert(input, { role = "assistant", content = { { type = "output_text", text = text } } })
+        table.insert(
+          input,
+          { role = "assistant", content = { { type = "output_text", text = text } }, phase = "commentary" }
+        )
       end
       for _, tc in ipairs(m.tool_calls or {}) do
         local name = tc["function"] and tc["function"].name or ""
@@ -723,59 +975,14 @@ local function build_responses_tools(tools)
   return out
 end
 
--- Multi-turn means prior assistant or tool messages exist. Those shapes
--- only pass beside the full agent prompt plus genuine tools.
-local function has_history(messages)
-  for _, m in ipairs(messages or {}) do
-    if type(m) == "table" and (m.role == "assistant" or m.role == "tool") then return true end
-  end
-  return false
-end
-
-local function has_client_tools(request) return #normalize_tools(request.tools) > 0 end
-
-local function merge_tools(client_tools)
-  local out = json.decode("[]")
-  local seen = {}
-  for _, t in ipairs(normalize_tools(client_tools)) do
-    local name = tool_name(t)
-    if name ~= "" then seen[name] = true end
-    table.insert(out, t)
-  end
-  for _, t in ipairs(INJECTED_TOOLS) do
-    local name = tool_name(t)
-    if name == "" or not seen[name] then table.insert(out, t) end
-  end
-  return out
-end
-
--- Anonymous chat payload in the genuine client's shape. temperature and
--- max_tokens default to the proven values when the client omits them:
--- the gate stalls requests that lack either field.
+-- Anonymous chat payload in the genuine client's shape: the fetched agent
+-- head leads every turn (no title path), temperature is never sent, tools
+-- merge client definitions over the injected built-ins.
 local function build_anon_chat_payload(request, model)
   local normalized_tools = normalize_tools(request.tools)
-  local agent_path = has_history(request.messages) or #normalized_tools > 0
-  local tool_names = {}
-  for _, t in ipairs(normalized_tools) do
-    table.insert(tool_names, tool_name(t))
-  end
-  debug_log(
-    "TOOLS",
-    "chat input shape="
-      .. table_shape(request.tools)
-      .. " normalized="
-      .. tostring(#normalized_tools)
-      .. " agent_path="
-      .. tostring(agent_path)
-      .. " tools="
-      .. table.concat(tool_names, ",")
-  )
-  local messages = {}
-  if agent_path then
-    table.insert(messages, { role = "system", content = AGENT_SYS })
-  else
-    table.insert(messages, { role = "system", content = FINGERPRINT })
-  end
+  local head, err = agent_prompt(model)
+  if head == nil then return nil, err end
+  local messages = { { role = "system", content = head } }
   for _, m in ipairs(request.messages or {}) do
     table.insert(messages, m)
   end
@@ -785,19 +992,12 @@ local function build_anon_chat_payload(request, model)
     stream = true,
     stream_options = { include_usage = true },
   }
-  if request.temperature and request.temperature > 0 then
-    payload.temperature = request.temperature
-  else
-    payload.temperature = 0.5
-  end
-  if request.max_tokens and request.max_tokens > 0 then
-    payload.max_tokens = output_token_budget(request)
-  else
-    payload.max_tokens = 32000
-  end
+  payload.max_tokens = output_token_budget(request)
   if request.top_p and request.top_p > 0 then payload.top_p = request.top_p end
-  if #normalized_tools > 0 then
-    payload.tools = normalized_tools
+  local merged, merr = merge_tools(request.tools)
+  if merged == nil then return nil, merr end
+  if #merged > 0 then
+    payload.tools = merged
     if request.tool_choice then
       payload.tool_choice = request.tool_choice
     else
@@ -805,50 +1005,19 @@ local function build_anon_chat_payload(request, model)
     end
   end
   if type(request.response_format) == "table" then payload.response_format = request.response_format end
-  debug_log(
-    "CHAT_TOOLS_ENCODE",
-    "present="
-      .. tostring(payload.tools ~= nil)
-      .. " type="
-      .. tostring(type(payload.tools))
-      .. " shape="
-      .. table_shape(payload.tools)
-      .. " encoded="
-      .. (payload.tools and debug_json(payload.tools) or "<absent>")
-  )
-  debug_log("CHAT_PAYLOAD", "json=" .. debug_json(payload))
+  debug_log("CHAT_PAYLOAD", "tools=" .. tostring(#merged) .. " messages=" .. tostring(#messages))
   return payload
 end
 
--- Anonymous Responses payload. Single turns pass with the title fragment
--- as developer content; history shapes need the full agent text plus
--- genuine tools. reasoning minimal is the cheapest effort this family
--- accepts; the genuine shape carries no temperature default.
-local function build_anon_responses_payload(request, model)
+-- Anonymous Responses payload. reasoning travels only as caller effort;
+-- the title-turn default is gone with the title path. prompt_cache_key is
+-- the raw session id; include requests encrypted reasoning blobs.
+local function build_anon_responses_payload(request, model, ses)
   local normalized_tools = normalize_tools(request.tools)
-  local agent_path = has_history(request.messages) or #normalized_tools > 0
-  local tool_names = {}
-  for _, t in ipairs(normalized_tools) do
-    table.insert(tool_names, tool_name(t))
-  end
-  debug_log(
-    "TOOLS",
-    "responses input shape="
-      .. table_shape(request.tools)
-      .. " normalized="
-      .. tostring(#normalized_tools)
-      .. " agent_path="
-      .. tostring(agent_path)
-      .. " tools="
-      .. table.concat(tool_names, ",")
-  )
-  local input = {}
-  if agent_path then
-    table.insert(input, { role = "developer", content = AGENT_SYS })
-  else
-    table.insert(input, { role = "developer", content = FINGERPRINT })
-  end
-  for _, item in ipairs(build_responses_input(request.messages)) do
+  local head, err = agent_prompt(model)
+  if head == nil then return nil, err end
+  local input = { { role = "developer", content = head } }
+  for _, item in ipairs(build_responses_input(request.messages, blob_take_all(request, model))) do
     table.insert(input, item)
   end
   local payload = {
@@ -858,8 +1027,8 @@ local function build_anon_responses_payload(request, model)
   }
   payload.max_output_tokens = output_token_budget(request)
   payload.store = false
-  -- Stable partition across turns: turn N+1 reuses turn N's prefix cache.
-  payload.prompt_cache_key = prefix_cache_key(request, model)
+  -- Stable partition across turns: the raw session id, as the genuine client sends it.
+  payload.prompt_cache_key = ses
   payload.include = { "reasoning.encrypted_content" }
   local effort = request.reasoning_effort
   if
@@ -871,28 +1040,20 @@ local function build_anon_responses_payload(request, model)
     or effort == "max"
   then
     payload.reasoning = { effort = effort, summary = "auto" }
-  else
-    payload.reasoning = { effort = "minimal", summary = "auto" }
   end
-  if request.temperature and request.temperature > 0 then payload.temperature = request.temperature end
   if request.top_p and request.top_p > 0 then payload.top_p = request.top_p end
   local tools_from_builder = build_responses_tools(normalized_tools)
-  if #tools_from_builder > 0 then
-    payload.tools = tools_from_builder
-    if request.tool_choice then payload.tool_choice = request.tool_choice end
+  local merged, merr = merge_tools_resp(tools_from_builder)
+  if merged == nil then return nil, merr end
+  if #merged > 0 then
+    payload.tools = merged
+    if request.tool_choice then
+      payload.tool_choice = request.tool_choice
+    else
+      payload.tool_choice = "auto"
+    end
   end
-  debug_log(
-    "RESPONSES_TOOLS_ENCODE",
-    "present="
-      .. tostring(payload.tools ~= nil)
-      .. " type="
-      .. tostring(payload.tools and type(payload.tools) or "nil")
-      .. " shape="
-      .. table_shape(payload.tools)
-      .. " encoded="
-      .. (payload.tools and debug_json(payload.tools) or "<absent>")
-  )
-  debug_log("RESPONSES_PAYLOAD", "json=" .. debug_json(payload))
+  debug_log("RESPONSES_PAYLOAD", "tools=" .. tostring(#(payload.tools or {})) .. " input=" .. tostring(#input))
   local rf = request.response_format
   if type(rf) == "table" and type(rf.type) == "string" then
     if rf.type == "json_object" then
@@ -907,8 +1068,20 @@ local function build_anon_responses_payload(request, model)
   return payload
 end
 
+-- Collect encrypted reasoning blobs from a completed Responses envelope.
+local function collect_blobs(raw)
+  local blobs = {}
+  if type(raw) ~= "table" or type(raw.output) ~= "table" then return blobs end
+  for _, item in ipairs(raw.output) do
+    if type(item) == "table" and item.type == "reasoning" and type(item.encrypted_content) == "string" then
+      table.insert(blobs, item.encrypted_content)
+    end
+  end
+  return blobs
+end
+
 -- Assemble one chat.completion from a streamed Responses SSE body.
-local function assemble_responses_stream(body, model)
+local function assemble_responses_stream(body, model, request)
   local text_parts = {}
   local reasoning_parts = {}
   local fn_by_index = {}
@@ -916,6 +1089,7 @@ local function assemble_responses_stream(body, model)
   local prompt_tokens, completion_tokens, total_tokens = 0, 0, 0
   local out_model = model
   local terminal_finish = nil
+  local blobs = {}
   local function fn_slot(index)
     local acc = fn_by_index[index]
     if not acc then
@@ -948,9 +1122,12 @@ local function assemble_responses_stream(body, model)
           elseif et == "response.function_call_arguments.delta" and type(ev.delta) == "string" then
             local acc_for_delta = fn_slot(ev.output_index or 0)
             acc_for_delta.args[1] = (acc_for_delta.args[1] or "") .. ev.delta
+          elseif et == "response.function_call_arguments.done" then
+            -- Arguments complete; assembly reads the accumulated buffer.
           elseif (et == "response.completed" or et == "response.incomplete") and type(ev.response) == "table" then
             local r = ev.response
             if type(r.model) == "string" and r.model ~= "" then out_model = r.model end
+            blobs = collect_blobs(r)
             if type(r.usage) == "table" then
               prompt_tokens = r.usage.input_tokens or 0
               completion_tokens = r.usage.output_tokens or 0
@@ -975,6 +1152,7 @@ local function assemble_responses_stream(body, model)
       end
     end
   end
+  blob_push(request, model, blobs)
   table.sort(fn_order)
   local tool_calls = {}
   for _, idx in ipairs(fn_order) do
@@ -1136,6 +1314,9 @@ llm_router.register("opencode-free", {
     local endpoint = endpoint_for_model(model)
     local client = llm_router.http_client({})
     local last_err = nil
+    -- Run-scoped ids: one session per conversation, one request id per run.
+    local ses = stable_session(request, model)
+    local msg = mint_msg(mint_ms())
 
     debug_log(
       "COMPLETE",
@@ -1157,25 +1338,19 @@ llm_router.register("opencode-free", {
 
     local exits, skipped = pick_proxies(ctx, EXIT_ATTEMPTS)
     for _, px in ipairs(exits) do
-      local ses = stable_session()
-      local msg = mint_msg(mint_ms())
-
       if endpoint == "/responses" then
         -- Anonymous Responses path: stream upstream like the genuine
         -- client and assemble the event stream into one completion.
         -- Generations over large contexts run long; the wide timeout only
         -- bounds dead connections, progress streams underneath it.
         local resp_client = llm_router.http_client({ timeout_ms = 300000 })
-        local payload = build_anon_responses_payload(request, model)
-        local headers = opencode_headers(ses, msg)
+        local payload, perr = build_anon_responses_payload(request, model, ses)
+        if payload == nil then return nil, perr end
+        local headers = opencode_headers(endpoint, ses, msg)
         local body = debug_json(payload)
-        print(
-          "[OPENCODE-FREE-DEBUG] responses tools body fragment: "
-            .. tostring(payload.tools and debug_json(payload.tools) or "<absent>")
-        )
         debug_log("HTTP", "POST " .. BASE_URL .. "/responses body_len=" .. tostring(#body))
         local raw_body, action, err = fetch_body(resp_client, BASE_URL .. "/responses", headers, body, model, px)
-        if raw_body then return assemble_responses_stream(raw_body, request.model) end
+        if raw_body then return assemble_responses_stream(raw_body, request.model, request) end
         debug_log("HTTP_ERROR", debug_json(err))
         if action == "done" then return nil, err end
         last_err = err
@@ -1183,13 +1358,10 @@ llm_router.register("opencode-free", {
         -- Anonymous chat path: the free-tier gate only serves stream:true
         -- requests shaped like the genuine client, so always stream upstream
         -- and assemble the SSE body into one completion here.
-        local payload = build_anon_chat_payload(request, model)
-        local headers = opencode_headers(ses, msg)
+        local payload, perr = build_anon_chat_payload(request, model)
+        if payload == nil then return nil, perr end
+        local headers = opencode_headers(endpoint, ses, msg)
         local body = debug_json(payload)
-        print(
-          "[OPENCODE-FREE-DEBUG] chat tools body fragment: "
-            .. tostring(payload.tools and debug_json(payload.tools) or "<absent>")
-        )
         debug_log("HTTP", "POST " .. BASE_URL .. "/chat/completions body_len=" .. tostring(#body))
         local raw_body, action, err = fetch_body(client, BASE_URL .. "/chat/completions", headers, body, model, px)
         if raw_body then return assemble_chat_response(raw_body, request.model) end
@@ -1222,22 +1394,19 @@ llm_router.register("opencode-free", {
     local client = llm_router.http_client({})
     local full_model = request.model
     local last_err = nil
+    local ses = stable_session(request, model)
+    local msg = mint_msg(mint_ms())
 
     local exits, skipped = pick_proxies(ctx, EXIT_ATTEMPTS)
     for _, px in ipairs(exits) do
-      local ses = stable_session()
-      local msg = mint_msg(mint_ms())
       local done = false
       local fatal = false
 
       if endpoint == "/chat/completions" then
-        local payload = build_anon_chat_payload(request, model)
-        local headers = opencode_headers(ses, msg)
+        local payload, perr = build_anon_chat_payload(request, model)
+        if payload == nil then return nil, perr end
+        local headers = opencode_headers(endpoint, ses, msg)
         local body = debug_json(payload)
-        print(
-          "[OPENCODE-FREE-DEBUG] chat-stream tools body fragment: "
-            .. tostring(payload.tools and debug_json(payload.tools) or "<absent>")
-        )
         debug_log("HTTP_STREAM", "POST " .. BASE_URL .. "/chat/completions body_len=" .. tostring(#body))
         local _, stream_err = client:stream({
           method = "POST",
@@ -1283,18 +1452,16 @@ llm_router.register("opencode-free", {
         -- incrementally, like the chat path. Wide timeout: generations over
         -- large contexts run long, progress streams underneath it.
         local stream_client = llm_router.http_client({ timeout_ms = 300000 })
-        local payload = build_anon_responses_payload(request, model)
-        local headers = opencode_headers(ses, msg)
+        local payload, perr = build_anon_responses_payload(request, model, ses)
+        if payload == nil then return nil, perr end
+        local headers = opencode_headers(endpoint, ses, msg)
         local body = debug_json(payload)
-        print(
-          "[OPENCODE-FREE-DEBUG] responses-stream tools body fragment: "
-            .. tostring(payload.tools and debug_json(payload.tools) or "<absent>")
-        )
         debug_log("HTTP_STREAM", "POST " .. BASE_URL .. "/responses body_len=" .. tostring(#body))
         local fn_state = {}
         local usage = nil
         local finish = "stop"
         local saw_tools = false
+        local blobs = {}
         local function fn_acc(index)
           local acc = fn_state[index]
           if not acc then
@@ -1324,6 +1491,16 @@ llm_router.register("opencode-free", {
             local ok, ev = pcall(json.decode, data)
             if not ok or type(ev) ~= "table" or type(ev.type) ~= "string" then return end
             local et = ev.type
+            -- Accepted lifecycle events without payload effects.
+            if
+              et == "response.created"
+              or et == "response.in_progress"
+              or et == "response.content_part.added"
+              or et == "response.content_part.done"
+              or et == "response.function_call_arguments.done"
+            then
+              return
+            end
             if et == "response.output_text.delta" and type(ev.delta) == "string" and ev.delta ~= "" then
               emit({
                 model = full_model,
@@ -1373,6 +1550,7 @@ llm_router.register("opencode-free", {
               acc_for_delta.args = acc_for_delta.args .. ev.delta
             elseif (et == "response.completed" or et == "response.incomplete") and type(ev.response) == "table" then
               local r = ev.response
+              blobs = collect_blobs(r)
               if type(r.usage) == "table" then
                 usage = {
                   prompt_tokens = r.usage.input_tokens or 0,
@@ -1394,6 +1572,7 @@ llm_router.register("opencode-free", {
             end
           end,
         })
+        blob_push(request, model, blobs)
         if stream_err then
           debug_log("HTTP_STREAM_ERROR", debug_json(stream_err))
           last_err = stream_err
