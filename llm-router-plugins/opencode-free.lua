@@ -1,6 +1,6 @@
 --- @plugin OpenCode Free
 --- @author TheSlopMachine
---- @version 6.3.4
+--- @version 6.3.6
 --- @plugin_api 1.0
 --- @description OpenAI/Anthropic/Google compatible free provider OpenCode Free (no key required)
 --- @allow_host opencode.ai
@@ -12,7 +12,10 @@ local BASE_URL = "https://opencode.ai/zen/v1"
 local MODELS_DEV_URL = "https://models.opencode.ai/api.json"
 local NPM_VERSION_URL = "https://registry.npmjs.org/opencode-ai/latest"
 local RAW_BASE = "https://raw.githubusercontent.com/anomalyco/opencode/"
-local RAW_BRANCHES = { "dev", "main" }
+-- Prompt bytes are pinned to the release tag matching the impersonated CLI
+-- version: the dev branch restructured into v2 (packages/cli, new system
+-- prompt) while released 1.18.x clients still send the v1 shapes, so dev
+-- bytes would mismatch the UA. No branch fallback: fail closed instead.
 
 -- Protocol families first: muse-spark/gpt/grok serve /responses even for
 -- their -free variants. Remaining -free models are chat-protocol.
@@ -157,14 +160,12 @@ local PROMPT_TTL = 86400
 local PROMPT_DIR = "packages/opencode/src/session/prompt/"
 
 local function fetch_repo_text(path, cache_key)
-  local ok, cached = pcall(llm_router.storage.get, TEXT_CACHE_SCOPE, cache_key)
+  local versioned_key = opencode_version() .. ":" .. cache_key
+  local ok, cached = pcall(llm_router.storage.get, TEXT_CACHE_SCOPE, versioned_key)
   if ok and type(cached) == "string" and cached ~= "" then return cached end
-  for _, branch in ipairs(RAW_BRANCHES) do
-    local body = fetch_text_cached(RAW_BASE .. branch .. "/" .. path, cache_key .. ":" .. branch, PROMPT_TTL)
-    if type(body) == "string" and body ~= "" then
-      pcall(llm_router.storage.set, TEXT_CACHE_SCOPE, cache_key, body, { ttl = PROMPT_TTL })
-      return body
-    end
+  local body = fetch_text_cached(RAW_BASE .. "v" .. opencode_version() .. "/" .. path, versioned_key, PROMPT_TTL)
+  if type(body) == "string" and body ~= "" then
+    return body
   end
   if ok and type(cached) == "string" then return cached end
   return nil
@@ -601,6 +602,8 @@ local PROXY_COUNTRIES = {}
 -- Exits that answered 403 during this request (the plugin state is fresh per
 -- request), reported as one aggregated error when every attempt is denied.
 local denied = 0
+-- Furthest known limit horizon (unix time) from parsed retry headers.
+local limited_horizon = 0
 
 -- Keys hash the proxy URL so embedded credentials never land in storage.
 -- The empty URL (direct connection) maps to its own fixed key.
@@ -677,8 +680,13 @@ end
 -- Terminal error when the loop ends without an upstream error to report.
 local function exits_exhausted(skipped)
   if skipped > 0 then
+    local message = "free-tier quota exhausted on every available exit (limited exits are skipped until their limit lifts)"
+    if limited_horizon > os.time() then
+      local mins = math.floor((limited_horizon - os.time()) / 60)
+      message = message .. " (up to ~" .. tostring(mins) .. "m)"
+    end
     return {
-      message = "free-tier quota exhausted on every available exit (limited exits are skipped for 6 hours)",
+      message = message,
       code = "insufficient_quota",
       status = 429,
     }
@@ -700,11 +708,62 @@ local function exhausted_error(last_err, skipped)
   return last_err or exits_exhausted(skipped)
 end
 
+-- Upstream retry horizon in seconds, or nil. Prefers retry-after-ms, then
+-- retry-after numeric seconds, then the HTTP-date form. Clamped to
+-- [60, 86400]; absent or unparseable headers fall back to RL_TTL.
+-- Header names arrive lowercased from the HTTP client.
+local RETRY_TTL_MIN = 60
+local RETRY_TTL_MAX = 86400
+local HTTP_MONTHS = {
+  jan = 1, feb = 2, mar = 3, apr = 4, may = 5, jun = 6,
+  jul = 7, aug = 8, sep = 9, oct = 10, nov = 11, dec = 12,
+}
+
+local function retry_ttl_seconds(resp)
+  local headers = {}
+  if type(resp) == "table" and type(resp.headers) == "table" then headers = resp.headers end
+  local function num(key)
+    local raw = headers[key]
+    if type(raw) ~= "string" or raw == "" then return nil end
+    return tonumber(raw:match("^%s*(.-)%s*$"))
+  end
+  local ms = num("retry-after-ms")
+  if ms ~= nil and ms > 0 then
+    return math.max(RETRY_TTL_MIN, math.min(RETRY_TTL_MAX, math.floor(ms / 1000)))
+  end
+  local secs = num("retry-after")
+  if secs == nil then secs = num("retry_after") end
+  if secs ~= nil and secs > 0 then
+    return math.max(RETRY_TTL_MIN, math.min(RETRY_TTL_MAX, math.floor(secs)))
+  end
+  local raw = headers["retry-after"]
+  if type(raw) == "string" and raw ~= "" then
+    local day, mon, year, hh, mm, ss =
+      raw:match("^%a+, (%d+) (%a+) (%d+) (%d+):(%d+):(%d+) GMT$")
+    local month = mon and HTTP_MONTHS[mon:lower()]
+    if day and month and year then
+      local target = os.time({
+        year = tonumber(year),
+        month = month,
+        day = tonumber(day),
+        hour = tonumber(hh),
+        min = tonumber(mm),
+        sec = tonumber(ss),
+      })
+      if target and target > os.time() then
+        return math.max(RETRY_TTL_MIN, math.min(RETRY_TTL_MAX, target - os.time()))
+      end
+    end
+  end
+  return nil
+end
+
 -- Free-tier mapping. The tier is anonymous and every 429 binds to the exit
 -- IP, quota wording included (the quota limiter answers per IP). The exit
--- is marked for six hours and the request moves to the next one; when all
--- exits are limited the last 429 reaches the client. Outcomes: "proxy" tries
--- the next exit, "done" returns the terminal error at once.
+-- is marked for the upstream retry horizon (6-hour fallback) and the
+-- request moves to the next one; when all exits are limited the last 429
+-- reaches the client. Outcomes: "proxy" tries the next exit, "done"
+-- returns the terminal error at once.
 local function map_upstream(resp, model_name, px)
   local body_str = tostring(resp.body or "")
   if resp.status == 401 and body_str:find("only be used from within OpenCode", 1, true) then
@@ -732,7 +791,10 @@ local function map_upstream(resp, model_name, px)
     local quota = lower_body:find("freeusagelimiterror", 1, true) ~= nil
       or lower_body:find("quota", 1, true) ~= nil
       or lower_body:find("free usage", 1, true) ~= nil
-    mark_exit_limited(px, quota and "quota" or "rate_limit")
+    local ttl = retry_ttl_seconds(resp) or RL_TTL
+    debug_log("RL_TTL", "ttl=" .. tostring(ttl) .. " quota=" .. tostring(quota))
+    if ttl > 0 then limited_horizon = math.max(limited_horizon, os.time() + ttl) end
+    mark_exit_limited(px, quota and "quota" or "rate_limit", ttl)
     if quota then
       return "proxy", { message = "free-tier quota exhausted", code = "insufficient_quota", status = 429 }
     end
