@@ -1,6 +1,6 @@
 --- @plugin OpenCode Free
 --- @author TheSlopMachine
---- @version 6.3.8
+--- @version 6.3.9
 --- @plugin_api 1.0
 --- @description OpenAI/Anthropic/Google compatible free provider OpenCode Free (no key required)
 --- @allow_host opencode.ai
@@ -41,6 +41,49 @@ local function debug_log(tag, message)
   local ok = pcall(print, "[opencode-free][" .. tostring(tag) .. "] " .. tostring(message))
   if not ok then
   end
+end
+
+-- Full failure dumps for troubleshooting (debug level only). Bodies cap at
+-- 128KB with a marker; error bodies are small in practice.
+local DUMP_CAP = 131072
+local function dump_capped(s)
+  s = tostring(s or "")
+  if #s > DUMP_CAP then return s:sub(1, DUMP_CAP) .. "\n[TRUNCATED total=" .. tostring(#s) .. "]" end
+  return s
+end
+
+local function redacted_headers(headers)
+  local copy = {}
+  for k, v in pairs(headers or {}) do
+    if tostring(k):lower() == "authorization" then
+      copy[k] = "{redacted}"
+    else
+      copy[k] = v
+    end
+  end
+  return debug_json(copy)
+end
+
+local function dump_request(url, headers, body)
+  debug_log(
+    "REQ_DUMP",
+    "POST " .. tostring(url) .. " headers=" .. redacted_headers(headers) .. " body=" .. dump_capped(body)
+  )
+end
+
+local function dump_response(resp, model_name)
+  local status = 0
+  local body = ""
+  local headers = ""
+  if type(resp) == "table" then
+    status = resp.status or 0
+    body = dump_capped(resp.body)
+    if type(resp.headers) == "table" then headers = debug_json(resp.headers) end
+  end
+  debug_log(
+    "RESP_DUMP",
+    "model=" .. tostring(model_name) .. " status=" .. tostring(status) .. " headers=" .. headers .. " body=" .. body
+  )
 end
 
 local function table_shape(value)
@@ -534,11 +577,13 @@ end
 -- ids stay listed nowhere: remove them here when upstream heals.
 -- 2026-09-30: jev-1.13-free (upstream 502s), deepseek-v4-flash-free and
 -- ling-3.0-flash-fin-free (fatal 400s).
+-- 2026-10-10: exo-free (upstream 410: model removed).
 local KNOWN_FREE = { ["big-pickle"] = true }
 local EXCLUDED_FREE = {
   ["jev-1.13-free"] = true,
   ["deepseek-v4-flash-free"] = true,
   ["ling-3.0-flash-fin-free"] = true,
+  ["exo-free"] = true,
 }
 
 local function is_free_model(id)
@@ -770,6 +815,7 @@ end
 -- returns the terminal error at once.
 local function map_upstream(resp, model_name, px)
   local body_str = tostring(resp.body or "")
+  if resp.status ~= 200 then dump_response(resp, model_name) end
   if resp.status == 401 and body_str:find("only be used from within OpenCode", 1, true) then
     return "done", { message = "free tier rejected the client fingerprint", code = "server_error", status = 401 }
   end
@@ -813,12 +859,6 @@ local function map_upstream(resp, model_name, px)
     return "proxy", { message = "free tier denied the current exit", code = "server_error", status = 403 }
   end
   if resp.status == 400 or resp.status == 404 or resp.status == 422 then
-    -- The upstream body names the offending field; keep it in the log since
-    -- the client-facing error cannot carry it.
-    debug_log(
-      "REJECTED",
-      "model=" .. tostring(model_name) .. " status=" .. tostring(resp.status) .. " body=" .. body_str:sub(1, 500)
-    )
     return "done",
       {
         message = "free tier rejected the request with status " .. tostring(resp.status),
@@ -1366,6 +1406,7 @@ local function fetch_body(client, url, headers, body, model_name, px)
   })
   if err then return nil, "retry", err end
   if resp.status == 200 then return resp.body end
+  dump_request(url, headers, body)
   local action, terr = map_upstream(resp, model_name, px)
   return nil, action, terr
 end
@@ -1490,6 +1531,7 @@ llm_router.register("opencode-free", {
           on_response = function(r)
             debug_log("HTTP_STREAM_RESPONSE", "status=" .. tostring(r.status) .. " body=" .. tostring(r.body or ""))
             if r.status ~= 200 then
+              dump_request(BASE_URL .. "/chat/completions", headers, body)
               local action, terr = map_upstream(r, model, px)
               if action == "done" then fatal = true end
               return terr
@@ -1552,6 +1594,7 @@ llm_router.register("opencode-free", {
           on_response = function(r)
             debug_log("HTTP_STREAM_RESPONSE", "status=" .. tostring(r.status))
             if r.status ~= 200 then
+              dump_request(BASE_URL .. "/responses", headers, body)
               local action, terr = map_upstream(r, model, px)
               if action == "done" then fatal = true end
               return terr
