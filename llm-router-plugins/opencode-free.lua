@@ -1,6 +1,6 @@
 --- @plugin OpenCode Free
 --- @author TheSlopMachine
---- @version 6.3.7
+--- @version 6.3.8
 --- @plugin_api 1.0
 --- @description OpenAI/Anthropic/Google compatible free provider OpenCode Free (no key required)
 --- @allow_host opencode.ai
@@ -813,6 +813,12 @@ local function map_upstream(resp, model_name, px)
     return "proxy", { message = "free tier denied the current exit", code = "server_error", status = 403 }
   end
   if resp.status == 400 or resp.status == 404 or resp.status == 422 then
+    -- The upstream body names the offending field; keep it in the log since
+    -- the client-facing error cannot carry it.
+    debug_log(
+      "REJECTED",
+      "model=" .. tostring(model_name) .. " status=" .. tostring(resp.status) .. " body=" .. body_str:sub(1, 500)
+    )
     return "done",
       {
         message = "free tier rejected the request with status " .. tostring(resp.status),
