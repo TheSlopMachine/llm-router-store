@@ -1,6 +1,6 @@
 --- @plugin OpenCode Free
 --- @author TheSlopMachine
---- @version 6.3.6
+--- @version 6.3.7
 --- @plugin_api 1.0
 --- @description OpenAI/Anthropic/Google compatible free provider OpenCode Free (no key required)
 --- @allow_host opencode.ai
@@ -599,11 +599,11 @@ local MAX_PICK_ROUNDS = 4
 local FORBIDDEN_TTL = 3600
 -- Country filter for pooled exits. Empty accepts any country.
 local PROXY_COUNTRIES = {}
--- Exits that answered 403 during this request (the plugin state is fresh per
--- request), reported as one aggregated error when every attempt is denied.
+-- Exits denied with 403 during this request (the plugin state is fresh per
+-- request), counted for terminal message flavor.
 local denied = 0
--- Furthest known limit horizon (unix time) from parsed retry headers.
-local limited_horizon = 0
+-- Whether any 429 classified as quota (fresh per request, like denied).
+local saw_quota = false
 
 -- Keys hash the proxy URL so embedded credentials never land in storage.
 -- The empty URL (direct connection) maps to its own fixed key.
@@ -674,38 +674,42 @@ local function pick_proxies(ctx, limit)
   if skipped > 0 then
     debug_log("EXITS", "usable=" .. tostring(#usable) .. " skipped_rate_limited=" .. tostring(skipped))
   end
-  return usable, skipped
+  return usable, skipped, #seen
 end
 
--- Terminal error when the loop ends without an upstream error to report.
-local function exits_exhausted(skipped)
-  if skipped > 0 then
-    local message = "free-tier quota exhausted on every available exit (limited exits are skipped until their limit lifts)"
-    if limited_horizon > os.time() then
-      local mins = math.floor((limited_horizon - os.time()) / 60)
-      message = message .. " (up to ~" .. tostring(mins) .. "m)"
-    end
+-- Terminal error when the attempt loop ends without success. Never fatal:
+-- exhaustion always surfaces as a short-retry 429 since the stack cannot
+-- emit Retry-After headers from plugins. 3s when known-untried candidates
+-- remain (the client retry picks them up); 30s when everything known was
+-- tried or is parked.
+local function terminal_error(skipped, attempted, observed)
+  local code = "rate_limit"
+  local what = "free tier rate limited"
+  if saw_quota then
+    code = "insufficient_quota"
+    what = "free-tier quota busy"
+  end
+  local extra = ""
+  if denied > 0 then extra = " (" .. tostring(denied) .. " exits denied with 403)" end
+  if attempted == 0 and skipped > 0 then
     return {
-      message = message,
-      code = "insufficient_quota",
+      message = what .. ", retry in ~30 seconds (all known exits parked)" .. extra,
+      code = code,
       status = 429,
     }
   end
-  return { message = "all free-tier exits exhausted", code = "server_error" }
-end
-
--- Final error of an exhausted attempt loop. When every attempted exit was
--- denied with 403 the client gets one aggregated error, never the answer of
--- a single arbitrary exit.
-local function exhausted_error(last_err, skipped)
-  if denied > 0 and (last_err == nil or last_err.status == 403) then
+  if observed > attempted then
     return {
-      message = "free tier denied every attempted exit with HTTP 403 (" .. tostring(denied) .. " tried)",
-      code = "server_error",
-      status = 502,
+      message = what .. ", retry in ~3 seconds (untried exits remain)" .. extra,
+      code = code,
+      status = 429,
     }
   end
-  return last_err or exits_exhausted(skipped)
+  return {
+    message = what .. ", retry in ~30 seconds" .. extra,
+    code = code,
+    status = 429,
+  }
 end
 
 -- Upstream retry horizon in seconds, or nil. Prefers retry-after-ms, then
@@ -793,7 +797,7 @@ local function map_upstream(resp, model_name, px)
       or lower_body:find("free usage", 1, true) ~= nil
     local ttl = retry_ttl_seconds(resp) or RL_TTL
     debug_log("RL_TTL", "ttl=" .. tostring(ttl) .. " quota=" .. tostring(quota))
-    if ttl > 0 then limited_horizon = math.max(limited_horizon, os.time() + ttl) end
+    if quota then saw_quota = true end
     mark_exit_limited(px, quota and "quota" or "rate_limit", ttl)
     if quota then
       return "proxy", { message = "free-tier quota exhausted", code = "insufficient_quota", status = 429 }
@@ -1375,7 +1379,6 @@ llm_router.register("opencode-free", {
     local model = request.model_name
     local endpoint = endpoint_for_model(model)
     local client = llm_router.http_client({})
-    local last_err = nil
     -- Run-scoped ids: one session per conversation, one request id per run.
     local ses = stable_session(request, model)
     local msg = mint_msg(mint_ms())
@@ -1398,8 +1401,10 @@ llm_router.register("opencode-free", {
         .. debug_json(request.tool_choice)
     )
 
-    local exits, skipped = pick_proxies(ctx, EXIT_ATTEMPTS)
+    local exits, skipped, observed = pick_proxies(ctx, EXIT_ATTEMPTS)
+    local attempted = 0
     for _, px in ipairs(exits) do
+      attempted = attempted + 1
       if endpoint == "/responses" then
         -- Anonymous Responses path: stream upstream like the genuine
         -- client and assemble the event stream into one completion.
@@ -1415,7 +1420,6 @@ llm_router.register("opencode-free", {
         if raw_body then return assemble_responses_stream(raw_body, request.model, request) end
         debug_log("HTTP_ERROR", debug_json(err))
         if action == "done" then return nil, err end
-        last_err = err
       else
         -- Anonymous chat path: the free-tier gate only serves stream:true
         -- requests shaped like the genuine client, so always stream upstream
@@ -1429,10 +1433,9 @@ llm_router.register("opencode-free", {
         if raw_body then return assemble_chat_response(raw_body, request.model) end
         debug_log("HTTP_ERROR", debug_json(err))
         if action == "done" then return nil, err end
-        last_err = err
       end
     end
-    return nil, exhausted_error(last_err, skipped)
+    return nil, terminal_error(skipped, attempted, observed)
   end,
 
   complete_stream = function(ctx, request, emit)
@@ -1459,8 +1462,10 @@ llm_router.register("opencode-free", {
     local ses = stable_session(request, model)
     local msg = mint_msg(mint_ms())
 
-    local exits, skipped = pick_proxies(ctx, EXIT_ATTEMPTS)
+    local exits, skipped, observed = pick_proxies(ctx, EXIT_ATTEMPTS)
+    local attempted = 0
     for _, px in ipairs(exits) do
+      attempted = attempted + 1
       local done = false
       local fatal = false
 
@@ -1673,7 +1678,7 @@ llm_router.register("opencode-free", {
         end
       end
     end
-    return nil, exhausted_error(last_err, skipped)
+    return nil, terminal_error(skipped, attempted, observed)
   end,
 
   -- Verified reasoning support the upstream catalog does not advertise.
