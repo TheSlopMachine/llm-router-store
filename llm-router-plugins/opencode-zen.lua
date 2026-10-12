@@ -1,7 +1,7 @@
 --- @plugin OpenCode Zen
 --- @author TheSlopMachine
---- @version 6.2.0
---- @plugin_api 1.0
+--- @version 6.3.0
+--- @plugin_api 1.3
 --- @description OpenAI/Anthropic/Google compatible paid provider OpenCode Zen (API key required)
 --- @allow_host opencode.ai
 --- @allow_host models.opencode.ai
@@ -592,14 +592,27 @@ llm_router.register("opencode-zen", {
 
   proxy_schema = {},
 
+  locales = {
+    ["en"] = {
+      ["zen.banner"] = "Zen API key required. Paid models only.",
+      ["misc.api_key"] = "API Key",
+      ["misc.save"] = "Save",
+    },
+    ["ru"] = {
+      ["zen.banner"] = "Требуется API-ключ Zen. Только платные модели.",
+      ["misc.api_key"] = "API-ключ",
+      ["misc.save"] = "Сохранить",
+    },
+  },
+
   credential_schema = {
     {
       type = "section",
       title = "OpenCode Zen",
       content = {
-        { type = "banner", variant = "info", text = "Zen API key required. Paid models only." },
-        { type = "secret", name = "api_key", label = "API Key", required = true },
-        { type = "button", text = "Save", form_action = "submit" },
+        { type = "banner", variant = "info", text = "zen.banner" },
+        { type = "secret", name = "api_key", label = "misc.api_key", required = true },
+        { type = "button", text = "misc.save", form_action = "submit" },
       },
     },
   },

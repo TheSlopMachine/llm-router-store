@@ -1,7 +1,7 @@
 --- @plugin Groq
 --- @author TheSlopMachine
---- @version 5.0.0
---- @plugin_api 1.0
+--- @version 5.1.0
+--- @plugin_api 1.3
 --- @description Groq OpenAI-compatible API: fast Llama/Qwen/gpt-oss inference, Whisper speech-to-text
 --- @allow_host api.groq.com
 
@@ -87,15 +87,30 @@ llm_router.register("groq", {
 
   proxy_schema = {},
 
+  locales = {
+    ["en"] = {
+      ["groq.subtitle"] = "Get your API key from the Groq console.",
+      ["groq.open_console"] = "Open Groq Console",
+      ["misc.api_key"] = "API Key",
+      ["misc.save"] = "Save",
+    },
+    ["ru"] = {
+      ["groq.subtitle"] = "Получите API-ключ в консоли Groq.",
+      ["groq.open_console"] = "Открыть консоль Groq",
+      ["misc.api_key"] = "API-ключ",
+      ["misc.save"] = "Сохранить",
+    },
+  },
+
   credential_schema = {
     {
       type = "section",
       title = "Groq",
-      subtitle = "Get your API key from the Groq console.",
+      subtitle = "groq.subtitle",
       content = {
-        { type = "link", text = "Open Groq Console", url = "https://console.groq.com/keys" },
-        { type = "secret", name = "api_key", label = "API Key", required = true },
-        { type = "button", text = "Save", form_action = "submit" },
+        { type = "link", text = "groq.open_console", url = "https://console.groq.com/keys" },
+        { type = "secret", name = "api_key", label = "misc.api_key", required = true },
+        { type = "button", text = "misc.save", form_action = "submit" },
       },
     },
   },

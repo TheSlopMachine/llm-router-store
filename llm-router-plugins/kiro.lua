@@ -1,7 +1,7 @@
 --- @plugin Kiro AI
 --- @author TheSlopMachine
---- @version 5.0.0
---- @plugin_api 1.0
+--- @version 5.1.0
+--- @plugin_api 1.3
 --- @description AWS Kiro models via device login (OAuth2 with proactive refresh)
 --- @allow_host codewhisperer.us-east-1.amazonaws.com
 --- @allow_host oidc.us-east-1.amazonaws.com
@@ -642,18 +642,18 @@ local function method_page(error_text)
     nodes,
     {
       type = "section",
-      title = "Sign in to Kiro",
-      subtitle = "Use the same Kiro account as in the IDE.",
+      title = "kiro.sign_in",
+      subtitle = "kiro.method_subtitle",
       content = {
         {
           type = "select",
           name = "device_method",
-          label = "Method",
+          label = "misc.method",
           options = { "builder-id", "idc" },
           option_labels = { ["builder-id"] = "AWS Builder ID", ["idc"] = "IAM Identity Center" },
           value = "builder-id",
         },
-        { type = "button", text = "Continue", form_action = "pick_method" },
+        { type = "button", text = "misc.continue", form_action = "pick_method" },
       },
     }
   )
@@ -669,19 +669,19 @@ local function region_page(error_text, region, start_url)
     nodes,
     {
       type = "section",
-      title = "Sign in to Kiro",
-      subtitle = "Enter your IAM Identity Center details.",
+      title = "kiro.sign_in",
+      subtitle = "kiro.idc_subtitle",
       content = {
         {
           type = "grid",
           columns = 2,
           content = {
-            { type = "input", name = "region", label = "Region", value = region or DEFAULT_REGION },
-            { type = "input", name = "start_url", label = "Start URL", value = start_url or BUILDER_START_URL },
+            { type = "input", name = "region", label = "misc.region", value = region or DEFAULT_REGION },
+            { type = "input", name = "start_url", label = "misc.start_url", value = start_url or BUILDER_START_URL },
           },
         },
-        { type = "button", text = "Start Device Login", form_action = "start_device" },
-        { type = "button", text = "Back", form_action = "restart" },
+        { type = "button", text = "kiro.start_device", form_action = "start_device" },
+        { type = "button", text = "misc.back", form_action = "restart" },
       },
     }
   )
@@ -692,11 +692,11 @@ local function builder_page()
   local nodes = {
     {
       type = "section",
-      title = "Sign in to Kiro",
-      subtitle = "Uses the Kiro default start URL in us-east-1. No input needed.",
+      title = "kiro.sign_in",
+      subtitle = "kiro.builder_subtitle",
       content = {
-        { type = "button", text = "Start Device Login", form_action = "start_device" },
-        { type = "button", text = "Back", form_action = "restart" },
+        { type = "button", text = "kiro.start_device", form_action = "start_device" },
+        { type = "button", text = "misc.back", form_action = "restart" },
       },
     },
   }
@@ -717,17 +717,17 @@ local function device_page(message_text, state)
     nodes,
     {
       type = "section",
-      title = "Complete device login",
-      subtitle = "Open the verification page, then enter the code below.",
+      title = "kiro.complete_title",
+      subtitle = "kiro.complete_subtitle",
       content = {
-        { type = "code", text = state.user_code or "", label = "Device code" },
+        { type = "code", text = state.user_code or "", label = "kiro.device_code" },
         {
           type = "link",
-          text = "Open verification page",
+          text = "kiro.open_verify",
           url = state.verification_uri_complete or state.verification_uri or "",
         },
-        { type = "button", text = "Check Authorization", form_action = "poll_device" },
-        { type = "button", text = "Start Over", form_action = "restart" },
+        { type = "button", text = "kiro.check_auth", form_action = "poll_device" },
+        { type = "button", text = "kiro.start_over", form_action = "restart" },
       },
     }
   )
@@ -987,19 +987,68 @@ llm_router.register("kiro", {
 
   proxy_schema = {},
 
+  locales = {
+    ["en"] = {
+      ["misc.region"] = "Region",
+      ["misc.start_url"] = "Start URL",
+      ["misc.access_token"] = "Access Token",
+      ["misc.refresh_token"] = "Refresh Token",
+      ["misc.save"] = "Save",
+      ["misc.method"] = "Method",
+      ["misc.continue"] = "Continue",
+      ["misc.back"] = "Back",
+      ["kiro.sign_in"] = "Sign in to Kiro",
+      ["kiro.method_subtitle"] = "Use the same Kiro account as in the IDE.",
+      ["kiro.idc_subtitle"] = "Enter your IAM Identity Center details.",
+      ["kiro.builder_subtitle"] = "Uses the Kiro default start URL in us-east-1. No input needed.",
+      ["kiro.start_device"] = "Start Device Login",
+      ["kiro.complete_title"] = "Complete device login",
+      ["kiro.complete_subtitle"] = "Open the verification page, then enter the code below.",
+      ["kiro.device_code"] = "Device code",
+      ["kiro.open_verify"] = "Open verification page",
+      ["kiro.check_auth"] = "Check Authorization",
+      ["kiro.start_over"] = "Start Over",
+      ["kiro.manual_title"] = "Manual token entry",
+      ["kiro.manual_subtitle"] = "Paste tokens from a previous login, or use device login instead.",
+    },
+    ["ru"] = {
+      ["misc.region"] = "Регион",
+      ["misc.start_url"] = "Стартовый URL",
+      ["misc.access_token"] = "Токен доступа",
+      ["misc.refresh_token"] = "Токен обновления",
+      ["misc.save"] = "Сохранить",
+      ["misc.method"] = "Метод",
+      ["misc.continue"] = "Продолжить",
+      ["misc.back"] = "Назад",
+      ["kiro.sign_in"] = "Вход в Kiro",
+      ["kiro.method_subtitle"] = "Используйте ту же учетную запись Kiro, что и в IDE.",
+      ["kiro.idc_subtitle"] = "Введите данные IAM Identity Center.",
+      ["kiro.builder_subtitle"] = "Используется стартовый URL Kiro по умолчанию в us-east-1. Ввод не требуется.",
+      ["kiro.start_device"] = "Начать вход устройства",
+      ["kiro.complete_title"] = "Завершите вход устройства",
+      ["kiro.complete_subtitle"] = "Откройте страницу подтверждения и введите код ниже.",
+      ["kiro.device_code"] = "Код устройства",
+      ["kiro.open_verify"] = "Открыть страницу подтверждения",
+      ["kiro.check_auth"] = "Проверить авторизацию",
+      ["kiro.start_over"] = "Начать заново",
+      ["kiro.manual_title"] = "Ручной ввод токенов",
+      ["kiro.manual_subtitle"] = "Вставьте токены из прошлого входа или используйте вход устройства.",
+    },
+  },
+
   config_schema = {
-    { type = "select", name = "region", label = "Region", options = { "us-east-1" } },
+    { type = "select", name = "region", label = "misc.region", options = { "us-east-1" } },
   },
 
   credential_schema = {
     {
       type = "section",
-      title = "Manual token entry",
-      subtitle = "Paste tokens from a previous login, or use device login instead.",
+      title = "kiro.manual_title",
+      subtitle = "kiro.manual_subtitle",
       content = {
-        { type = "secret", name = "access_token", label = "Access Token" },
-        { type = "secret", name = "refresh_token", label = "Refresh Token" },
-        { type = "button", text = "Save", form_action = "submit" },
+        { type = "secret", name = "access_token", label = "misc.access_token" },
+        { type = "secret", name = "refresh_token", label = "misc.refresh_token" },
+        { type = "button", text = "misc.save", form_action = "submit" },
       },
     },
   },
