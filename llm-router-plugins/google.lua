@@ -1,7 +1,7 @@
 --- @plugin Google AI Studio
 --- @author TheSlopMachine
---- @version 5.1.3
---- @plugin_api 1.4
+--- @version 5.2.0
+--- @plugin_api 1.5
 --- @description Google Gemini models via AI Studio API
 --- @allow_host generativelanguage.googleapis.com
 
@@ -1162,6 +1162,81 @@ llm_router.register("google", {
     end
     if resp.status == 401 then return { status = "unhealthy", message = "api key rejected" } end
     return { status = "unknown", message = "status " .. tostring(resp.status) }
+  end,
+
+  -- Model liveness: per-model metadata GET proves existence with zero
+  -- generation spend and discriminates the serving method per class.
+  -- Direct, no proxy: metadata reads carry no geo requirement and pool
+  -- health must not decide model health. Retries across credentials with
+  -- unanimity for death: healthy wins at once, quota outranks unknown,
+  -- unhealthy needs every tried key to report model-missing. Probes never
+  -- park, disable, or write cooldowns.
+  check_model = function(ctx, model_ref)
+    local endpoint = model_ref.endpoint or "chat"
+    local want_method = "generateContent"
+    if endpoint == "embeddings" then
+      want_method = "embedContent"
+    elseif endpoint ~= "chat" and endpoint ~= "vision" and endpoint ~= "speech" and endpoint ~= "image" then
+      return { status = "unknown", message = "endpoint not supported: " .. tostring(endpoint) }
+    end
+    local model_name = request_model_name(model_ref.model_name or "")
+    if model_name == "" then return { status = "unknown", message = "model name is required" } end
+    local creds, total = usable_credentials(model_name)
+    if #creds == 0 and total > 0 then
+      return { status = "quota_exceeded", message = "quota exhausted" }
+    end
+    if #creds == 0 then return { status = "unknown", message = "no credentials available" } end
+    local client = llm_router.http_client({ timeout_ms = 15000 })
+    local missing = 0
+    local tried = 0
+    local seen_quota = false
+    local seen_unknown = nil
+    for _, cred in ipairs(creds) do
+      local key = api_key_of(cred.data)
+      if key == "" then
+        seen_unknown = seen_unknown or "api_key is required"
+      else
+        tried = tried + 1
+        llm_router.log("debug", "probing model", { cred_id = cred.id, model = model_ref.model, endpoint = endpoint })
+        local resp, err = client:request({
+          method = "GET",
+          url = BASE_URL .. "/models/" .. model_name,
+          headers = { ["x-goog-api-key"] = key },
+        })
+        if err then
+          local message = "request failed"
+          if type(err) == "table" and type(err.message) == "string" then message = err.message end
+          seen_unknown = seen_unknown or message
+        elseif resp.status == 200 then
+          local body_str = tostring(resp.body or "")
+          if string.find(body_str, want_method, 1, true) then
+            return { status = "healthy", response = "ok" }
+          end
+          seen_unknown = seen_unknown or "model method not listed"
+        elseif resp.status == 404 then
+          local lower = string.lower(tostring(resp.body or ""))
+          if string.find(lower, "models/" .. string.lower(model_name), 1, true) then
+            missing = missing + 1
+            seen_unknown = seen_unknown or "model not found upstream"
+          else
+            seen_unknown = seen_unknown or "model not found upstream"
+          end
+        elseif resp.status == 429 then
+          seen_quota = true
+        elseif resp.status == 400 or resp.status == 401 or resp.status == 403 then
+          seen_unknown = seen_unknown or "api key rejected"
+        else
+          seen_unknown = seen_unknown or ("status " .. tostring(resp.status))
+        end
+      end
+    end
+    if tried > 0 and missing == tried then
+      return { status = "unhealthy", message = "model not found upstream" }
+    end
+    if seen_quota then
+      return { status = "quota_exceeded", message = "quota exhausted" }
+    end
+    return { status = "unknown", message = seen_unknown or "health check inconclusive" }
   end,
 
   complete = function(ctx, request)

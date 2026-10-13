@@ -1,7 +1,7 @@
 --- @plugin OpenCode Zen
 --- @author TheSlopMachine
---- @version 6.3.2
---- @plugin_api 1.4
+--- @version 6.4.0
+--- @plugin_api 1.5
 --- @description OpenAI/Anthropic/Google compatible paid provider OpenCode Zen (API key required)
 --- @allow_host opencode.ai
 --- @allow_host models.opencode.ai
@@ -662,6 +662,82 @@ llm_router.register("opencode-zen", {
     if resp.status == 200 then return { status = "healthy" } end
     if resp.status == 401 then return { status = "unhealthy", message = "api key rejected" } end
     return { status = "unknown", message = "status " .. tostring(resp.status) }
+  end,
+
+  -- Model liveness: unauthenticated-discriminator POST proves existence
+  -- with zero generation spend (rejection happens pre-generation). Direct,
+  -- no proxy: pool exits must not decide model health. Retries across
+  -- credentials with unanimity for death: healthy wins at once, quota
+  -- outranks unknown, unhealthy needs every tried key to report
+  -- model-missing. Probes never park or disable.
+  check_model = function(ctx, model_ref)
+    local endpoint = model_ref.endpoint or "chat"
+    if endpoint ~= "chat" and endpoint ~= "vision" then
+      return { status = "unknown", message = "endpoint not supported: " .. tostring(endpoint) }
+    end
+    local model_name = model_ref.model_name or ""
+    if model_name == "" then return { status = "unknown", message = "model name is required" } end
+    local creds = llm_router.credentials.list()
+    if #creds == 0 then return { status = "unknown", message = "no credentials available" } end
+    local client = llm_router.http_client({ timeout_ms = 15000 })
+    local missing = 0
+    local tried = 0
+    local seen_quota = false
+    local seen_unknown = nil
+    for _, cred in ipairs(creds) do
+      local key = api_key_of(cred.data)
+      if key == "" then
+        seen_unknown = seen_unknown or "api_key is required"
+      else
+        tried = tried + 1
+        llm_router.log("debug", "probing model", { cred_id = cred.id, model = model_ref.model, endpoint = endpoint })
+        local ses, msg = mint_ids()
+        local resp, err = client:request({
+          method = "POST",
+          url = BASE_URL .. "/chat/completions",
+          headers = opencode_headers(key, ses, msg),
+          body = json.encode({ model = model_name, messages = { { role = "user", content = "hi" } }, max_tokens = 1 }),
+        })
+        if err then
+          local message = "request failed"
+          if type(err) == "table" and type(err.message) == "string" then message = err.message end
+          seen_unknown = seen_unknown or message
+        elseif resp.status == 200 then
+          return { status = "healthy", response = "ok" }
+        elseif resp.status == 400 and string.find(tostring(resp.body or ""), "Model is unavailable", 1, true) then
+          missing = missing + 1
+          seen_unknown = seen_unknown or "model not found upstream"
+        elseif resp.status == 401 then
+          seen_unknown = seen_unknown or "api key rejected"
+        elseif resp.status == 429 then
+          local body_str = tostring(resp.body or "")
+          local etype = ""
+          do
+            local ok, parsed = pcall(json.decode, body_str)
+            if ok and parsed and type(parsed.error) == "table" and type(parsed.error.type) == "string" then
+              etype = parsed.error.type
+            end
+          end
+          local lower_message = string.lower(body_str)
+          if string.lower(etype) == "freeusagelimiterror"
+            or string.find(lower_message, "quota", 1, true) ~= nil
+            or string.find(lower_message, "free usage", 1, true) ~= nil then
+            seen_quota = true
+          else
+            seen_unknown = seen_unknown or "rate limited"
+          end
+        else
+          seen_unknown = seen_unknown or ("status " .. tostring(resp.status))
+        end
+      end
+    end
+    if tried > 0 and missing == tried then
+      return { status = "unhealthy", message = "model not found upstream" }
+    end
+    if seen_quota then
+      return { status = "quota_exceeded", message = "quota exhausted" }
+    end
+    return { status = "unknown", message = seen_unknown or "health check inconclusive" }
   end,
 
   complete = function(ctx, request)

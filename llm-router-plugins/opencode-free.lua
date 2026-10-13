@@ -1,7 +1,7 @@
 --- @plugin OpenCode Free
 --- @author TheSlopMachine
---- @version 6.4.2
---- @plugin_api 1.4
+--- @version 6.5.0
+--- @plugin_api 1.5
 --- @description OpenAI/Anthropic/Google compatible free provider OpenCode Free (no key required)
 --- @allow_host opencode.ai
 --- @allow_host models.opencode.ai
@@ -1401,6 +1401,63 @@ llm_router.register("opencode-free", {
     local cached = llm_router.storage.get(MODEL_CACHE_SCOPE, "infos")
     if type(cached) == "table" and #cached > 0 then return cached end
     return refresh_model_catalog()
+  end,
+
+  -- Model liveness: the tier is anonymous, so a single direct
+  -- discriminator POST proves existence with zero generation spend
+  -- (rejection happens pre-generation). Free names answer 403
+  -- FreeTierError (gated to genuine clients, not missing); paid names
+  -- answer 401 (not on tier); unknown names answer 400 Model-unavailable.
+  -- Probes never write storage marks.
+  check_model = function(ctx, model_ref)
+    local endpoint = model_ref.endpoint or "chat"
+    if endpoint ~= "chat" and endpoint ~= "vision" then
+      return { status = "unknown", message = "endpoint not supported: " .. tostring(endpoint) }
+    end
+    local model_name = model_ref.model_name or ""
+    if model_name == "" then return { status = "unknown", message = "model name is required" } end
+    local client = llm_router.http_client({ timeout_ms = 15000 })
+    local ms = mint_ms()
+    local ses = mint_session(ms)
+    local msg = mint_msg(ms)
+    llm_router.log("debug", "probing model", { model = model_ref.model, endpoint = endpoint })
+    local resp, err = client:request({
+      method = "POST",
+      url = BASE_URL .. "/chat/completions",
+      headers = opencode_headers("/chat/completions", ses, msg),
+      body = json.encode({ model = model_name, messages = { { role = "user", content = "hi" } }, max_tokens = 1 }),
+    })
+    if err then
+      local message = "request failed"
+      if type(err) == "table" and type(err.message) == "string" then message = err.message end
+      return { status = "unknown", message = message }
+    end
+    local body_str = tostring(resp.body or "")
+    if resp.status == 200 then
+      return { status = "healthy", response = "ok" }
+    end
+    if resp.status == 400 and string.find(body_str, "Model is unavailable", 1, true) then
+      return { status = "unhealthy", message = "model not found upstream" }
+    end
+    if resp.status == 401 and not is_free_model(model_name) then
+      return { status = "unhealthy", message = "model is not available on the free tier" }
+    end
+    if resp.status == 403 and string.find(body_str, "only be used from within OpenCode", 1, true) then
+      return { status = "healthy", response = "ok" }
+    end
+    if resp.status == 429 then
+      local lower_body = string.lower(body_str)
+      if string.find(lower_body, "freeusagelimiterror", 1, true) ~= nil
+        or string.find(lower_body, "quota", 1, true) ~= nil
+        or string.find(lower_body, "free usage", 1, true) ~= nil then
+        return { status = "quota_exceeded", message = "quota exhausted" }
+      end
+      return { status = "unknown", message = "rate limited" }
+    end
+    if resp.status == 401 or resp.status == 403 or resp.status == 426 then
+      return { status = "unknown", message = "status " .. tostring(resp.status) }
+    end
+    return { status = "unknown", message = "status " .. tostring(resp.status) }
   end,
 
   complete = function(ctx, request)

@@ -1,7 +1,7 @@
 --- @plugin Kiro AI
 --- @author TheSlopMachine
---- @version 5.1.2
---- @plugin_api 1.4
+--- @version 5.2.0
+--- @plugin_api 1.5
 --- @description AWS Kiro models via device login (OAuth2 with proactive refresh)
 --- @allow_host codewhisperer.us-east-1.amazonaws.com
 --- @allow_host oidc.us-east-1.amazonaws.com
@@ -1158,6 +1158,110 @@ llm_router.register("kiro", {
     if resp.status == 200 then return { status = "healthy" } end
     if resp.status == 401 then return { status = "unhealthy", message = "access token rejected" } end
     return { status = "unknown", message = "status " .. tostring(resp.status) }
+  end,
+
+  -- Model liveness: catalog membership proves servability with zero
+  -- generation spend (generation burns credits). Per credential: fetch the
+  -- ListAvailableModels catalog over the discovery endpoints (plus the
+  -- profile-ARN retry for desktop accounts), then exact-match the model id
+  -- including thinking variants. Retries across credentials with unanimity
+  -- for death: healthy wins at once, quota outranks unknown, unhealthy
+  -- needs every tried key to miss the model with usable quota. Probes never
+  -- park, disable, or refresh tokens.
+  check_model = function(ctx, model_ref)
+    local endpoint = model_ref.endpoint or "chat"
+    if endpoint ~= "chat" and endpoint ~= "vision" then
+      return { status = "unknown", message = "endpoint not supported: " .. tostring(endpoint) }
+    end
+    local model_name = model_ref.model_name or ""
+    if model_name == "" then return { status = "unknown", message = "model name is required" } end
+    local creds = llm_router.credentials.list()
+    if #creds == 0 then return { status = "unknown", message = "no credentials available" } end
+    local client = llm_router.http_client({ timeout_ms = 15000 })
+    local missing = 0
+    local tried = 0
+    local seen_quota = false
+    local seen_unknown = nil
+    for _, cred in ipairs(creds) do
+      local data = cred.data or {}
+      local token = token_of(data)
+      if token == "" then
+        seen_unknown = seen_unknown or "access_token is required"
+      else
+        tried = tried + 1
+        llm_router.log("debug", "probing model", { cred_id = cred.id, model = model_ref.model, endpoint = endpoint })
+        local region = runtime_region(cred, ctx.provider_config)
+        local arn = data.profile_arn
+        if type(arn) ~= "string" or arn == "" then arn = data.profileArn end
+        local targets = {}
+        for _, url in ipairs(discovery_endpoints(region)) do
+          table.insert(targets, { url = url, arn = nil })
+        end
+        if type(arn) == "string" and arn ~= "" then
+          table.insert(targets, { url = discovery_endpoints(region)[1], arn = arn })
+        end
+        local decided = false
+        for _, target in ipairs(targets) do
+          local fetch_url = target.url .. "?origin=AI_EDITOR"
+          if type(target.arn) == "string" and target.arn ~= "" then
+            fetch_url = fetch_url .. "&profileArn=" .. target.arn
+          end
+          local resp, err = client:request({
+            method = "GET",
+            url = fetch_url,
+            headers = {
+              ["Authorization"] = "Bearer " .. token,
+              ["Accept"] = "application/json",
+              ["User-Agent"] = "AWS-SDK-JS/3.0.0 kiro-ide/1.0.0",
+            },
+          })
+          if err then
+            -- Transport failure: try the next discovery target (region
+            -- fallback), same as model discovery.
+          elseif resp.status == 200 then
+            local models = parse_model_list(resp.body)
+            if models == nil then
+              seen_unknown = seen_unknown or "model discovery failed"
+              decided = true
+              break
+            end
+            local found = false
+            for _, m in ipairs(with_thinking_variants(models)) do
+              if m.name == model_name then
+                found = true
+                break
+              end
+            end
+            if found then
+              return { status = "healthy", response = "ok" }
+            end
+            missing = missing + 1
+            seen_unknown = seen_unknown or "model not found upstream"
+            decided = true
+            break
+          elseif resp.status == 402 or resp.status == 429 then
+            seen_quota = true
+            decided = true
+            break
+          elseif resp.status == 401 or resp.status == 403 then
+            -- Auth or region/ARN mismatch: the next discovery target may
+            -- serve this account, so keep trying before voting unknown.
+            seen_unknown = seen_unknown or "access token rejected"
+          end
+          -- Any other status: try the next discovery target.
+        end
+        if not decided then
+          seen_unknown = seen_unknown or "model discovery failed"
+        end
+      end
+    end
+    if tried > 0 and missing == tried then
+      return { status = "unhealthy", message = "model not found upstream" }
+    end
+    if seen_quota then
+      return { status = "quota_exceeded", message = "quota exhausted" }
+    end
+    return { status = "unknown", message = seen_unknown or "health check inconclusive" }
   end,
 
   auth_initiate = function(ctx) return start_page("", DEFAULT_REGION, BUILDER_START_URL, "builder-id") end,
