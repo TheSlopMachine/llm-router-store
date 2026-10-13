@@ -1,7 +1,7 @@
 --- @plugin Groq
 --- @author TheSlopMachine
---- @version 5.1.0
---- @plugin_api 1.3
+--- @version 5.1.2
+--- @plugin_api 1.4
 --- @description Groq OpenAI-compatible API: fast Llama/Qwen/gpt-oss inference, Whisper speech-to-text
 --- @allow_host api.groq.com
 
@@ -247,6 +247,7 @@ llm_router.register("groq", {
     local client = llm_router.http_client({})
     local last_err = nil
     for _, cred in ipairs(llm_router.credentials.list()) do
+      llm_router.log("debug", "trying credential", { cred_id = cred.id, model = request.model })
       local key = api_key_of(cred.data)
       for _, px in ipairs(pick_proxies(ctx, 3)) do
         local resp, err = client:request({
@@ -261,25 +262,31 @@ llm_router.register("groq", {
           out.model = request.model
           return out
         elseif err ~= nil then
+          llm_router.log("debug", "transport error", { reason = tostring(err.message or "transport error"), code = err.code, cred_id = cred.id })
           last_err = err
         elseif resp.status == 401 then
           -- Groq answers 401 for bad keys: bench the credential.
           bench(ctx, cred.id, "groq rejected the api key", 300)
+          llm_router.log("warn", "api key rejected", { status = 401, code = "authentication_error", cred_id = cred.id })
           break
         elseif resp.status == 403 then
           -- 403 ("Forbidden", "Access denied. Please check your network
           -- settings.") is the Cloudflare egress-IP block: the exit is
           -- at fault, not the credential. Try the next proxy.
+          llm_router.log("debug", "egress blocked", { status = 403, code = "server_error", cred_id = cred.id })
           last_err = { message = "groq egress block on current exit", code = "server_error", status = 502 }
         elseif resp.status == 429 then
           local lower = string.lower(tostring(resp.body or ""))
           if string.find(lower, "per day", 1, true) then
             llm_router.credentials.park(cred.id, retry_after_secs(resp), "groq daily quota exhausted")
+            llm_router.log("warn", "quota exhausted", { status = 429, code = "insufficient_quota", cred_id = cred.id })
             break
           end
           llm_router.credentials.park(cred.id, retry_after_secs(resp), "groq rate limited")
+          llm_router.log("warn", "rate limited", { status = 429, code = "rate_limit", cred_id = cred.id })
           break
         elseif resp.status == 400 or resp.status == 404 or resp.status == 422 then
+          llm_router.log("error", "request rejected", { status = resp.status, code = "invalid_request_error", cred_id = cred.id })
           return nil,
             {
               message = "groq rejected the request with status " .. tostring(resp.status),
@@ -287,6 +294,7 @@ llm_router.register("groq", {
               status = resp.status,
             }
         else
+          llm_router.log("debug", "unexpected status", { status = resp.status, code = "server_error", cred_id = cred.id })
           last_err = {
             message = "groq returned status " .. tostring(resp.status),
             code = "server_error",
@@ -295,7 +303,9 @@ llm_router.register("groq", {
         end
       end
     end
-    return nil, last_err or { message = "all groq credentials exhausted", code = "server_error" }
+    local exhausted = last_err or { message = "all groq credentials exhausted", code = "server_error" }
+    llm_router.log("error", "all credentials exhausted", { reason = tostring(exhausted.message or "request failed"), code = exhausted.code })
+    return nil, exhausted
   end,
 
   complete_stream = function(ctx, request, emit)
@@ -303,6 +313,7 @@ llm_router.register("groq", {
     local full_model = request.model
     local last_err = nil
     for _, cred in ipairs(llm_router.credentials.list()) do
+      llm_router.log("debug", "trying credential", { cred_id = cred.id, model = request.model })
       local key = api_key_of(cred.data)
       for _, px in ipairs(pick_proxies(ctx, 3)) do
         local done = false
@@ -317,17 +328,21 @@ llm_router.register("groq", {
             if r.status == 401 then
               bench(ctx, cred.id, "groq rejected the api key", 300)
               next_cred = true
+              llm_router.log("warn", "api key rejected", { status = 401, code = "authentication_error", cred_id = cred.id })
               return { message = "groq rejected the api key", code = "authentication_error", status = 401 }
             end
             if r.status == 403 then
+              llm_router.log("debug", "egress blocked", { status = 403, code = "server_error", cred_id = cred.id })
               return { message = "groq egress block on current exit", code = "server_error", status = 502 }
             end
             if r.status == 429 then
               llm_router.credentials.park(cred.id, retry_after_secs(r), "groq rate limited")
               next_cred = true
+              llm_router.log("warn", "rate limited", { status = 429, code = "rate_limit", cred_id = cred.id })
               return { message = "groq rate limited", code = "rate_limit", status = 429 }
             end
             if r.status ~= 200 then
+              llm_router.log("error", "unexpected status", { status = r.status, code = "server_error", cred_id = cred.id })
               return {
                 message = "groq returned status " .. tostring(r.status),
                 code = "server_error",
@@ -361,7 +376,9 @@ llm_router.register("groq", {
         if done then return nil, last_err end
       end
     end
-    return nil, last_err or { message = "all groq credentials exhausted", code = "server_error" }
+    local exhausted = last_err or { message = "all groq credentials exhausted", code = "server_error" }
+    llm_router.log("error", "all credentials exhausted", { reason = tostring(exhausted.message or "request failed"), code = exhausted.code })
+    return nil, exhausted
   end,
 
   -- Speech-to-text: always fetch verbose_json upstream; the router renders
@@ -394,6 +411,7 @@ llm_router.register("groq", {
     local body, ctype = llm_router.multipart(parts)
     local last_err = nil
     for _, cred in ipairs(llm_router.credentials.list()) do
+      llm_router.log("debug", "trying credential", { cred_id = cred.id, model = request.model })
       local key = api_key_of(cred.data)
       for _, px in ipairs(pick_proxies(ctx, 3)) do
         local resp, err = client:request({
@@ -406,14 +424,18 @@ llm_router.register("groq", {
         if err == nil and resp.status == 200 then
           return json.decode(resp.body)
         elseif err ~= nil then
+          llm_router.log("debug", "transport error", { reason = tostring(err.message or "transport error"), code = err.code, cred_id = cred.id })
           last_err = err
         elseif resp.status == 401 then
           bench(ctx, cred.id, "groq rejected the api key", 300)
+          llm_router.log("warn", "api key rejected", { status = 401, code = "authentication_error", cred_id = cred.id })
           break
         elseif resp.status == 429 then
           llm_router.credentials.park(cred.id, retry_after_secs(resp), "groq rate limited")
+          llm_router.log("warn", "rate limited", { status = 429, code = "rate_limit", cred_id = cred.id })
           break
         elseif resp.status == 400 or resp.status == 404 or resp.status == 422 then
+          llm_router.log("error", "request rejected", { status = resp.status, code = "invalid_request_error", cred_id = cred.id })
           return nil,
             {
               message = "groq rejected the request with status " .. tostring(resp.status),
@@ -421,6 +443,7 @@ llm_router.register("groq", {
               status = resp.status,
             }
         else
+          llm_router.log("debug", "unexpected status", { status = resp.status, code = "server_error", cred_id = cred.id })
           last_err = {
             message = "groq returned status " .. tostring(resp.status),
             code = "server_error",
@@ -429,6 +452,8 @@ llm_router.register("groq", {
         end
       end
     end
-    return nil, last_err or { message = "all groq credentials exhausted", code = "server_error" }
+    local exhausted = last_err or { message = "all groq credentials exhausted", code = "server_error" }
+    llm_router.log("error", "all credentials exhausted", { reason = tostring(exhausted.message or "request failed"), code = exhausted.code })
+    return nil, exhausted
   end,
 })

@@ -1,7 +1,7 @@
 --- @plugin OpenCode Free
 --- @author TheSlopMachine
---- @version 6.4.0
---- @plugin_api 1.1
+--- @version 6.4.2
+--- @plugin_api 1.4
 --- @description OpenAI/Anthropic/Google compatible free provider OpenCode Free (no key required)
 --- @allow_host opencode.ai
 --- @allow_host models.opencode.ai
@@ -47,14 +47,8 @@ local function wire_body(payload)
   return body:gsub('"summary":{}', '"summary":[]')
 end
 
-local function debug_log(tag, message)
-  local ok = pcall(print, "[opencode-free][" .. tostring(tag) .. "] " .. tostring(message))
-  if not ok then
-  end
-end
-
--- Full failure dumps for troubleshooting (debug level only). Bodies cap at
--- 128KB with a marker; error bodies are small in practice.
+-- Request/response dumps route straight to the structured router log.
+-- Bodies cap at 128KB with a marker before the 2048-char key truncation.
 local DUMP_CAP = 131072
 local function dump_capped(s)
   s = tostring(s or "")
@@ -75,9 +69,10 @@ local function redacted_headers(headers)
 end
 
 local function dump_request(url, headers, body)
-  debug_log(
-    "REQ_DUMP",
-    "POST " .. tostring(url) .. " headers=" .. redacted_headers(headers) .. " body=" .. dump_capped(body)
+  llm_router.log(
+    "debug",
+    "request dump",
+    { method = "POST", url = tostring(url), headers = redacted_headers(headers), body = dump_capped(body), event = "request_dump" }
   )
 end
 
@@ -90,28 +85,11 @@ local function dump_response(resp, model_name)
     body = dump_capped(resp.body)
     if type(resp.headers) == "table" then headers = debug_json(resp.headers) end
   end
-  debug_log(
-    "RESP_DUMP",
-    "model=" .. tostring(model_name) .. " status=" .. tostring(status) .. " headers=" .. headers .. " body=" .. body
+  llm_router.log(
+    "debug",
+    "response dump",
+    { model = tostring(model_name), status = status, headers = headers, body = body, event = "response_dump" }
   )
-end
-
-local function table_shape(value)
-  if type(value) ~= "table" then return type(value) end
-  local numeric = 0
-  local other = 0
-  local max_index = 0
-  for k, _ in pairs(value) do
-    if type(k) == "number" and k >= 1 and k % 1 == 0 then
-      numeric = numeric + 1
-      if k > max_index then max_index = k end
-    else
-      other = other + 1
-    end
-  end
-  if other == 0 and numeric == 0 then return "table(empty)" end
-  if other == 0 and max_index == numeric then return "array(" .. tostring(numeric) .. ")" end
-  return "map(numeric=" .. tostring(numeric) .. ",other=" .. tostring(other) .. ")"
 end
 
 local function tool_name(t)
@@ -727,7 +705,7 @@ local function pick_proxies(ctx, limit)
     if #usable >= limit then break end
   end
   if skipped > 0 then
-    debug_log("EXITS", "usable=" .. tostring(#usable) .. " skipped_rate_limited=" .. tostring(skipped))
+    llm_router.log("debug", "selecting exits", { usable = #usable, skipped = skipped, event = "exits" })
   end
   return usable, skipped, #seen
 end
@@ -847,7 +825,7 @@ local function map_upstream(resp, model_name, px)
       or lower_body:find("quota", 1, true) ~= nil
       or lower_body:find("free usage", 1, true) ~= nil
     local ttl = retry_ttl_seconds(resp) or RL_TTL
-    debug_log("RL_TTL", "ttl=" .. tostring(ttl) .. " quota=" .. tostring(quota))
+    llm_router.log("debug", "exit rate limited", { ttl = ttl, quota = quota, event = "rate_limit" })
     if quota then saw_quota = true end
     mark_exit_limited(px, quota and "quota" or "rate_limit", ttl)
     if quota then
@@ -859,7 +837,7 @@ local function map_upstream(resp, model_name, px)
     -- Blocked egress address: the exit is at fault, not the request. Mark it
     -- for an hour and move to the next one.
     denied = denied + 1
-    debug_log("FORBIDDEN", "exit=" .. exit_key(px) .. " body=" .. body_str:sub(1, 200))
+    llm_router.log("warn", "exit forbidden", { exit = exit_key(px), body = body_str:sub(1, 1000), event = "forbidden" })
     mark_exit_limited(px, "forbidden", FORBIDDEN_TTL)
     return "proxy", { message = "free tier denied the current exit", code = "server_error", status = 403 }
   end
@@ -984,13 +962,11 @@ local function normalize_call_id(raw)
   local ok, hashed = pcall(llm_router.uuid_v5, CALL_ID_NAMESPACE, raw)
   if ok and type(hashed) == "string" and hashed ~= "" then
     local normalized = "call_" .. hashed
-    print(
-      "[OPENCODE-FREE-DEBUG] normalized oversized call_id length=" .. tostring(#raw) .. " -> " .. tostring(#normalized)
-    )
+    llm_router.log("debug", "normalized call id", { from_len = #raw, to_len = #normalized })
     return normalized
   end
   local normalized = raw:sub(1, 64)
-  print("[OPENCODE-FREE-DEBUG] truncated oversized call_id length=" .. tostring(#raw) .. " -> 64")
+  llm_router.log("debug", "truncated call id", { from_len = #raw, to_len = 64 })
   return normalized
 end
 
@@ -1056,7 +1032,7 @@ local function build_responses_input(messages, pairs)
         if type(pair) == "table" and type(pair.blob) == "string" and pair.blob ~= "" then
           local item = { type = "reasoning", summary = json.decode("[]"), encrypted_content = pair.blob }
           if type(pair.id) == "string" and pair.id ~= "" then item.id = pair.id end
-          debug_log("REASONING_REPLAY", "id=" .. tostring(item.id))
+          llm_router.log("debug", "replaying reasoning", { reasoning_id = item.id, event = "reasoning_replay" })
           table.insert(input, item)
         end
       end
@@ -1135,7 +1111,7 @@ local function build_anon_chat_payload(request, model)
     end
   end
   if type(request.response_format) == "table" then payload.response_format = request.response_format end
-  debug_log("CHAT_PAYLOAD", "tools=" .. tostring(#merged) .. " messages=" .. tostring(#messages))
+  llm_router.log("debug", "built chat payload", { tools = #merged, messages = #messages, event = "payload" })
   return payload
 end
 
@@ -1183,7 +1159,7 @@ local function build_anon_responses_payload(request, model, ses)
       payload.tool_choice = "auto"
     end
   end
-  debug_log("RESPONSES_PAYLOAD", "tools=" .. tostring(#(payload.tools or {})) .. " input=" .. tostring(#input))
+  llm_router.log("debug", "built responses payload", { tools = #(payload.tools or {}), input = #input, event = "payload" })
   local rf = request.response_format
   if type(rf) == "table" and type(rf.type) == "string" then
     if rf.type == "json_object" then
@@ -1251,9 +1227,10 @@ local function assemble_responses_stream(body, model, request)
               total_tokens = r.usage.total_tokens or (prompt_tokens + completion_tokens)
               local details = r.usage.input_tokens_details
               if type(details) == "table" and tonumber(details.cached_tokens) then
-                debug_log(
-                  "CACHE",
-                  "cached_tokens=" .. tostring(details.cached_tokens) .. " input_tokens=" .. tostring(prompt_tokens)
+                llm_router.log(
+                  "debug",
+                  "cache hit",
+                  { cached_tokens = details.cached_tokens, input_tokens = prompt_tokens, event = "cache" }
                 )
               end
             end
@@ -1434,22 +1411,18 @@ llm_router.register("opencode-free", {
     local ses = stable_session(request, model)
     local msg = mint_msg(mint_ms())
 
-    debug_log(
-      "COMPLETE",
-      "model="
-        .. tostring(model)
-        .. " full_model="
-        .. tostring(request.model)
-        .. " endpoint="
-        .. tostring(endpoint)
-        .. " request_tools="
-        .. table_shape(request.tools)
-        .. " tools_count="
-        .. tostring(#normalize_tools(request.tools))
-        .. " messages="
-        .. tostring(type(request.messages) == "table" and #request.messages or -1)
-        .. " tool_choice="
-        .. debug_json(request.tool_choice)
+    llm_router.log(
+      "debug",
+      "starting request",
+      {
+        model = tostring(request.model),
+        model_name = tostring(model),
+        endpoint = tostring(endpoint),
+        tools = #normalize_tools(request.tools),
+        messages = type(request.messages) == "table" and #request.messages or -1,
+        tool_choice = debug_json(request.tool_choice),
+        event = "request_start",
+      }
     )
 
     local exits, skipped, observed = pick_proxies(ctx, EXIT_ATTEMPTS)
@@ -1466,10 +1439,10 @@ llm_router.register("opencode-free", {
         if payload == nil then return nil, perr end
         local headers = opencode_headers(endpoint, ses, msg)
         local body = wire_body(payload)
-        debug_log("HTTP", "POST " .. BASE_URL .. "/responses body_len=" .. tostring(#body))
+        llm_router.log("debug", "sending request", { method = "POST", url = BASE_URL .. "/responses", body_len = #body, event = "http" })
         local raw_body, action, err = fetch_body(resp_client, BASE_URL .. "/responses", headers, body, model, px)
         if raw_body then return assemble_responses_stream(raw_body, model, request) end
-        debug_log("HTTP_ERROR", debug_json(err))
+        llm_router.log("warn", "request failed", { code = err.code, status = err.status, reason = err.message, event = "http_error" })
         if action == "done" then return nil, err end
       else
         -- Anonymous chat path: the free-tier gate only serves stream:true
@@ -1479,10 +1452,10 @@ llm_router.register("opencode-free", {
         if payload == nil then return nil, perr end
         local headers = opencode_headers(endpoint, ses, msg)
         local body = wire_body(payload)
-        debug_log("HTTP", "POST " .. BASE_URL .. "/chat/completions body_len=" .. tostring(#body))
+        llm_router.log("debug", "sending request", { method = "POST", url = BASE_URL .. "/chat/completions", body_len = #body, event = "http" })
         local raw_body, action, err = fetch_body(client, BASE_URL .. "/chat/completions", headers, body, model, px)
         if raw_body then return assemble_chat_response(raw_body, request.model) end
-        debug_log("HTTP_ERROR", debug_json(err))
+        llm_router.log("warn", "request failed", { code = err.code, status = err.status, reason = err.message, event = "http_error" })
         if action == "done" then return nil, err end
       end
     end
@@ -1492,20 +1465,17 @@ llm_router.register("opencode-free", {
   complete_stream = function(ctx, request, emit)
     local model = request.model_name
     local endpoint = endpoint_for_model(model)
-    debug_log(
-      "STREAM",
-      "model="
-        .. tostring(model)
-        .. " full_model="
-        .. tostring(request.model)
-        .. " endpoint="
-        .. tostring(endpoint)
-        .. " request_tools="
-        .. table_shape(request.tools)
-        .. " tools_count="
-        .. tostring(#normalize_tools(request.tools))
-        .. " messages="
-        .. tostring(type(request.messages) == "table" and #request.messages or -1)
+    llm_router.log(
+      "debug",
+      "starting stream",
+      {
+        model = tostring(request.model),
+        model_name = tostring(model),
+        endpoint = tostring(endpoint),
+        tools = #normalize_tools(request.tools),
+        messages = type(request.messages) == "table" and #request.messages or -1,
+        event = "request_start",
+      }
     )
     local client = llm_router.http_client({})
     local full_model = request.model
@@ -1525,7 +1495,7 @@ llm_router.register("opencode-free", {
         if payload == nil then return nil, perr end
         local headers = opencode_headers(endpoint, ses, msg)
         local body = wire_body(payload)
-        debug_log("HTTP_STREAM", "POST " .. BASE_URL .. "/chat/completions body_len=" .. tostring(#body))
+        llm_router.log("debug", "sending stream", { method = "POST", url = BASE_URL .. "/chat/completions", body_len = #body, event = "stream" })
         local _, stream_err = client:stream({
           method = "POST",
           url = BASE_URL .. "/chat/completions",
@@ -1533,7 +1503,7 @@ llm_router.register("opencode-free", {
           body = body,
           proxy_url = px.url,
           on_response = function(r)
-            debug_log("HTTP_STREAM_RESPONSE", "status=" .. tostring(r.status) .. " body=" .. tostring(r.body or ""))
+            llm_router.log("debug", "stream responded", { status = r.status, body = tostring(r.body or ""), event = "stream_response" })
             if r.status ~= 200 then
               dump_request(BASE_URL .. "/chat/completions", headers, body)
               local action, terr = map_upstream(r, model, px)
@@ -1542,7 +1512,7 @@ llm_router.register("opencode-free", {
             end
           end,
           on_line = function(line)
-            debug_log("SSE", "line=" .. tostring(line))
+            llm_router.log("debug", "server-sent event", { line = tostring(line), event = "sse" })
             if line:sub(1, 6) ~= "data: " then return end
             local data = line:sub(7)
             if data == "[DONE]" or data == "" then return end
@@ -1556,12 +1526,12 @@ llm_router.register("opencode-free", {
           end,
         })
         if stream_err then
-          debug_log("HTTP_STREAM_ERROR", debug_json(stream_err))
+          llm_router.log("warn", "stream failed", { code = stream_err.code, status = stream_err.status, reason = stream_err.message, event = "stream_error" })
           last_err = stream_err
           if fatal then return nil, last_err end
           if done then return nil, last_err end
         else
-          debug_log("HTTP_STREAM_DONE", "chat stream completed")
+          llm_router.log("debug", "stream completed", { endpoint = endpoint, event = "stream_done" })
           return
         end
       end
@@ -1575,7 +1545,7 @@ llm_router.register("opencode-free", {
         if payload == nil then return nil, perr end
         local headers = opencode_headers(endpoint, ses, msg)
         local body = wire_body(payload)
-        debug_log("HTTP_STREAM", "POST " .. BASE_URL .. "/responses body_len=" .. tostring(#body))
+        llm_router.log("debug", "sending stream", { method = "POST", url = BASE_URL .. "/responses", body_len = #body, event = "stream" })
         local fn_state = {}
         local usage = nil
         local finish = "stop"
@@ -1595,7 +1565,7 @@ llm_router.register("opencode-free", {
           body = body,
           proxy_url = px.url,
           on_response = function(r)
-            debug_log("HTTP_STREAM_RESPONSE", "status=" .. tostring(r.status))
+            llm_router.log("debug", "stream responded", { status = r.status, event = "stream_response" })
             if r.status ~= 200 then
               dump_request(BASE_URL .. "/responses", headers, body)
               local action, terr = map_upstream(r, model, px)
@@ -1678,12 +1648,10 @@ llm_router.register("opencode-free", {
                 }
                 local details = r.usage.input_tokens_details
                 if type(details) == "table" and tonumber(details.cached_tokens) then
-                  debug_log(
-                    "CACHE",
-                    "cached_tokens="
-                      .. tostring(details.cached_tokens)
-                      .. " input_tokens="
-                      .. tostring(usage.prompt_tokens)
+                  llm_router.log(
+                    "debug",
+                    "cache hit",
+                    { cached_tokens = details.cached_tokens, input_tokens = usage.prompt_tokens, event = "cache" }
                   )
                 end
               end
@@ -1692,7 +1660,7 @@ llm_router.register("opencode-free", {
           end,
         })
         if stream_err then
-          debug_log("HTTP_STREAM_ERROR", debug_json(stream_err))
+          llm_router.log("warn", "stream failed", { code = stream_err.code, status = stream_err.status, reason = stream_err.message, event = "stream_error" })
           last_err = stream_err
           if fatal then return nil, last_err end
           if done then return nil, last_err end
@@ -1724,7 +1692,7 @@ llm_router.register("opencode-free", {
           local chunk = { model = full_model, choices = { terminal } }
           if usage then chunk.usage = usage end
           emit(chunk)
-          debug_log("HTTP_STREAM_DONE", "responses stream completed")
+          llm_router.log("debug", "stream completed", { endpoint = endpoint, event = "stream_done" })
           return
         end
       end

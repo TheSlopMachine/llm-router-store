@@ -1,7 +1,7 @@
 --- @plugin OpenCode Zen
 --- @author TheSlopMachine
---- @version 6.3.0
---- @plugin_api 1.3
+--- @version 6.3.2
+--- @plugin_api 1.4
 --- @description OpenAI/Anthropic/Google compatible paid provider OpenCode Zen (API key required)
 --- @allow_host opencode.ai
 --- @allow_host models.opencode.ai
@@ -159,13 +159,16 @@ end
 -- credential, "done" returns the terminal error to the client at once.
 local function map_upstream(ctx, resp, cred_id)
   if resp.status == 426 then
+    llm_router.log("error", "client upgrade required", { status = 426, code = "authentication_error", cred_id = cred_id })
     return "done", { message = "zen client upgrade required", code = "authentication_error", status = 426 }
   end
   if resp.status == 401 then
     bench(ctx, cred_id, "zen rejected the api key", 300)
+    llm_router.log("warn", "api key rejected", { status = 401, code = "authentication_error", cred_id = cred_id })
     return "cred", { message = "zen rejected the api key", code = "authentication_error", status = 401 }
   end
   if resp.status ~= 429 then
+    llm_router.log("error", "unexpected status", { status = resp.status, code = "server_error", cred_id = cred_id })
     return "done",
       { message = "zen returned status " .. tostring(resp.status), code = "server_error", status = resp.status }
   end
@@ -183,8 +186,10 @@ local function map_upstream(ctx, resp, cred_id)
     or string.find(lower_message, "free usage", 1, true) ~= nil
   if quota then
     llm_router.credentials.park(cred_id, retry_after_secs(resp), "zen quota exhausted")
+    llm_router.log("warn", "quota exhausted", { status = 429, code = "insufficient_quota", cred_id = cred_id })
     return "cred", { message = "zen quota exhausted", code = "insufficient_quota", status = 429 }
   end
+  llm_router.log("debug", "rate limited", { status = 429, code = "rate_limit", cred_id = cred_id })
   return "proxy", { message = "zen rate limited on current exit", code = "rate_limit", status = 429 }
 end
 
@@ -665,6 +670,7 @@ llm_router.register("opencode-zen", {
     local client = llm_router.http_client({})
     local last_err = nil
     for _, cred in ipairs(llm_router.credentials.list()) do
+      llm_router.log("debug", "trying credential", { cred_id = cred.id, model = request.model })
       local api_key = api_key_of(cred.data)
       if api_key == "" then
         last_err = { message = "api_key is required", code = "invalid_request_error", status = 400 }
@@ -684,7 +690,9 @@ llm_router.register("opencode-zen", {
         end
       end
     end
-    return nil, last_err or { message = "all zen credentials exhausted", code = "server_error" }
+    local exhausted = last_err or { message = "all zen credentials exhausted", code = "server_error" }
+    llm_router.log("error", "all credentials exhausted", { reason = tostring(exhausted.message or "request failed"), code = exhausted.code })
+    return nil, exhausted
   end,
 
   complete_stream = function(ctx, request, emit)
@@ -694,6 +702,7 @@ llm_router.register("opencode-zen", {
     local full_model = request.model
     local last_err = nil
     for _, cred in ipairs(llm_router.credentials.list()) do
+      llm_router.log("debug", "trying credential", { cred_id = cred.id, model = request.model })
       local api_key = api_key_of(cred.data)
       if api_key == "" then
         last_err = { message = "api_key is required", code = "invalid_request_error", status = 400 }
@@ -717,6 +726,8 @@ llm_router.register("opencode-zen", {
         end
       end
     end
-    return nil, last_err or { message = "all zen credentials exhausted", code = "server_error" }
+    local exhausted = last_err or { message = "all zen credentials exhausted", code = "server_error" }
+    llm_router.log("error", "all credentials exhausted", { reason = tostring(exhausted.message or "request failed"), code = exhausted.code })
+    return nil, exhausted
   end,
 })

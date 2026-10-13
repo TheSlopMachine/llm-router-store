@@ -1,7 +1,7 @@
 --- @plugin TheSpeedX Proxy List
 --- @author TheSlopMachine
---- @version 3.0.0
---- @plugin_api 1.0
+--- @version 3.0.2
+--- @plugin_api 1.4
 --- @description Free proxy list from TheSpeedX (http.txt, socks4.txt, socks5.txt)
 --- @allow_host cdn.jsdelivr.net
 
@@ -25,6 +25,7 @@ llm_router.register_proxy_source("thespeedx", {
 
       local resp, err = client:request({ method = "GET", url = feed.url, headers = headers })
       if err then
+        llm_router.log("warn", "feed request failed", { feed = feed.protocol, reason = tostring(err.message or err) })
         if first_err == nil then first_err = err end
       elseif resp.status == 304 then
         local response_headers = resp.headers or {}
@@ -35,6 +36,7 @@ llm_router.register_proxy_source("thespeedx", {
           llm_router.storage.set(feed.scope, "last_modified", response_headers["last-modified"])
         end
       elseif resp.status ~= 200 then
+        llm_router.log("warn", "feed rejected", { feed = feed.protocol, status = resp.status })
         if first_err == nil then
           first_err = { message = "thespeedx list: status " .. resp.status, code = "server_error", status = resp.status }
         end
@@ -52,6 +54,7 @@ llm_router.register_proxy_source("thespeedx", {
         end
         local body = resp.body
         if type(body) ~= "string" or body == "" then
+          llm_router.log("warn", "empty body", { feed = feed.protocol })
           if first_err == nil then
             first_err = { message = "thespeedx list: empty body", code = "server_error", status = 502 }
           end
@@ -74,6 +77,7 @@ llm_router.register_proxy_source("thespeedx", {
       if first_err ~= nil then return nil, first_err end
       return nil
     end
+    llm_router.log("debug", "list served", { count = #out })
     return out
   end,
 })

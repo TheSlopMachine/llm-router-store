@@ -1,7 +1,7 @@
 --- @plugin Google AI Studio
 --- @author TheSlopMachine
---- @version 5.1.0
---- @plugin_api 1.3
+--- @version 5.1.2
+--- @plugin_api 1.4
 --- @description Google Gemini models via AI Studio API
 --- @allow_host generativelanguage.googleapis.com
 
@@ -85,6 +85,7 @@ local function map_upstream(ctx, resp, cred_id)
   local status = resp.status
   if status == 400 and string.find(lower, "location is not supported", 1, true) then
     -- Geo-blocked: the proxy exit is at fault, not the request.
+    llm_router.log("debug", "location blocked", { status = status, code = "server_error", cred_id = cred_id })
     return "proxy", { message = "gemini location block on current exit", code = "server_error", status = 502 }
   end
   if
@@ -97,10 +98,12 @@ local function map_upstream(ctx, resp, cred_id)
     )
   then
     bench(ctx, cred_id, "gemini rejected the api key", 300)
+    llm_router.log("warn", "api key rejected", { status = status, code = "authentication_error", cred_id = cred_id })
     return "cred", { message = "gemini rejected the api key", code = "authentication_error", status = 401 }
   end
   if status == 401 then
     bench(ctx, cred_id, "gemini rejected the api key", 300)
+    llm_router.log("warn", "api key rejected", { status = status, code = "authentication_error", cred_id = cred_id })
     return "cred", { message = "gemini rejected the api key", code = "authentication_error", status = 401 }
   end
   if status == 429 then
@@ -108,10 +111,15 @@ local function map_upstream(ctx, resp, cred_id)
     -- serve on. The park is per credential; the model dimension stays in
     -- the request the caller already scopes.
     llm_router.credentials.park(cred_id, retry_after_secs(resp), "gemini rate limited")
+    llm_router.log("warn", "rate limited", { status = status, code = "rate_limit", cred_id = cred_id })
     return "cred", { message = "gemini rate limited", code = "rate_limit", status = 429 }
   end
-  if status == 404 then return "done", { message = "gemini model not found", code = "not_found", status = 404 } end
+  if status == 404 then
+    llm_router.log("error", "model not found", { status = status, code = "not_found", cred_id = cred_id })
+    return "done", { message = "gemini model not found", code = "not_found", status = 404 }
+  end
   if status == 400 or status == 422 then
+    llm_router.log("error", "request rejected", { status = status, code = "invalid_request_error", cred_id = cred_id })
     return "done",
       {
         message = "gemini rejected the request with status " .. tostring(status),
@@ -119,6 +127,7 @@ local function map_upstream(ctx, resp, cred_id)
         status = status,
       }
   end
+  llm_router.log("debug", "unexpected status", { status = status, code = "server_error", cred_id = cred_id })
   return "proxy", { message = "gemini returned status " .. tostring(status), code = "server_error", status = status }
 end
 
@@ -1120,6 +1129,7 @@ llm_router.register("google", {
     if perr then return nil, perr end
     local last_err = nil
     for _, cred in ipairs(llm_router.credentials.list()) do
+      llm_router.log("debug", "trying credential", { cred_id = cred.id, model = request.model })
       local key = api_key_of(cred.data)
       local exits, exits_err = pick_proxies(ctx, 3)
       if not exits then return nil, exits_err end
@@ -1134,6 +1144,7 @@ llm_router.register("google", {
         if err == nil and resp.status == 200 then
           return assemble_completion(resp.body, request.model)
         elseif err ~= nil then
+          llm_router.log("debug", "transport error", { reason = tostring(err.message or "transport error"), code = err.code, cred_id = cred.id })
           last_err = err
         else
           local action, terr = map_upstream(ctx, resp, cred.id)
@@ -1143,7 +1154,9 @@ llm_router.register("google", {
         end
       end
     end
-    return nil, last_err or { message = "all google credentials exhausted", code = "server_error" }
+    local exhausted = last_err or { message = "all google credentials exhausted", code = "server_error" }
+    llm_router.log("error", "all credentials exhausted", { reason = tostring(exhausted.message or "request failed"), code = exhausted.code })
+    return nil, exhausted
   end,
 
   complete_stream = function(ctx, request, emit)
@@ -1154,6 +1167,7 @@ llm_router.register("google", {
     local chunk_id = "google-" .. tostring(os.time())
     local last_err = nil
     for _, cred in ipairs(llm_router.credentials.list()) do
+      llm_router.log("debug", "trying credential", { cred_id = cred.id, model = request.model })
       local key = api_key_of(cred.data)
       local exits, exits_err = pick_proxies(ctx, 3)
       if not exits then return nil, exits_err end
@@ -1250,7 +1264,9 @@ llm_router.register("google", {
         if done then return nil, last_err end
       end
     end
-    return nil, last_err or { message = "all google credentials exhausted", code = "server_error" }
+    local exhausted = last_err or { message = "all google credentials exhausted", code = "server_error" }
+    llm_router.log("error", "all credentials exhausted", { reason = tostring(exhausted.message or "request failed"), code = exhausted.code })
+    return nil, exhausted
   end,
 
   speech = function(ctx, request)
@@ -1274,6 +1290,7 @@ llm_router.register("google", {
     local client = llm_router.http_client({})
     local last_err = nil
     for _, cred in ipairs(llm_router.credentials.list()) do
+      llm_router.log("debug", "trying credential", { cred_id = cred.id, model = request.model })
       local key = api_key_of(cred.data)
       local exits, exits_err = pick_proxies(ctx, 3)
       if not exits then return nil, exits_err end
@@ -1300,6 +1317,7 @@ llm_router.register("google", {
           local wav = wrap_wav(pcm, rate, 1)
           return { audio_b64 = llm_router.base64_encode(wav), format = "wav" }
         elseif err ~= nil then
+          llm_router.log("debug", "transport error", { reason = tostring(err.message or "transport error"), code = err.code, cred_id = cred.id })
           last_err = err
         else
           local action, terr = map_upstream(ctx, resp, cred.id)
@@ -1309,7 +1327,9 @@ llm_router.register("google", {
         end
       end
     end
-    return nil, last_err or { message = "all google credentials exhausted", code = "server_error" }
+    local exhausted = last_err or { message = "all google credentials exhausted", code = "server_error" }
+    llm_router.log("error", "all credentials exhausted", { reason = tostring(exhausted.message or "request failed"), code = exhausted.code })
+    return nil, exhausted
   end,
 
   generate_image = function(ctx, request)
@@ -1328,6 +1348,7 @@ llm_router.register("google", {
     local client = llm_router.http_client({})
     local last_err = nil
     for _, cred in ipairs(llm_router.credentials.list()) do
+      llm_router.log("debug", "trying credential", { cred_id = cred.id, model = request.model })
       local key = api_key_of(cred.data)
       local exits, exits_err = pick_proxies(ctx, 3)
       if not exits then return nil, exits_err end
@@ -1373,7 +1394,9 @@ llm_router.register("google", {
         if not failed then return { created = os.time(), data = data } end
       end
     end
-    return nil, last_err or { message = "all google credentials exhausted", code = "server_error" }
+    local exhausted = last_err or { message = "all google credentials exhausted", code = "server_error" }
+    llm_router.log("error", "all credentials exhausted", { reason = tostring(exhausted.message or "request failed"), code = exhausted.code })
+    return nil, exhausted
   end,
 
   embed = function(ctx, request)
@@ -1397,6 +1420,7 @@ llm_router.register("google", {
     local client = llm_router.http_client({})
     local last_err = nil
     for _, cred in ipairs(llm_router.credentials.list()) do
+      llm_router.log("debug", "trying credential", { cred_id = cred.id, model = request.model })
       local key = api_key_of(cred.data)
       local exits, exits_err = pick_proxies(ctx, 3)
       if not exits then return nil, exits_err end
@@ -1424,6 +1448,7 @@ llm_router.register("google", {
           end
           return { data = data }
         elseif err ~= nil then
+          llm_router.log("debug", "transport error", { reason = tostring(err.message or "transport error"), code = err.code, cred_id = cred.id })
           last_err = err
         else
           local action, terr = map_upstream(ctx, resp, cred.id)
@@ -1433,6 +1458,8 @@ llm_router.register("google", {
         end
       end
     end
-    return nil, last_err or { message = "all google credentials exhausted", code = "server_error" }
+    local exhausted = last_err or { message = "all google credentials exhausted", code = "server_error" }
+    llm_router.log("error", "all credentials exhausted", { reason = tostring(exhausted.message or "request failed"), code = exhausted.code })
+    return nil, exhausted
   end,
 })

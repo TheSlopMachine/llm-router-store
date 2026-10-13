@@ -1,7 +1,7 @@
 --- @plugin Proxifly Proxy List
 --- @author TheSlopMachine
---- @version 6.0.0
---- @plugin_api 1.0
+--- @version 6.0.2
+--- @plugin_api 1.4
 --- @description Free proxy list from proxifly (proxies/all/data.json; http/https/socks4/socks5)
 --- @allow_host cdn.jsdelivr.net
 
@@ -19,7 +19,10 @@ llm_router.register_proxy_source("proxifly", {
     if type(last_modified) == "string" then headers["If-Modified-Since"] = last_modified end
 
     local resp, err = client:request({ method = "GET", url = LIST_URL, headers = headers })
-    if err then return nil, err end
+    if err then
+      llm_router.log("warn", "list request failed", { reason = tostring(err.message or err) })
+      return nil, err
+    end
     if resp.status == 304 then
       local response_headers = resp.headers or {}
       if type(response_headers.etag) == "string" then
@@ -31,10 +34,12 @@ llm_router.register_proxy_source("proxifly", {
       return nil
     end
     if resp.status ~= 200 then
+      llm_router.log("warn", "list rejected", { status = resp.status })
       return nil, { message = "proxifly list: status " .. resp.status, code = "server_error", status = resp.status }
     end
     local ok, entries = pcall(json.decode, resp.body)
     if not ok or type(entries) ~= "table" then
+      llm_router.log("warn", "invalid json", {})
       return nil, { message = "proxifly list: invalid json", code = "server_error", status = 502 }
     end
     local response_headers = resp.headers or {}
@@ -60,6 +65,7 @@ llm_router.register_proxy_source("proxifly", {
         end
       end
     end
+    llm_router.log("debug", "list served", { count = #out })
     return out
   end,
 })

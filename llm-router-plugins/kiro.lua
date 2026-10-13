@@ -1,7 +1,7 @@
 --- @plugin Kiro AI
 --- @author TheSlopMachine
---- @version 5.1.0
---- @plugin_api 1.3
+--- @version 5.1.2
+--- @plugin_api 1.4
 --- @description AWS Kiro models via device login (OAuth2 with proactive refresh)
 --- @allow_host codewhisperer.us-east-1.amazonaws.com
 --- @allow_host oidc.us-east-1.amazonaws.com
@@ -847,10 +847,12 @@ end
 local function map_upstream(ctx, resp, cred_id)
   if resp.status == 401 then
     bench(ctx, cred_id, "kiro rejected the access token", 300)
+    llm_router.log("warn", "access token rejected", { status = 401, code = "authentication_error", cred_id = cred_id })
     return "cred", { message = "kiro rejected the access token", code = "authentication_error", status = 401 }
   end
   if resp.status == 402 then
     park_quota(cred_id, resp)
+    llm_router.log("warn", "quota exhausted", { status = 402, code = "insufficient_quota", cred_id = cred_id })
     return "cred", { message = "kiro quota exhausted", code = "insufficient_quota", status = 402 }
   end
   if resp.status == 429 then
@@ -863,16 +865,18 @@ local function map_upstream(ctx, resp, cred_id)
       or string.find(lower, "monthly", 1, true)
     then
       park_quota(cred_id, resp)
+      llm_router.log("warn", "quota exhausted", { status = 429, code = "insufficient_quota", cred_id = cred_id })
       return "cred", { message = "kiro quota exhausted", code = "insufficient_quota", status = 429 }
     end
     local secs = retry_after_secs(resp)
     llm_router.credentials.park(cred_id, secs, "kiro rate limited")
     note_state("rate_limit", secs)
+    llm_router.log("warn", "rate limited", { status = 429, code = "rate_limit", cred_id = cred_id, wait = secs })
     return "cred", { message = "kiro rate limited", code = "rate_limit", status = 429 }
   end
   if resp.status == 400 or resp.status == 404 then
     local raw = tostring(resp.body or "")
-    print("[kiro] upstream " .. tostring(resp.status) .. " body: " .. raw:sub(1, 1000))
+    llm_router.log("debug", "upstream body", { status = resp.status, body = raw:sub(1, 1000) })
     local detail = upstream_detail(raw)
     -- Kiro answers an oversized conversation with a 400 naming
     -- CONTENT_LENGTH_EXCEEDS_THRESHOLD ("input is too long"). The OpenAI
@@ -884,8 +888,12 @@ local function map_upstream(ctx, resp, cred_id)
     end
     local message = "kiro rejected the request with status " .. tostring(resp.status)
     if detail ~= "" then message = message .. ": " .. detail end
+    local log_keys = { status = resp.status, code = code, cred_id = cred_id }
+    if detail ~= "" then log_keys.detail = detail end
+    llm_router.log("error", "request rejected", log_keys)
     return "done", { message = message, code = code, status = resp.status }
   end
+  llm_router.log("debug", "unexpected status", { status = resp.status, code = "server_error", cred_id = cred_id })
   return "proxy",
     { message = "kiro returned status " .. tostring(resp.status), code = "server_error", status = resp.status }
 end
@@ -1290,6 +1298,7 @@ llm_router.register("kiro", {
     local client = llm_router.http_client({ timeout_ms = STREAM_TIMEOUT_MS })
     local last_err = nil
     for _, cred in ipairs(llm_router.credentials.list()) do
+      llm_router.log("debug", "trying credential", { cred_id = cred.id, model = request.model_name })
       for _, px in ipairs(pick_proxies(ctx, 3)) do
         local resp, err = client:request({
           method = "POST",
@@ -1310,7 +1319,9 @@ llm_router.register("kiro", {
         end
       end
     end
-    return nil, final_error(last_err)
+    local exhausted = final_error(last_err)
+    llm_router.log("error", "all credentials exhausted", { reason = tostring(exhausted.message or "request failed"), code = exhausted.code })
+    return nil, exhausted
   end,
 
   complete_stream = function(ctx, request, emit)
@@ -1320,6 +1331,7 @@ llm_router.register("kiro", {
     if alias_err then return nil, alias_err end
     local last_err = nil
     for _, cred in ipairs(llm_router.credentials.list()) do
+      llm_router.log("debug", "trying credential", { cred_id = cred.id, model = request.model })
       for _, px in ipairs(pick_proxies(ctx, 3)) do
         local response_id = "kiro-" .. tostring(os.time())
         local created = os.time()
@@ -1483,7 +1495,9 @@ llm_router.register("kiro", {
         end
       end
     end
-    return nil, final_error(last_err)
+    local exhausted = final_error(last_err)
+    llm_router.log("error", "all credentials exhausted", { reason = tostring(exhausted.message or "request failed"), code = exhausted.code })
+    return nil, exhausted
   end,
 })
 
@@ -1502,7 +1516,6 @@ function client_stream_raw(ctx, headers, payload, url, proxy_url, cred_id, st, o
     proxy_url = proxy_url,
     on_response = function(r)
       if r.status == 200 then return end
-      print("[kiro] stream rejected: status=" .. tostring(r.status) .. " request_bytes=" .. tostring(#body))
       local action, terr = map_upstream(ctx, r, cred_id)
       if action == "done" then st.fatal = true end
       if action == "cred" then st.next_cred = true end

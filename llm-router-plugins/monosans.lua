@@ -1,7 +1,7 @@
 --- @plugin Monosans Proxy List
 --- @author TheSlopMachine
---- @version 3.0.0
---- @plugin_api 1.0
+--- @version 3.0.2
+--- @plugin_api 1.4
 --- @description Free proxy list from monosans (proxies/all.txt; http/socks4/socks5)
 --- @allow_host cdn.jsdelivr.net
 
@@ -19,7 +19,10 @@ llm_router.register_proxy_source("monosans", {
     if type(last_modified) == "string" then headers["If-Modified-Since"] = last_modified end
 
     local resp, err = client:request({ method = "GET", url = LIST_URL, headers = headers })
-    if err then return nil, err end
+    if err then
+      llm_router.log("warn", "list request failed", { reason = tostring(err.message or err) })
+      return nil, err
+    end
     if resp.status == 304 then
       local response_headers = resp.headers or {}
       if type(response_headers.etag) == "string" then
@@ -31,6 +34,7 @@ llm_router.register_proxy_source("monosans", {
       return nil
     end
     if resp.status ~= 200 then
+      llm_router.log("warn", "list rejected", { status = resp.status })
       return nil, { message = "monosans list: status " .. resp.status, code = "server_error", status = resp.status }
     end
     local response_headers = resp.headers or {}
@@ -46,6 +50,7 @@ llm_router.register_proxy_source("monosans", {
     end
     local body = resp.body
     if type(body) ~= "string" or body == "" then
+      llm_router.log("warn", "empty body", {})
       return nil, { message = "monosans list: empty body", code = "server_error", status = 502 }
     end
     local out = {}
@@ -66,6 +71,7 @@ llm_router.register_proxy_source("monosans", {
         end
       end
     end
+    llm_router.log("debug", "list served", { count = #out })
     return out
   end,
 })
