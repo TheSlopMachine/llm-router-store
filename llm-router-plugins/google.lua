@@ -1,6 +1,6 @@
 --- @plugin Google AI Studio
 --- @author TheSlopMachine
---- @version 5.1.2
+--- @version 5.1.3
 --- @plugin_api 1.4
 --- @description Google Gemini models via AI Studio API
 --- @allow_host generativelanguage.googleapis.com
@@ -38,6 +38,51 @@ local function retry_after_secs(resp)
     return secs
   end
   return 60
+end
+
+-- Gemini resource names arrive as "models/<name>" inside the bare model id;
+-- the upstream path wants the name without it.
+local function request_model_name(bare) return ((bare or ""):gsub("^models/", "")) end
+
+-- Rate-limit cooldowns are per credential+model: Gemini quotas bind to the
+-- key+model pair, so a 429 must never park the credential (parked rows
+-- vanish from credentials.list() for every model, turning one model's
+-- quota into a provider-wide outage). Cooldowns live in plugin storage
+-- with a TTL; only requests for the same model skip a cooling credential.
+local COOLDOWN_SCOPE = "rate_limit"
+
+local function cooldown_key(cred_id, model_name) return tostring(cred_id) .. ":" .. request_model_name(model_name) end
+
+local function cooldown_active(cred_id, model_name)
+  local ok, value = pcall(llm_router.storage.get, COOLDOWN_SCOPE, cooldown_key(cred_id, model_name))
+  return ok and value ~= nil
+end
+
+local function set_cooldown(cred_id, model_name, ttl_secs)
+  if type(ttl_secs) ~= "number" or ttl_secs < 1 then ttl_secs = 1 end
+  pcall(
+    llm_router.storage.set,
+    COOLDOWN_SCOPE,
+    cooldown_key(cred_id, model_name),
+    { at = os.time(), reason = "rate limited" },
+    { ttl = math.floor(ttl_secs) }
+  )
+end
+
+-- Credentials not cooling down for this model. Returns (usable, total):
+-- an empty usable set with a positive total means every key hit this
+-- model's quota, never a credential-wide outage.
+local function usable_credentials(model_name)
+  local usable, total = {}, 0
+  for _, cred in ipairs(llm_router.credentials.list()) do
+    total = total + 1
+    if cooldown_active(cred.id, model_name) then
+      llm_router.log("debug", "credential cooling down", { cred_id = cred.id, model = model_name })
+    else
+      table.insert(usable, cred)
+    end
+  end
+  return usable, total
 end
 
 -- Gemini serves US exits: proxy selection filters the pool accordingly.
@@ -80,7 +125,7 @@ end
 -- Outcomes map to loop decisions: "proxy" retries the same credential on
 -- the next exit, "cred" moves to the next credential, "done" returns the
 -- terminal error to the client at once.
-local function map_upstream(ctx, resp, cred_id)
+local function map_upstream(ctx, resp, cred_id, model_name)
   local lower = string.lower(tostring(resp.body or ""))
   local status = resp.status
   if status == 400 and string.find(lower, "location is not supported", 1, true) then
@@ -107,11 +152,11 @@ local function map_upstream(ctx, resp, cred_id)
     return "cred", { message = "gemini rejected the api key", code = "authentication_error", status = 401 }
   end
   if status == 429 then
-    -- Gemini quotas bind to the key+model pair; other models on the key
-    -- serve on. The park is per credential; the model dimension stays in
-    -- the request the caller already scopes.
-    llm_router.credentials.park(cred_id, retry_after_secs(resp), "gemini rate limited")
-    llm_router.log("warn", "rate limited", { status = status, code = "rate_limit", cred_id = cred_id })
+    -- Quotas bind to the key+model pair: cool down only this pair, never
+    -- park the key. Parking hides the credential from every model.
+    local wait = retry_after_secs(resp)
+    set_cooldown(cred_id, model_name, wait)
+    llm_router.log("warn", "rate limited", { status = status, code = "rate_limit", cred_id = cred_id, model = model_name })
     return "cred", { message = "gemini rate limited", code = "rate_limit", status = 429 }
   end
   if status == 404 then
@@ -559,10 +604,6 @@ local function build_tools(request, provider_config)
 end
 
 local function is_gemini3(model) return (model:lower():match("^gemini%-3") ~= nil) end
-
--- Gemini resource names arrive as "models/<name>" inside the bare model id;
--- the upstream path wants the name without it.
-local function request_model_name(bare) return ((bare or ""):gsub("^models/", "")) end
 
 local function build_generation_config(request, model)
   local cfg = nil
@@ -1127,8 +1168,13 @@ llm_router.register("google", {
     local client = llm_router.http_client({})
     local payload, perr = build_payload(request, ctx.provider_config)
     if perr then return nil, perr end
+    local model_name = request_model_name(request.model_name)
+    local creds, total = usable_credentials(model_name)
+    if #creds == 0 and total > 0 then
+      return nil, { message = "gemini rate limited", code = "rate_limit", status = 429 }
+    end
     local last_err = nil
-    for _, cred in ipairs(llm_router.credentials.list()) do
+    for _, cred in ipairs(creds) do
       llm_router.log("debug", "trying credential", { cred_id = cred.id, model = request.model })
       local key = api_key_of(cred.data)
       local exits, exits_err = pick_proxies(ctx, 3)
@@ -1136,7 +1182,7 @@ llm_router.register("google", {
       for _, px in ipairs(exits) do
         local resp, err = client:request({
           method = "POST",
-          url = BASE_URL .. "/models/" .. request_model_name(request.model_name) .. ":generateContent",
+          url = BASE_URL .. "/models/" .. model_name .. ":generateContent",
           headers = { ["x-goog-api-key"] = key, ["Content-Type"] = "application/json" },
           body = json.encode(payload),
           proxy_url = px.url,
@@ -1147,7 +1193,7 @@ llm_router.register("google", {
           llm_router.log("debug", "transport error", { reason = tostring(err.message or "transport error"), code = err.code, cred_id = cred.id })
           last_err = err
         else
-          local action, terr = map_upstream(ctx, resp, cred.id)
+          local action, terr = map_upstream(ctx, resp, cred.id, model_name)
           if action == "done" then return nil, terr end
           last_err = terr
           if action == "cred" then break end
@@ -1165,8 +1211,13 @@ llm_router.register("google", {
     if perr then return nil, perr end
     local full_model = request.model
     local chunk_id = "google-" .. tostring(os.time())
+    local model_name = request_model_name(request.model_name)
+    local creds, total = usable_credentials(model_name)
+    if #creds == 0 and total > 0 then
+      return nil, { message = "gemini rate limited", code = "rate_limit", status = 429 }
+    end
     local last_err = nil
-    for _, cred in ipairs(llm_router.credentials.list()) do
+    for _, cred in ipairs(creds) do
       llm_router.log("debug", "trying credential", { cred_id = cred.id, model = request.model })
       local key = api_key_of(cred.data)
       local exits, exits_err = pick_proxies(ctx, 3)
@@ -1181,13 +1232,13 @@ llm_router.register("google", {
         local next_cred = false
         local resp, stream_err = client:stream({
           method = "POST",
-          url = BASE_URL .. "/models/" .. request_model_name(request.model_name) .. ":streamGenerateContent?alt=sse",
+          url = BASE_URL .. "/models/" .. model_name .. ":streamGenerateContent?alt=sse",
           headers = { ["x-goog-api-key"] = key, ["Content-Type"] = "application/json" },
           body = json.encode(payload),
           proxy_url = px.url,
           on_response = function(r)
             if r.status == 200 then return end
-            local action, terr = map_upstream(ctx, r, cred.id)
+            local action, terr = map_upstream(ctx, r, cred.id, model_name)
             if action == "done" then fatal = true end
             if action == "cred" then next_cred = true end
             return terr
@@ -1288,8 +1339,13 @@ llm_router.register("google", {
       },
     }
     local client = llm_router.http_client({})
+    local model_name = request_model_name(request.model_name)
+    local creds, total = usable_credentials(model_name)
+    if #creds == 0 and total > 0 then
+      return nil, { message = "gemini rate limited", code = "rate_limit", status = 429 }
+    end
     local last_err = nil
-    for _, cred in ipairs(llm_router.credentials.list()) do
+    for _, cred in ipairs(creds) do
       llm_router.log("debug", "trying credential", { cred_id = cred.id, model = request.model })
       local key = api_key_of(cred.data)
       local exits, exits_err = pick_proxies(ctx, 3)
@@ -1297,7 +1353,7 @@ llm_router.register("google", {
       for _, px in ipairs(exits) do
         local resp, err = client:request({
           method = "POST",
-          url = BASE_URL .. "/models/" .. request_model_name(request.model_name) .. ":generateContent",
+          url = BASE_URL .. "/models/" .. model_name .. ":generateContent",
           headers = { ["x-goog-api-key"] = key, ["Content-Type"] = "application/json" },
           body = json.encode(payload),
           proxy_url = px.url,
@@ -1320,7 +1376,7 @@ llm_router.register("google", {
           llm_router.log("debug", "transport error", { reason = tostring(err.message or "transport error"), code = err.code, cred_id = cred.id })
           last_err = err
         else
-          local action, terr = map_upstream(ctx, resp, cred.id)
+          local action, terr = map_upstream(ctx, resp, cred.id, model_name)
           if action == "done" then return nil, terr end
           last_err = terr
           if action == "cred" then break end
@@ -1346,8 +1402,13 @@ llm_router.register("google", {
       generationConfig = gen_config,
     }
     local client = llm_router.http_client({})
+    local model_name = request_model_name(request.model_name)
+    local creds, total = usable_credentials(model_name)
+    if #creds == 0 and total > 0 then
+      return nil, { message = "gemini rate limited", code = "rate_limit", status = 429 }
+    end
     local last_err = nil
-    for _, cred in ipairs(llm_router.credentials.list()) do
+    for _, cred in ipairs(creds) do
       llm_router.log("debug", "trying credential", { cred_id = cred.id, model = request.model })
       local key = api_key_of(cred.data)
       local exits, exits_err = pick_proxies(ctx, 3)
@@ -1362,7 +1423,7 @@ llm_router.register("google", {
         for _ = 1, n do
           local resp, err = client:request({
             method = "POST",
-            url = BASE_URL .. "/models/" .. request_model_name(request.model_name) .. ":generateContent",
+            url = BASE_URL .. "/models/" .. model_name .. ":generateContent",
             headers = { ["x-goog-api-key"] = key, ["Content-Type"] = "application/json" },
             body = json.encode(payload),
             proxy_url = px.url,
@@ -1373,7 +1434,7 @@ llm_router.register("google", {
             break
           end
           if resp.status ~= 200 then
-            local action, terr = map_upstream(ctx, resp, cred.id)
+            local action, terr = map_upstream(ctx, resp, cred.id, model_name)
             last_err = terr
             failed = true
             if action == "done" then return nil, terr end
@@ -1418,8 +1479,12 @@ llm_router.register("google", {
       table.insert(requests, entry)
     end
     local client = llm_router.http_client({})
+    local creds, total = usable_credentials(model)
+    if #creds == 0 and total > 0 then
+      return nil, { message = "gemini rate limited", code = "rate_limit", status = 429 }
+    end
     local last_err = nil
-    for _, cred in ipairs(llm_router.credentials.list()) do
+    for _, cred in ipairs(creds) do
       llm_router.log("debug", "trying credential", { cred_id = cred.id, model = request.model })
       local key = api_key_of(cred.data)
       local exits, exits_err = pick_proxies(ctx, 3)
@@ -1451,7 +1516,7 @@ llm_router.register("google", {
           llm_router.log("debug", "transport error", { reason = tostring(err.message or "transport error"), code = err.code, cred_id = cred.id })
           last_err = err
         else
-          local action, terr = map_upstream(ctx, resp, cred.id)
+          local action, terr = map_upstream(ctx, resp, cred.id, model)
           if action == "done" then return nil, terr end
           last_err = terr
           if action == "cred" then break end
