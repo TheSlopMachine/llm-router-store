@@ -1,6 +1,6 @@
 --- @plugin OpenCode Free
 --- @author TheSlopMachine
---- @version 6.5.0
+--- @version 6.5.3
 --- @plugin_api 1.5
 --- @description OpenAI/Anthropic/Google compatible free provider OpenCode Free (no key required)
 --- @allow_host opencode.ai
@@ -8,7 +8,9 @@
 --- @allow_host registry.npmjs.org
 --- @allow_host raw.githubusercontent.com
 
-local BASE_URL = "https://opencode.ai/zen/v1"
+-- Base path follows the model catalog (opencode.api): /zen/v1 now answers
+-- FreeTierError, the live path is /inference/v1.
+local BASE_URL = "https://opencode.ai/inference/v1"
 local MODELS_DEV_URL = "https://models.opencode.ai/api.json"
 local NPM_VERSION_URL = "https://registry.npmjs.org/opencode-ai/latest"
 local RAW_BASE = "https://raw.githubusercontent.com/anomalyco/opencode/"
@@ -174,12 +176,9 @@ local function opencode_version()
   return VERSION_FALLBACK
 end
 
--- provider-utils sub-version has no live source; the observed constants are
--- keyed by endpoint family (chat 4.0.23, responses 4.0.40 on 1.18.35).
+-- 1.19.0 sends the short form with no provider suffix.
 local function user_agent(endpoint)
-  local sdk = "4.0.23"
-  if endpoint == "/responses" then sdk = "4.0.40" end
-  return "opencode/" .. opencode_version() .. " ai-sdk/provider-utils/" .. sdk .. " runtime/bun/1.3.14"
+  return "opencode/" .. opencode_version()
 end
 
 local function catalog_ua() return "opencode/latest/" .. opencode_version() .. "/cli" end
@@ -648,12 +647,21 @@ local function exit_key(px)
   return url
 end
 
+-- The direct exit is never parked: without a pool it is the only egress,
+-- so parking it blocks every request until the entry expires.
+local function is_direct(px)
+  local url = (type(px) == "table" and px.url) or ""
+  return url == ""
+end
+
 local function exit_limited(px)
+  if is_direct(px) then return false end
   local ok, v = pcall(llm_router.storage.get, RL_SCOPE, exit_key(px))
   return ok and v ~= nil
 end
 
 local function mark_exit_limited(px, reason, ttl)
+  if is_direct(px) then return end
   pcall(llm_router.storage.set, RL_SCOPE, exit_key(px), { at = os.time(), reason = reason }, { ttl = ttl or RL_TTL })
 end
 
@@ -661,7 +669,7 @@ end
 -- how many marked exits were bypassed. The pool searches for live exits and
 -- waits for them; the wait deadline is shared by every round of the request.
 -- A direct pool or an expired wait degrades to one direct attempt, and the
--- direct leg obeys the same mark.
+-- direct leg is never parked.
 local function pick_proxies(ctx, limit)
   limit = limit or 3
   -- Unconfigured providers go direct: only an explicit pool selection
