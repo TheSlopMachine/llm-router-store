@@ -1,6 +1,6 @@
 --- @plugin Monosans Proxy List
 --- @author TheSlopMachine
---- @version 3.0.2
+--- @version 3.1.0
 --- @plugin_api 1.4
 --- @description Free proxy list from monosans (proxies/all.txt; http/socks4/socks5)
 --- @allow_host cdn.jsdelivr.net
@@ -9,14 +9,21 @@ local LIST_URL = "https://cdn.jsdelivr.net/gh/monosans/proxy-list@main/proxies/a
 local CACHE_SCOPE = "proxy_list"
 local PROTOCOLS = { http = true, https = true, socks4 = true, socks4a = true, socks5 = true }
 
+-- Unconditional full fetch once per interval. Validators persist durably,
+-- so an emptied pool would otherwise 304 forever without reseeding.
+local FULL_FETCH_TTL = 7 * 24 * 3600
+
 llm_router.register_proxy_source("monosans", {
   fetch_proxies = function()
     local client = llm_router.http_client({ timeout_ms = 30000 })
     local headers = {}
-    local etag = llm_router.storage.get(CACHE_SCOPE, "etag")
-    local last_modified = llm_router.storage.get(CACHE_SCOPE, "last_modified")
-    if type(etag) == "string" then headers["If-None-Match"] = etag end
-    if type(last_modified) == "string" then headers["If-Modified-Since"] = last_modified end
+    -- Absent marker skips validators once, forcing a full list fetch.
+    if llm_router.storage.get(CACHE_SCOPE, "conditional_fetch") ~= nil then
+      local etag = llm_router.storage.get(CACHE_SCOPE, "etag")
+      local last_modified = llm_router.storage.get(CACHE_SCOPE, "last_modified")
+      if type(etag) == "string" then headers["If-None-Match"] = etag end
+      if type(last_modified) == "string" then headers["If-Modified-Since"] = last_modified end
+    end
 
     local resp, err = client:request({ method = "GET", url = LIST_URL, headers = headers })
     if err then
@@ -24,6 +31,7 @@ llm_router.register_proxy_source("monosans", {
       return nil, err
     end
     if resp.status == 304 then
+      llm_router.storage.set(CACHE_SCOPE, "conditional_fetch", true, { ttl = FULL_FETCH_TTL })
       local response_headers = resp.headers or {}
       if type(response_headers.etag) == "string" then
         llm_router.storage.set(CACHE_SCOPE, "etag", response_headers.etag)
@@ -37,6 +45,7 @@ llm_router.register_proxy_source("monosans", {
       llm_router.log("warn", "list rejected", { status = resp.status })
       return nil, { message = "monosans list: status " .. resp.status, code = "server_error", status = resp.status }
     end
+    llm_router.storage.set(CACHE_SCOPE, "conditional_fetch", true, { ttl = FULL_FETCH_TTL })
     local response_headers = resp.headers or {}
     if type(response_headers.etag) == "string" then
       llm_router.storage.set(CACHE_SCOPE, "etag", response_headers.etag)
