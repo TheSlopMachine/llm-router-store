@@ -1,6 +1,6 @@
 --- @plugin Kiro AI
 --- @author TheSlopMachine
---- @version 5.2.0
+--- @version 5.2.1
 --- @plugin_api 1.5
 --- @description AWS Kiro models via device login (OAuth2 with proactive refresh)
 --- @allow_host codewhisperer.us-east-1.amazonaws.com
@@ -419,20 +419,72 @@ local function message_text(m)
   return table.concat(parts, "\n")
 end
 
+local function invalid_request(message) return { message = message, code = "invalid_request_error", status = 400 } end
+
+-- Bedrock rejects a tool schema whose required field is not an array of
+-- property names. An empty Lua table encodes as a JSON object, so an empty
+-- required list is omitted instead of transmitted.
+local function check_required(name, index, required)
+  if required == nil then return nil end
+  if type(required) ~= "table" then
+    return invalid_request(
+      "tool '" .. name .. "' at index " .. tostring(index) .. " has invalid required field: array expected"
+    )
+  end
+  if next(required) == nil then return nil end
+  local count = 0
+  for key, value in pairs(required) do
+    if type(key) ~= "number" or type(value) ~= "string" then
+      return invalid_request(
+        "tool '" .. name .. "' at index " .. tostring(index) .. " has invalid required field: array expected"
+      )
+    end
+    count = count + 1
+  end
+  for position = 1, count do
+    if type(required[position]) ~= "string" then
+      return invalid_request(
+        "tool '" .. name .. "' at index " .. tostring(index) .. " has invalid required field: array expected"
+      )
+    end
+  end
+  return nil
+end
+
+local function without_empty_required(schema)
+  if schema.required == nil then return schema end
+  if next(schema.required) ~= nil then return schema end
+  local copy = {}
+  for key, value in pairs(schema) do
+    if key ~= "required" then copy[key] = value end
+  end
+  return copy
+end
+
 local function build_tool_specs(tools)
   local specs = {}
-  for _, t in ipairs(tools or {}) do
-    local name = t.name or ""
-    local desc = t.description or ""
-    local schema = t.parameters
-    if t["function"] then
-      if t["function"].name and t["function"].name ~= "" then name = t["function"].name end
-      if t["function"].description and t["function"].description ~= "" then desc = t["function"].description end
-      if t["function"].parameters then schema = t["function"].parameters end
+  for position, tool in ipairs(tools or {}) do
+    local index = position - 1
+    local name = tool.name or ""
+    local desc = tool.description or ""
+    local schema = tool.parameters
+    if tool["function"] then
+      if tool["function"].name and tool["function"].name ~= "" then name = tool["function"].name end
+      if tool["function"].description and tool["function"].description ~= "" then desc = tool["function"].description end
+      if tool["function"].parameters then schema = tool["function"].parameters end
     end
     if name ~= "" then
       if desc == "" then desc = "Tool: " .. name end
       if schema == nil then schema = { type = "object", properties = {} } end
+      if type(schema) ~= "table" then
+        return nil,
+          invalid_request(
+            "tool '" .. name .. "' at index " .. tostring(index) .. " has invalid parameters: object expected"
+          )
+      end
+      local validation_error = check_required(name, index, schema.required)
+      if validation_error then return nil, validation_error end
+      schema = without_empty_required(schema)
       table.insert(
         specs,
         {
@@ -446,7 +498,7 @@ local function build_tool_specs(tools)
       )
     end
   end
-  return specs
+  return specs, nil
 end
 
 local function convert_messages(messages, tools, model)
@@ -455,6 +507,12 @@ local function convert_messages(messages, tools, model)
   local user_parts = {}
   local assistant_parts = {}
   local tool_results = {}
+  local tool_specifications = nil
+  if #tools > 0 then
+    local specifications, specification_error = build_tool_specs(tools)
+    if specification_error then return nil, nil, specification_error end
+    tool_specifications = specifications
+  end
 
   local function flush_user()
     local content = table.concat(user_parts, "\n\n"):match("^%s*(.-)%s*$")
@@ -467,7 +525,7 @@ local function convert_messages(messages, tools, model)
     if #tool_results > 0 then msg.userInputMessageContext = { toolResults = tool_results } end
     if #tools > 0 and #history == 0 then
       msg.userInputMessageContext = msg.userInputMessageContext or {}
-      msg.userInputMessageContext.tools = build_tool_specs(tools)
+      msg.userInputMessageContext.tools = tool_specifications
     end
     table.insert(history, { userInputMessage = msg })
     user_parts = {}
@@ -538,7 +596,7 @@ local function convert_messages(messages, tools, model)
   if #tools > 0 then
     current.userInputMessageContext = current.userInputMessageContext or {}
     if current.userInputMessageContext.tools == nil then
-      current.userInputMessageContext.tools = build_tool_specs(tools)
+      current.userInputMessageContext.tools = tool_specifications
     end
   end
   for _, entry in ipairs(history) do
@@ -549,7 +607,7 @@ local function convert_messages(messages, tools, model)
     end
     if e and (e.modelId == nil or e.modelId == "") then e.modelId = model end
   end
-  return history, current
+  return history, current, nil
 end
 
 local function conversation_id(history, current_content)
@@ -567,7 +625,8 @@ local function conversation_id(history, current_content)
 end
 
 local function build_payload(request, model, thinking, effort)
-  local history, current = convert_messages(request.messages, request.tools or {}, model)
+  local history, current, conversion_error = convert_messages(request.messages, request.tools or {}, model)
+  if conversion_error then return nil, conversion_error end
   if current.content == "" then current.content = "continue" end
   current.content = "[Context: Current time is " .. os.date("!%Y-%m-%dT%H:%M:%SZ") .. "]\n\n" .. current.content
   if thinking then
@@ -611,7 +670,7 @@ local function build_payload(request, model, thinking, effort)
       }
     end
   end
-  return payload
+  return payload, nil
 end
 
 local function generate_headers(credential)
@@ -1399,6 +1458,8 @@ llm_router.register("kiro", {
     local effort = resolve_effort(request)
     local model, thinking, alias_err = resolve_model(request.model_name, effort)
     if alias_err then return nil, alias_err end
+    local payload, payload_err = build_payload(request, model, thinking, effort)
+    if payload_err then return nil, payload_err end
     local client = llm_router.http_client({ timeout_ms = STREAM_TIMEOUT_MS })
     local last_err = nil
     for _, cred in ipairs(llm_router.credentials.list()) do
@@ -1408,7 +1469,7 @@ llm_router.register("kiro", {
           method = "POST",
           url = generate_url(cred, ctx.provider_config),
           headers = generate_headers(cred),
-          body = json.encode(build_payload(request, model, thinking, effort)),
+          body = json.encode(payload),
           proxy_url = px.url,
         })
         if err == nil and resp.status == 200 then
@@ -1433,6 +1494,8 @@ llm_router.register("kiro", {
     local effort = resolve_effort(request)
     local short_model, thinking, alias_err = resolve_model(request.model_name, effort)
     if alias_err then return nil, alias_err end
+    local payload, payload_err = build_payload(request, short_model, thinking, effort)
+    if payload_err then return nil, payload_err end
     local last_err = nil
     for _, cred in ipairs(llm_router.credentials.list()) do
       llm_router.log("debug", "trying credential", { cred_id = cred.id, model = request.model })
@@ -1459,7 +1522,6 @@ llm_router.register("kiro", {
           })
           done = true
         end
-        local payload = build_payload(request, short_model, thinking, effort)
         local generate = generate_url(cred, ctx.provider_config)
         local _, stream_err = client_stream_raw(
           ctx,
