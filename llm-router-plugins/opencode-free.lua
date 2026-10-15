@@ -1,6 +1,6 @@
 --- @plugin OpenCode Free
 --- @author TheSlopMachine
---- @version 6.5.5
+--- @version 6.5.7
 --- @plugin_api 1.5
 --- @description OpenAI/Anthropic/Google compatible free provider OpenCode Free (no key required)
 --- @allow_host opencode.ai
@@ -530,12 +530,31 @@ local function mint_session(ms) return "ses_" .. time_head(true, ms, 1) .. ulid_
 
 local function mint_msg(ms) return "msg_" .. time_head(false, ms, 2) .. ulid_tail() end
 
--- Session id stable per conversation: keyed by the router's stable
--- cross-turn partition, minted once per key, 10-minute TTL so abandoned
--- sessions expire. The same id serves as prompt_cache_key verbatim.
+-- Session id chained per conversation turn: the lookup key hashes the
+-- dialogue prefix without the latest exchange, the store key hashes the
+-- full dialogue. Each turn rotates the entry (delete old, store new) under
+-- a 10-minute TTL, so one session id follows the conversation. The same
+-- id serves as prompt_cache_key verbatim.
 local SESSION_SCOPE = "session_v2"
 local SESSION_TTL = 600
+local DLG_NS = "9e4f1a2b-3c5d-4e6f-8a9b-0c1d2e3f4a5b"
 
+local function dlg_slice(messages, from, to)
+  local out = {}
+  if type(messages) ~= "table" then return out end
+  for index = from, to do
+    if type(messages[index]) == "table" then table.insert(out, messages[index]) end
+  end
+  return out
+end
+
+local function dlg_count(request)
+  if type(request.messages) == "table" then return #request.messages end
+  return 0
+end
+
+-- Legacy root key: model plus router partition hash, else model plus raw
+-- first-message bytes. Fallback for dialogue hashing only.
 local function conv_key(request, model)
   if type(request.cache_key) == "string" and request.cache_key ~= "" then
     return model .. "|" .. request.cache_key
@@ -547,15 +566,38 @@ local function conv_key(request, model)
   return model .. "|" .. first
 end
 
+-- Dialogue hash key for messages[from..to], model-scoped so identical
+-- dialogue on different models never shares a session. Falls back to the
+-- legacy root key when hashing is unavailable.
+local function dlg_key(request, model, from, to)
+  local serial = debug_json(dlg_slice(request.messages, from, to))
+  local ok, id = pcall(llm_router.uuid_v5, DLG_NS, tostring(model) .. "|" .. serial)
+  if ok and type(id) == "string" and id ~= "" then return tostring(model) .. "|dlg_" .. id end
+  return conv_key(request, model)
+end
+
+local function dlg_old_key(request, model)
+  local count = dlg_count(request)
+  return dlg_key(request, model, 1, math.max(count - 2, 0))
+end
+
+local function dlg_new_key(request, model)
+  return dlg_key(request, model, 1, dlg_count(request))
+end
+
 local function stable_session(request, model)
-  local key = conv_key(request, model)
-  local ok, ses = pcall(llm_router.storage.get, SESSION_SCOPE, key)
+  local old_key = dlg_old_key(request, model)
+  local new_key = dlg_new_key(request, model)
+  local ok, ses = pcall(llm_router.storage.get, SESSION_SCOPE, old_key)
   if ok and type(ses) == "string" and ses ~= "" then
-    pcall(llm_router.storage.set, SESSION_SCOPE, key, ses, { ttl = SESSION_TTL })
+    pcall(llm_router.storage.delete, SESSION_SCOPE, old_key)
+    pcall(llm_router.storage.set, SESSION_SCOPE, new_key, ses, { ttl = SESSION_TTL })
+    llm_router.log("debug", "session loaded", { event = "session" })
     return ses
   end
   local fresh = mint_session(mint_ms())
-  pcall(llm_router.storage.set, SESSION_SCOPE, key, fresh, { ttl = SESSION_TTL })
+  pcall(llm_router.storage.set, SESSION_SCOPE, new_key, fresh, { ttl = SESSION_TTL })
+  llm_router.log("debug", "session missed", { event = "session" })
   return fresh
 end
 
@@ -1019,16 +1061,18 @@ end
 local BLOB_SCOPE = "reasoning_blobs"
 local BLOB_TTL = 600
 
-local function blob_store_key(request, model) return conv_key(request, model) end
-
 local function blob_push(request, model, pairs)
   if #pairs == 0 then return end
-  pcall(llm_router.storage.set, BLOB_SCOPE, blob_store_key(request, model), pairs, { ttl = BLOB_TTL })
+  pcall(llm_router.storage.set, BLOB_SCOPE, dlg_new_key(request, model), pairs, { ttl = BLOB_TTL })
 end
 
 local function blob_take_all(request, model)
-  local ok, pairs = pcall(llm_router.storage.get, BLOB_SCOPE, blob_store_key(request, model))
-  if ok and type(pairs) == "table" then return pairs end
+  local ok, pairs = pcall(llm_router.storage.get, BLOB_SCOPE, dlg_old_key(request, model))
+  if ok and type(pairs) == "table" and #pairs > 0 then
+    llm_router.log("debug", "reasoning blobs loaded", { count = #pairs, event = "reasoning_blobs" })
+    return pairs
+  end
+  llm_router.log("debug", "reasoning blobs missed", { event = "reasoning_blobs" })
   return {}
 end
 
@@ -1304,7 +1348,9 @@ local function assemble_responses_stream(body, model, request)
   if #tool_calls > 0 then finish = "tool_calls" end
   local tool_calls_final = tool_calls
   if #tool_calls == 0 then tool_calls_final = json.decode("[]") end
-  local message = { role = "assistant", content = table.concat(text_parts), tool_calls = tool_calls_final }
+  local content = table.concat(text_parts)
+  llm_router.log("debug", "assembled completion", { finish = finish, prompt_tokens = prompt_tokens, completion_tokens = completion_tokens, text_chars = #content, event = "assemble" })
+  local message = { role = "assistant", content = content, tool_calls = tool_calls_final }
   local reasoning = table.concat(reasoning_parts)
   if reasoning ~= "" then message.reasoning_content = reasoning end
   return {
@@ -1398,7 +1444,9 @@ local function assemble_chat_response(body, model)
   if #tool_calls > 0 and finish == "stop" then finish = "tool_calls" end
   local tool_calls_final = tool_calls
   if #tool_calls == 0 then tool_calls_final = json.decode("[]") end
-  local message = { role = "assistant", content = table.concat(text_parts), tool_calls = tool_calls_final }
+  local content = table.concat(text_parts)
+  llm_router.log("debug", "assembled completion", { finish = finish, prompt_tokens = prompt_tokens, completion_tokens = completion_tokens, text_chars = #content, event = "assemble" })
+  local message = { role = "assistant", content = content, tool_calls = tool_calls_final }
   local reasoning = table.concat(reasoning_parts)
   if reasoning ~= "" then message.reasoning_content = reasoning end
   return {
@@ -1444,7 +1492,11 @@ llm_router.register("opencode-free", {
 
   get_model_infos = function(ctx)
     local cached = llm_router.storage.get(MODEL_CACHE_SCOPE, "infos")
-    if type(cached) == "table" and #cached > 0 then return cached end
+    if type(cached) == "table" and #cached > 0 then
+      llm_router.log("debug", "model catalog loaded", { count = #cached, event = "model_catalog" })
+      return cached
+    end
+    llm_router.log("debug", "model catalog missed", { event = "model_catalog" })
     return refresh_model_catalog()
   end,
 
