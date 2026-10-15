@@ -1,6 +1,6 @@
 --- @plugin OpenCode Free
 --- @author TheSlopMachine
---- @version 6.5.4
+--- @version 6.5.5
 --- @plugin_api 1.5
 --- @description OpenAI/Anthropic/Google compatible free provider OpenCode Free (no key required)
 --- @allow_host opencode.ai
@@ -1527,41 +1527,55 @@ llm_router.register("opencode-free", {
       }
     )
 
-    local exits, skipped, observed = pick_proxies(ctx, EXIT_ATTEMPTS)
     local attempted = 0
-    for _, px in ipairs(exits) do
-      attempted = attempted + 1
-      if endpoint == "/responses" then
-        -- Anonymous Responses path: stream upstream like the genuine
-        -- client and assemble the event stream into one completion.
-        -- Generations over large contexts run long; the wide timeout only
-        -- bounds dead connections, progress streams underneath it.
-        local resp_client = llm_router.http_client({ timeout_ms = 300000 })
-        local payload, perr = build_anon_responses_payload(request, model, ses)
-        if payload == nil then return nil, perr end
-        local headers = opencode_headers(endpoint, ses, msg)
-        local body = wire_body(payload)
-        llm_router.log("debug", "sending request", { method = "POST", url = BASE_URL .. "/responses", body_len = #body, event = "http" })
-        local raw_body, action, err = fetch_body(resp_client, BASE_URL .. "/responses", headers, body, model, px)
-        if raw_body then return assemble_responses_stream(raw_body, model, request) end
-        llm_router.log("warn", "request failed", { code = err.code, status = err.status, reason = err.message, event = "http_error" })
-        if action == "done" then return nil, err end
-      else
-        -- Anonymous chat path: the free-tier gate only serves stream:true
-        -- requests shaped like the genuine client, so always stream upstream
-        -- and assemble the SSE body into one completion here.
-        local payload, perr = build_anon_chat_payload(request, model)
-        if payload == nil then return nil, perr end
-        local headers = opencode_headers(endpoint, ses, msg)
-        local body = wire_body(payload)
-        llm_router.log("debug", "sending request", { method = "POST", url = BASE_URL .. "/chat/completions", body_len = #body, event = "http" })
-        local raw_body, action, err = fetch_body(client, BASE_URL .. "/chat/completions", headers, body, model, px)
-        if raw_body then return assemble_chat_response(raw_body, request.model) end
-        llm_router.log("warn", "request failed", { code = err.code, status = err.status, reason = err.message, event = "http_error" })
-        if action == "done" then return nil, err end
+    local total_skipped = 0
+    local tried_direct = false
+    -- Drain the pool: re-pick until no unmarked exit remains instead of
+    -- stopping at one fixed budget. Marked exits stay skipped, the direct
+    -- repeat guard ends direct-only runs, and pool exhaustion below ends
+    -- every run with the terminal error.
+    while true do
+      local exits, skipped = pick_proxies(ctx, EXIT_ATTEMPTS)
+      total_skipped = total_skipped + skipped
+      if #exits == 0 then break end
+      if #exits == 1 and is_direct(exits[1]) then
+        if tried_direct then break end
+        tried_direct = true
+      end
+      for _, px in ipairs(exits) do
+        attempted = attempted + 1
+        if endpoint == "/responses" then
+          -- Anonymous Responses path: stream upstream like the genuine
+          -- client and assemble the event stream into one completion.
+          -- Generations over large contexts run long; the wide timeout only
+          -- bounds dead connections, progress streams underneath it.
+          local resp_client = llm_router.http_client({ timeout_ms = 300000 })
+          local payload, perr = build_anon_responses_payload(request, model, ses)
+          if payload == nil then return nil, perr end
+          local headers = opencode_headers(endpoint, ses, msg)
+          local body = wire_body(payload)
+          llm_router.log("debug", "sending request", { method = "POST", url = BASE_URL .. "/responses", body_len = #body, event = "http" })
+          local raw_body, action, err = fetch_body(resp_client, BASE_URL .. "/responses", headers, body, model, px)
+          if raw_body then return assemble_responses_stream(raw_body, model, request) end
+          llm_router.log("warn", "request failed", { code = err.code, status = err.status, reason = err.message, event = "http_error" })
+          if action == "done" then return nil, err end
+        else
+          -- Anonymous chat path: the free-tier gate only serves stream:true
+          -- requests shaped like the genuine client, so always stream upstream
+          -- and assemble the SSE body into one completion here.
+          local payload, perr = build_anon_chat_payload(request, model)
+          if payload == nil then return nil, perr end
+          local headers = opencode_headers(endpoint, ses, msg)
+          local body = wire_body(payload)
+          llm_router.log("debug", "sending request", { method = "POST", url = BASE_URL .. "/chat/completions", body_len = #body, event = "http" })
+          local raw_body, action, err = fetch_body(client, BASE_URL .. "/chat/completions", headers, body, model, px)
+          if raw_body then return assemble_chat_response(raw_body, request.model) end
+          llm_router.log("warn", "request failed", { code = err.code, status = err.status, reason = err.message, event = "http_error" })
+          if action == "done" then return nil, err end
+        end
       end
     end
-    return nil, terminal_error(skipped, attempted, observed)
+    return nil, terminal_error(total_skipped, attempted, attempted)
   end,
 
   complete_stream = function(ctx, request, emit)
@@ -1585,9 +1599,21 @@ llm_router.register("opencode-free", {
     local ses = stable_session(request, model)
     local msg = mint_msg(mint_ms())
 
-    local exits, skipped, observed = pick_proxies(ctx, EXIT_ATTEMPTS)
     local attempted = 0
-    for _, px in ipairs(exits) do
+    local total_skipped = 0
+    local tried_direct = false
+    -- Drain the pool: re-pick until no unmarked exit remains instead of
+    -- stopping at one fixed budget. Pool exhaustion below ends every run
+    -- with the terminal error.
+    while true do
+      local exits, skipped = pick_proxies(ctx, EXIT_ATTEMPTS)
+      total_skipped = total_skipped + skipped
+      if #exits == 0 then break end
+      if #exits == 1 and is_direct(exits[1]) then
+        if tried_direct then break end
+        tried_direct = true
+      end
+      for _, px in ipairs(exits) do
       attempted = attempted + 1
       local done = false
       local fatal = false
@@ -1800,8 +1826,9 @@ llm_router.register("opencode-free", {
           return
         end
       end
+      end
     end
-    return nil, terminal_error(skipped, attempted, observed)
+    return nil, terminal_error(total_skipped, attempted, attempted)
   end,
 
   -- Verified reasoning support the upstream catalog does not advertise.
