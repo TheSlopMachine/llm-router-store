@@ -1,6 +1,6 @@
 --- @plugin OpenCode Free
 --- @author TheSlopMachine
---- @version 6.5.3
+--- @version 6.5.4
 --- @plugin_api 1.5
 --- @description OpenAI/Anthropic/Google compatible free provider OpenCode Free (no key required)
 --- @allow_host opencode.ai
@@ -629,6 +629,9 @@ local MAX_PICK_ROUNDS = 4
 -- A 403 marks the exit for an hour: blocked egress addresses recover sooner
 -- than rate-limited ones.
 local FORBIDDEN_TTL = 3600
+-- A 5xx or transport break marks the exit briefly: flaky egress recovers
+-- faster than blocked or limited addresses.
+local SERVER_ERROR_TTL = 600
 -- Country filter for pooled exits. Empty accepts any country.
 local PROXY_COUNTRIES = {}
 -- Exits denied with 403 during this request (the plugin state is fresh per
@@ -663,6 +666,26 @@ end
 local function mark_exit_limited(px, reason, ttl)
   if is_direct(px) then return end
   pcall(llm_router.storage.set, RL_SCOPE, exit_key(px), { at = os.time(), reason = reason }, { ttl = ttl or RL_TTL })
+end
+
+-- Transport breaks bind to the exit, not the request. Marks are short so
+-- future selections skip the flaky egress without hiding an upstream-wide
+-- outage. Cancellation never marks: without transport details the failure
+-- carries no exit blame.
+local function mark_exit_transport(px, err)
+  if type(err) ~= "table" or err.transport ~= true then return end
+  if is_direct(px) then return end
+  local reason = "network"
+  if type(err.reason) == "string" and err.reason ~= "" then reason = err.reason end
+  mark_exit_limited(px, "server_error", SERVER_ERROR_TTL)
+  llm_router.log("warn", "exit transport failed", { code = "server_error", reason = reason, exit = exit_key(px), event = "transport" })
+end
+
+-- HTTP 5xx answers bind to the exit the same way: mark briefly and move to
+-- the next exit instead of failing the request at once.
+local function mark_exit_server_error(px, status)
+  mark_exit_limited(px, "server_error", SERVER_ERROR_TTL)
+  llm_router.log("warn", "exit server error", { status = status, code = "server_error", exit = exit_key(px), event = "server_error" })
 end
 
 -- Returns (exits, skipped): up to `limit` exits not currently marked, and
@@ -854,6 +877,17 @@ local function map_upstream(resp, model_name, px)
       {
         message = "free tier rejected the request with status " .. tostring(resp.status),
         code = "invalid_request_error",
+        status = resp.status,
+      }
+  end
+  if resp.status == 500 or resp.status == 502 or resp.status == 503 or resp.status == 504 then
+    -- Transient server fault: the exit may be flaky while upstream stays
+    -- healthy. Mark briefly and move to the next exit.
+    mark_exit_server_error(px, resp.status)
+    return "proxy",
+      {
+        message = "free tier returned status " .. tostring(resp.status) .. " on current exit",
+        code = "server_error",
         status = resp.status,
       }
   end
@@ -1393,7 +1427,10 @@ local function fetch_body(client, url, headers, body, model_name, px)
     body = body,
     proxy_url = px.url,
   })
-  if err then return nil, "retry", err end
+  if err then
+    mark_exit_transport(px, err)
+    return nil, "retry", err
+  end
   if resp.status == 200 then return resp.body end
   dump_request(url, headers, body)
   local action, terr = map_upstream(resp, model_name, px)
@@ -1591,6 +1628,7 @@ llm_router.register("opencode-free", {
           end,
         })
         if stream_err then
+          mark_exit_transport(px, stream_err)
           llm_router.log("warn", "stream failed", { code = stream_err.code, status = stream_err.status, reason = stream_err.message, event = "stream_error" })
           last_err = stream_err
           if fatal then return nil, last_err end
@@ -1725,6 +1763,7 @@ llm_router.register("opencode-free", {
           end,
         })
         if stream_err then
+          mark_exit_transport(px, stream_err)
           llm_router.log("warn", "stream failed", { code = stream_err.code, status = stream_err.status, reason = stream_err.message, event = "stream_error" })
           last_err = stream_err
           if fatal then return nil, last_err end
