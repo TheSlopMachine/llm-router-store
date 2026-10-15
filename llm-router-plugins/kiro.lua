@@ -1,6 +1,6 @@
 --- @plugin Kiro AI
 --- @author TheSlopMachine
---- @version 5.2.1
+--- @version 5.2.2
 --- @plugin_api 1.5
 --- @description AWS Kiro models via device login (OAuth2 with proactive refresh)
 --- @allow_host codewhisperer.us-east-1.amazonaws.com
@@ -1017,11 +1017,33 @@ local function do_refresh(data)
   return merged
 end
 
+-- The plugin Lua state keeps a fixed-size value stack, so joining thousands
+-- of response fragments with one table.concat call overflows it. Grouped
+-- joining keeps the live operand count flat for responses of any length.
+local JOIN_GROUP_SIZE = 256
+
+local function join_parts(parts)
+  local count = #parts
+  if count <= JOIN_GROUP_SIZE then return table.concat(parts, "") end
+  local groups = {}
+  local index = 1
+  while index <= count do
+    local stop = math.min(index + JOIN_GROUP_SIZE - 1, count)
+    local pieces = {}
+    for position = index, stop do
+      pieces[#pieces + 1] = parts[position]
+    end
+    groups[#groups + 1] = table.concat(pieces, "")
+    index = stop + 1
+  end
+  return join_parts(groups)
+end
+
 -- Shared unary completion assembly: aggregated Kiro response → OpenAI.
 local function assemble_completion(body, thinking, full_model)
   local state = aggregate_response(body, thinking)
-  local text = table.concat(state.content, "")
-  local reasoning = table.concat(state.reasoning, "")
+  local text = join_parts(state.content)
+  local reasoning = join_parts(state.reasoning)
   local finish = state.finish_reason
   if finish == "" then finish = "stop" end
   if #state.tool_calls > 0 then finish = "tool_calls" end
