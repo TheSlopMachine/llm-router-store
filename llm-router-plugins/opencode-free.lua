@@ -1,6 +1,6 @@
 --- @plugin OpenCode Free
 --- @author TheSlopMachine
---- @version 6.5.7
+--- @version 6.5.8
 --- @plugin_api 1.5
 --- @description OpenAI/Anthropic/Google compatible free provider OpenCode Free (no key required)
 --- @allow_host opencode.ai
@@ -663,11 +663,9 @@ end
 local RL_SCOPE = "exit_limited"
 local RL_TTL = 6 * 3600
 local RL_NS = "6d3c2b0e-8f55-4c0a-9d4e-1b7a5e2f9c31"
+-- Per-fetch width: one pool query returns up to this many candidates, and
+-- the exit iterator yields them one by one before fetching past marked heads.
 local MAX_PROXY_CANDIDATES = 30
--- Exits tried per request. 403 denials are common on shared egress and fail
--- fast, so the budget leaves room for several of them.
-local EXIT_ATTEMPTS = 5
-local MAX_PICK_ROUNDS = 4
 -- A 403 marks the exit for an hour: blocked egress addresses recover sooner
 -- than rate-limited ones.
 local FORBIDDEN_TTL = 3600
@@ -730,57 +728,54 @@ local function mark_exit_server_error(px, status)
   llm_router.log("warn", "exit server error", { status = status, code = "server_error", exit = exit_key(px), event = "server_error" })
 end
 
--- Returns (exits, skipped): up to `limit` exits not currently marked, and
--- how many marked exits were bypassed. The pool searches for live exits and
--- waits for them; the wait deadline is shared by every round of the request.
--- A direct pool or an expired wait degrades to one direct attempt, and the
--- direct leg is never parked.
-local function pick_proxies(ctx, limit)
-  limit = limit or 3
-  -- Unconfigured providers go direct: only an explicit pool selection
-  -- (dashboard proxy switch) routes through pooled exits.
+-- Lazy exit iterator: yields one unmarked exit per call, fetching past
+-- marked pool heads on demand. Returns the next function plus a counts
+-- table carrying skipped. Ends (nil) when the pool is exhausted or the
+-- direct fallback is spent. The pool search waits for live exits on the
+-- first fetch only; later fetches never wait. A direct pool or an expired
+-- wait degrades to one direct attempt, and the direct leg is never parked.
+local function exit_stream(ctx)
   local pool = nil
   if ctx.provider_config and ctx.provider_config.proxy and ctx.provider_config.proxy.pool ~= "" then
     pool = ctx.provider_config.proxy.pool
   end
-  local usable, skipped = {}, 0
-  local seen = {}
-  for _ = 1, MAX_PICK_ROUNDS do
-    -- Ask wider than the attempt budget so marked exits at the head of the
-    -- pool do not starve the fresh ones behind them. Once something usable
-    -- exists, later rounds never wait for more.
-    local opts = {
-      pool = pool,
-      countries = PROXY_COUNTRIES,
-      exclude = seen,
-      limit = MAX_PROXY_CANDIDATES,
-      fallback = "direct",
-    }
-    if #usable > 0 then opts.timeout_ms = 1 end
-    local res = llm_router.proxies.require(opts)
-    if not res then break end
-    if #res.proxies == 0 then
-      -- Direct pool or wait deadline: the direct exit, unless exits are in hand.
-      if #usable == 0 then
-        local direct = {}
-        if exit_limited(direct) then skipped = skipped + 1 else table.insert(usable, direct) end
+  local counts = { skipped = 0 }
+  local seen, pending = {}, {}
+  local fetched, tried_direct = false, false
+  local function next_exit()
+    while true do
+      if #pending > 0 then return table.remove(pending, 1) end
+      local opts = {
+        pool = pool,
+        countries = PROXY_COUNTRIES,
+        exclude = seen,
+        limit = MAX_PROXY_CANDIDATES,
+        fallback = "direct",
+      }
+      if fetched then opts.timeout_ms = 1 end
+      fetched = true
+      local res = llm_router.proxies.require(opts)
+      if not res or #res.proxies == 0 then
+        if tried_direct then return nil end
+        tried_direct = true
+        return {}
       end
-      break
-    end
-    for _, px in ipairs(res.proxies) do
-      table.insert(seen, px.url)
-      if exit_limited(px) then
-        skipped = skipped + 1
-      elseif #usable < limit then
-        table.insert(usable, px)
+      local fresh = 0
+      for _, px in ipairs(res.proxies) do
+        table.insert(seen, px.url)
+        if exit_limited(px) then
+          counts.skipped = counts.skipped + 1
+        else
+          table.insert(pending, px)
+          fresh = fresh + 1
+        end
+      end
+      if fresh == 0 then
+        llm_router.log("debug", "selecting exits", { usable = 0, skipped = counts.skipped, event = "exits" })
       end
     end
-    if #usable >= limit then break end
   end
-  if skipped > 0 then
-    llm_router.log("debug", "selecting exits", { usable = #usable, skipped = skipped, event = "exits" })
-  end
-  return usable, skipped, #seen
+  return next_exit, counts
 end
 
 -- Terminal error when the attempt loop ends without success. Never fatal:
@@ -1579,23 +1574,12 @@ llm_router.register("opencode-free", {
       }
     )
 
+    local next_exit, exit_counts = exit_stream(ctx)
     local attempted = 0
-    local total_skipped = 0
-    local tried_direct = false
-    -- Drain the pool: re-pick until no unmarked exit remains instead of
-    -- stopping at one fixed budget. Marked exits stay skipped, the direct
-    -- repeat guard ends direct-only runs, and pool exhaustion below ends
-    -- every run with the terminal error.
     while true do
-      local exits, skipped = pick_proxies(ctx, EXIT_ATTEMPTS)
-      total_skipped = total_skipped + skipped
-      if #exits == 0 then break end
-      if #exits == 1 and is_direct(exits[1]) then
-        if tried_direct then break end
-        tried_direct = true
-      end
-      for _, px in ipairs(exits) do
-        attempted = attempted + 1
+      local px = next_exit()
+      if px == nil then break end
+      attempted = attempted + 1
         if endpoint == "/responses" then
           -- Anonymous Responses path: stream upstream like the genuine
           -- client and assemble the event stream into one completion.
@@ -1625,9 +1609,8 @@ llm_router.register("opencode-free", {
           llm_router.log("warn", "request failed", { code = err.code, status = err.status, reason = err.message, event = "http_error" })
           if action == "done" then return nil, err end
         end
-      end
     end
-    return nil, terminal_error(total_skipped, attempted, attempted)
+    return nil, terminal_error(exit_counts.skipped, attempted, attempted)
   end,
 
   complete_stream = function(ctx, request, emit)
@@ -1651,21 +1634,11 @@ llm_router.register("opencode-free", {
     local ses = stable_session(request, model)
     local msg = mint_msg(mint_ms())
 
+    local next_exit, exit_counts = exit_stream(ctx)
     local attempted = 0
-    local total_skipped = 0
-    local tried_direct = false
-    -- Drain the pool: re-pick until no unmarked exit remains instead of
-    -- stopping at one fixed budget. Pool exhaustion below ends every run
-    -- with the terminal error.
     while true do
-      local exits, skipped = pick_proxies(ctx, EXIT_ATTEMPTS)
-      total_skipped = total_skipped + skipped
-      if #exits == 0 then break end
-      if #exits == 1 and is_direct(exits[1]) then
-        if tried_direct then break end
-        tried_direct = true
-      end
-      for _, px in ipairs(exits) do
+      local px = next_exit()
+      if px == nil then break end
       attempted = attempted + 1
       local done = false
       local fatal = false
@@ -1878,9 +1851,8 @@ llm_router.register("opencode-free", {
           return
         end
       end
-      end
     end
-    return nil, terminal_error(total_skipped, attempted, attempted)
+    return nil, terminal_error(exit_counts.skipped, attempted, attempted)
   end,
 
   -- Verified reasoning support the upstream catalog does not advertise.
