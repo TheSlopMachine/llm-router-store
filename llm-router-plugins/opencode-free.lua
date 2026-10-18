@@ -1,6 +1,6 @@
 --- @plugin OpenCode Free
 --- @author TheSlopMachine
---- @version 6.5.8
+--- @version 6.6.0
 --- @plugin_api 1.5
 --- @description OpenAI/Anthropic/Google compatible free provider OpenCode Free (no key required)
 --- @allow_host opencode.ai
@@ -8,201 +8,216 @@
 --- @allow_host registry.npmjs.org
 --- @allow_host raw.githubusercontent.com
 
+-- The free tier only serves the genuine CLI, so every fingerprint-critical
+-- byte (version, system prompt head, tool descriptions, ids) is reproduced
+-- from upstream sources. Sandbox state is fresh per call: module-level
+-- locals are per-request, anything that must outlive a request lives in
+-- llm_router.storage.
+
 -- Base path follows the model catalog (opencode.api): /zen/v1 now answers
 -- FreeTierError, the live path is /inference/v1.
 local BASE_URL = "https://opencode.ai/inference/v1"
 local MODELS_DEV_URL = "https://models.opencode.ai/api.json"
 local NPM_VERSION_URL = "https://registry.npmjs.org/opencode-ai/latest"
+-- Prompt and tool-description bytes are pinned to the release tag matching
+-- the impersonated CLI version: the dev branch restructured into v2
+-- (packages/cli, new system prompt) while released 1.18.x clients still send
+-- the v1 shapes, so dev bytes would mismatch the UA. No branch fallback:
+-- fail closed instead.
 local RAW_BASE = "https://raw.githubusercontent.com/anomalyco/opencode/"
--- Prompt bytes are pinned to the release tag matching the impersonated CLI
--- version: the dev branch restructured into v2 (packages/cli, new system
--- prompt) while released 1.18.x clients still send the v1 shapes, so dev
--- bytes would mismatch the UA. No branch fallback: fail closed instead.
 
--- Protocol families first: muse-spark/gpt/grok serve /responses even for
--- their -free variants. Remaining -free models are chat-protocol.
-local function endpoint_for_model(model)
-  local m = model:lower()
-  if m:match("^gpt%-") or m:match("muse%-spark") or m:match("^grok%-") then return "/responses" end
-  return "/chat/completions"
-end
+-- The free-tier gate answers 401/403 with this text to anything that does
+-- not look like the genuine client.
+local FINGERPRINT_MARKER = "only be used from within OpenCode"
+
+-- Generations over large contexts run long; the wide timeout only bounds
+-- dead connections, progress streams underneath it.
+local GENERATION_TIMEOUT_MS = 300000
 
 -- Free-tier models think inside the output budget, including chat-protocol
 -- models with no reasoning flag. Requests below the floor starve the text
 -- (reasoning consumes the whole budget), so the floor applies to every
 -- model, explicit caller budgets included.
 local MIN_OUTPUT_TOKENS = 512
+local DEFAULT_OUTPUT_TOKENS = 32000
 
-local function debug_json(value)
+-- Router log values truncate at 2048 characters; dumps cap just below so the
+-- truncation marker (with the original size) survives.
+local DUMP_CAP = 1900
+
+-- Upstream verdicts on one attempt: try the next exit or return the error.
+local NEXT = "next"
+local STOP = "stop"
+
+-- Terminal error table in the router's error contract.
+local function fault(message, code, status)
+  return { message = message, code = code, status = status }
+end
+
+---------------------------------------------------------------------------
+-- Storage and JSON helpers
+---------------------------------------------------------------------------
+
+-- Storage is a cache layer, never a correctness dependency: a faulting read
+-- is a miss and a faulting write is skipped. Both are logged.
+local function storage_call(operation, scope, ...)
+  local ok, result = pcall(llm_router.storage[operation], scope, ...)
+  if ok then return result end
+  llm_router.log("warn", "storage operation failed", { operation = operation, reason = tostring(result) })
+  return nil
+end
+
+local function store_get(scope, key) return storage_call("get", scope, key) end
+local function store_set(scope, key, value, ttl) storage_call("set", scope, key, value, { ttl = ttl }) end
+local function store_delete(scope, key) storage_call("delete", scope, key) end
+
+-- Diagnostics only: never feeds a wire body or a key.
+local function log_json(value)
   local ok, encoded = pcall(json.encode, value)
   if ok and type(encoded) == "string" then return encoded end
-  return "<json.encode failed: " .. tostring(encoded) .. ">"
+  return "<unencodable>"
 end
 
--- Serializes an upstream payload. Empty Lua tables encode as JSON objects,
--- but reasoning items require a real empty array: the validator rejects
--- `"summary":{}` and the fingerprint gate rejects a missing summary key,
--- so only the exact `"summary":[]` bytes pass. The substitution is scoped
--- to that literal; no other emitted shape uses a summary key.
+local function encode_json(value, what)
+  local ok, encoded = pcall(json.encode, value)
+  if ok and type(encoded) == "string" then return encoded end
+  return nil, fault("request " .. what .. " cannot be serialized", "invalid_request_error", 400)
+end
+
+-- Empty Lua tables encode as JSON objects, but the upstream validator needs
+-- real empty arrays (reasoning `summary`, tool `required`). Payloads carry
+-- this sentinel string where an empty array belongs, and the serialized body
+-- swaps exactly the quoted sentinel token. User text cannot collide: quotes
+-- inside JSON strings are escaped, so a whole quoted token never appears.
+local WIRE_EMPTY_ARRAY = "__wire_empty_array__"
+
 local function wire_body(payload)
-  local body = debug_json(payload)
-  return body:gsub('"summary":{}', '"summary":[]')
+  local body, err = encode_json(payload, "payload")
+  if body == nil then return nil, err end
+  return (body:gsub('"' .. WIRE_EMPTY_ARRAY .. '"', "[]"))
 end
 
--- Request/response dumps route straight to the structured router log.
--- Bodies cap at 128KB with a marker before the 2048-char key truncation.
-local DUMP_CAP = 131072
-local function dump_capped(s)
-  s = tostring(s or "")
+-- Router-bound values need a table that serializes as an empty array.
+local function empty_array() return json.decode("[]") end
+
+local function capped(value)
+  local s = tostring(value or "")
   if #s > DUMP_CAP then return s:sub(1, DUMP_CAP) .. "\n[TRUNCATED total=" .. tostring(#s) .. "]" end
   return s
 end
 
 local function redacted_headers(headers)
   local copy = {}
-  for k, v in pairs(headers or {}) do
+  for k, v in pairs(headers) do
     if tostring(k):lower() == "authorization" then
       copy[k] = "{redacted}"
     else
       copy[k] = v
     end
   end
-  return debug_json(copy)
+  return log_json(copy)
 end
 
-local function dump_request(url, headers, body)
-  llm_router.log(
-    "debug",
-    "request dump",
-    { method = "POST", url = tostring(url), headers = redacted_headers(headers), body = dump_capped(body), event = "request_dump" }
-  )
+local function dump_request(job)
+  llm_router.log("debug", "request dump", {
+    endpoint = job.protocol.path,
+    headers = redacted_headers(job.headers),
+    body = capped(job.body),
+    event = "request_dump",
+  })
 end
 
 local function dump_response(resp, model_name)
-  local status = 0
-  local body = ""
   local headers = ""
-  if type(resp) == "table" then
-    status = resp.status or 0
-    body = dump_capped(resp.body)
-    if type(resp.headers) == "table" then headers = debug_json(resp.headers) end
-  end
-  llm_router.log(
-    "debug",
-    "response dump",
-    { model = tostring(model_name), status = status, headers = headers, body = body, event = "response_dump" }
-  )
+  if type(resp.headers) == "table" then headers = log_json(resp.headers) end
+  llm_router.log("debug", "response dump", {
+    model = model_name,
+    status = resp.status,
+    headers = headers,
+    body = capped(resp.body),
+    event = "response_dump",
+  })
 end
 
-local function tool_name(t)
-  if type(t) ~= "table" then return "" end
-  if type(t["function"]) == "table" and type(t["function"].name) == "string" then return t["function"].name end
-  if type(t.name) == "string" then return t.name end
-  return ""
-end
+---------------------------------------------------------------------------
+-- Remote text: CLI version, prompt heads, tool descriptions
+---------------------------------------------------------------------------
 
-local function normalize_tools(tools)
-  local out = {}
-  if type(tools) ~= "table" then return out end
-
-  local function add_tool(t)
-    if type(t) == "table" then table.insert(out, t) end
-  end
-
-  local has_array_items = false
-  for i = 1, #tools do
-    has_array_items = true
-    add_tool(tools[i])
-  end
-  if has_array_items then return out end
-
-  local looks_like_single_tool = type(tools.name) == "string"
-    or (type(tools["function"]) == "table" and type(tools["function"].name) == "string")
-    or type(tools.input_schema) == "table"
-  if looks_like_single_tool then
-    add_tool(tools)
-    return out
-  end
-
-  -- Map-shaped input iterates in undefined order. Sort by name so the
-  -- upstream tool list is stable.
-  for _, value in pairs(tools) do
-    add_tool(value)
-  end
-  table.sort(out, function(a, b) return tool_name(a) < tool_name(b) end)
-  return out
-end
-
-local function output_token_budget(request)
-  local value = tonumber(request.max_completion_tokens)
-  if value == nil or value <= 0 then value = tonumber(request.max_tokens) end
-  if value == nil or value <= 0 then return 32000 end
-  if value < MIN_OUTPUT_TOKENS then return MIN_OUTPUT_TOKENS end
-  return value
-end
-
--- Remote text cache: every fingerprint-critical byte (CLI version, prompt
--- heads, tool descriptions) arrives over the wire and refreshes on TTL.
--- Fetch failures serve last-cached bytes; prompt callers fail closed when
--- nothing is cached, since a wrong fingerprint is worse than an error.
 local TEXT_CACHE_SCOPE = "remote_text"
 
-local function fetch_text_cached(url, cache_key, ttl)
-  local ok, cached = pcall(llm_router.storage.get, TEXT_CACHE_SCOPE, cache_key)
-  if ok and type(cached) == "string" and cached ~= "" then return cached end
+local function http_get_text(url)
   local client = llm_router.http_client({ timeout_ms = 30000 })
   local resp, err = client:request({ method = "GET", url = url, headers = {} })
-  if err or resp == nil or resp.status ~= 200 or type(resp.body) ~= "string" or resp.body == "" then
+  if err ~= nil or resp.status ~= 200 or type(resp.body) ~= "string" or resp.body == "" then
+    llm_router.log("warn", "remote text fetch failed", {
+      detail = url,
+      status = resp and resp.status,
+      reason = err and err.message,
+    })
     return nil
   end
-  pcall(llm_router.storage.set, TEXT_CACHE_SCOPE, cache_key, resp.body, { ttl = ttl })
   return resp.body
 end
 
 -- CLI version for the User-Agent, from the npm registry metadata the
--- official upgrade path prefers over the rate-limited GitHub API.
--- Verified live: /latest answers {"version": "1.18.35", ...} with no auth.
+-- official upgrade path prefers over the rate-limited GitHub API:
+-- /latest answers {"version": "1.18.35", ...} with no auth. The fresh copy
+-- refreshes daily; the last known copy outlives it so a registry outage does
+-- not stop traffic. With neither, the request fails closed: a guessed
+-- version would put a wrong fingerprint on the wire.
 local VERSION_TTL = 86400
-local VERSION_FALLBACK = "1.18.35"
+local VERSION_LAST_KNOWN_TTL = 30 * 86400
+
+local function valid_version(value)
+  return type(value) == "string" and value:match("^%d+%.%d+%.%d+$") ~= nil
+end
 
 local function opencode_version()
-  local body = fetch_text_cached(NPM_VERSION_URL, "npm_version", VERSION_TTL)
-  if type(body) == "string" and body ~= "" then
+  local fresh = store_get(TEXT_CACHE_SCOPE, "cli_version")
+  if valid_version(fresh) then return fresh end
+  local body = http_get_text(NPM_VERSION_URL)
+  if body ~= nil then
     local ok, parsed = pcall(json.decode, body)
-    if ok and type(parsed) == "table" and type(parsed.version) == "string" and parsed.version ~= "" then
+    if ok and type(parsed) == "table" and valid_version(parsed.version) then
+      store_set(TEXT_CACHE_SCOPE, "cli_version", parsed.version, VERSION_TTL)
+      store_set(TEXT_CACHE_SCOPE, "cli_version_last", parsed.version, VERSION_LAST_KNOWN_TTL)
       return parsed.version
     end
   end
-  return VERSION_FALLBACK
-end
-
--- 1.19.0 sends the short form with no provider suffix.
-local function user_agent(endpoint)
-  return "opencode/" .. opencode_version()
-end
-
-local function catalog_ua() return "opencode/latest/" .. opencode_version() .. "/cli" end
-
--- Prompt heads fetched from the opencode repository (dev branch first, main
--- as fallback). SystemPrompt.provider owns the family mapping; the same
--- text serves both protocols, only the role wrapper differs.
-local PROMPT_TTL = 86400
-local PROMPT_DIR = "packages/opencode/src/session/prompt/"
-
-local function fetch_repo_text(path, cache_key)
-  local versioned_key = opencode_version() .. ":" .. cache_key
-  local ok, cached = pcall(llm_router.storage.get, TEXT_CACHE_SCOPE, versioned_key)
-  if ok and type(cached) == "string" and cached ~= "" then return cached end
-  local body = fetch_text_cached(RAW_BASE .. "v" .. opencode_version() .. "/" .. path, versioned_key, PROMPT_TTL)
-  if type(body) == "string" and body ~= "" then
-    return body
+  local last = store_get(TEXT_CACHE_SCOPE, "cli_version_last")
+  if valid_version(last) then
+    llm_router.log("warn", "serving last known client version")
+    return last
   end
-  if ok and type(cached) == "string" then return cached end
-  return nil
+  return nil, fault("opencode client version unavailable", "server_error", 502)
 end
 
-local function prompt_file_for_model(model)
-  local m = model:lower()
+local function user_agent(version) return "opencode/" .. version end
+
+local function catalog_user_agent(version) return "opencode/latest/" .. version .. "/cli" end
+
+-- Repo text is pinned to a release tag, so the bytes behind a version key
+-- never change: the TTL only bounds how long unused versions linger. A fetch
+-- failure with a cold cache fails closed, since a wrong fingerprint is worse
+-- than an error.
+local REPO_TEXT_TTL = 7 * 86400
+local PROMPT_DIR = "packages/opencode/src/session/prompt/"
+local TOOL_DESC_DIR = "packages/opencode/src/tool/"
+
+local function fetch_repo_text(version, path)
+  local key = version .. ":" .. path
+  local cached = store_get(TEXT_CACHE_SCOPE, key)
+  if type(cached) == "string" and cached ~= "" then return cached end
+  local body = http_get_text(RAW_BASE .. "v" .. version .. "/" .. path)
+  if body == nil then return nil end
+  store_set(TEXT_CACHE_SCOPE, key, body, REPO_TEXT_TTL)
+  return body
+end
+
+-- SystemPrompt.provider owns the family mapping; the same text serves both
+-- protocols, only the role wrapper differs.
+local function prompt_file_for_model(model_name)
+  local m = model_name:lower()
   if m:find("muse", 1, true) then return "meta.txt", true end
   if m:find("gpt-4", 1, true) or m:find("o1", 1, true) or m:find("o3", 1, true) then return "beast.txt", false end
   if m:find("gpt", 1, true) then
@@ -219,25 +234,95 @@ end
 
 -- Head text only: the live tail (working directory, skills, MCP
 -- instructions) is machine-specific and unreproducible, so it is omitted.
--- Returns (nil, err) when neither fresh nor cached bytes exist.
-local function agent_prompt(model)
-  local file, is_meta = prompt_file_for_model(model)
-  local head = fetch_repo_text(PROMPT_DIR .. file, "prompt:" .. file)
-  if type(head) ~= "string" or head == "" then
-    return nil, { message = "agent prompt unavailable (" .. file .. ")", code = "server_error", status = 502 }
+local function agent_prompt(version, model_name)
+  local file, is_meta = prompt_file_for_model(model_name)
+  local head = fetch_repo_text(version, PROMPT_DIR .. file)
+  if head == nil then
+    return nil, fault("agent prompt unavailable (" .. file .. ")", "server_error", 502)
   end
   if is_meta then
     local name = "Muse Spark"
-    if model:lower():find("muse-glimmer", 1, true) then name = "Muse Glimmer" end
+    if model_name:lower():find("muse-glimmer", 1, true) then name = "Muse Glimmer" end
     head = head:gsub("{{MODEL_NAME}}", name)
   end
   return head
 end
 
--- Tool description prose fetched from the tool sibling .txt files.
--- Parameter schemas below are structural (TS-annotation-sourced) and pinned
--- against live captures, not prose.
-local TOOL_DESC_DIR = "packages/opencode/src/tool/"
+-- pwsh/win32 render of tool/shell/shell.txt, ported from
+-- tool/shell/prompt.ts (powershellCommandSection + chainGuidance PS branch,
+-- limits 2000 lines / 51200 bytes, 120000ms default timeout).
+-- The tmp path is machine-specific upstream; this value reproduces the
+-- proven Windows-client bytes and is documented, not derived.
+local SHELL_TMP_DIR = "C:\\Users\\Thinker\\AppData\\Local\\Temp\\opencode"
+local SHELL_INTRO = "Executes a given PowerShell (7+) command with optional timeout, ensuring proper handling and security measures."
+
+local SHELL_CHAIN_GUIDANCE = "If the commands depend on each other and must run sequentially, use a single bash tool call with '&&' to chain them together (e.g., `git add . && git commit -m \"message\" && git push`). For instance, if one operation must complete before another starts (like New-Item before Copy-Item, Write before bash for git operations, or git add before git commit), run these operations sequentially instead."
+local SHELL_NOTES = "# PowerShell (7+) shell notes\n"
+  .. "- This cross-platform shell supports pipeline chain operators (`&&` and `||`).\n"
+  .. "- Use double quotes for interpolated strings (`\"Hello $name\"`), single quotes for verbatim strings.\n"
+  .. "- Prefer full cmdlet names like `Get-ChildItem`, `Set-Content`, `Remove-Item`, and `New-Item` over aliases.\n"
+  .. "- Use `$(...)` for subexpressions. Use `@(...)` for array expressions.\n"
+  .. "- To call a native executable whose path contains spaces, use the call operator: `& \"path/to/exe\" args`.\n"
+  .. "- Escape special characters with the PowerShell backtick character."
+local SHELL_COMMAND_SECTION = SHELL_NOTES
+  .. "\n\nBefore executing the command, please follow these steps:\n\n"
+  .. "1. Directory Verification:\n"
+  .. "   - If the command will create new directories or files, first use `Test-Path -LiteralPath <parent>` to verify the parent directory exists and is the correct location\n"
+  .. "   - For example, before creating `foo\\bar`, first use `Test-Path -LiteralPath \"foo\"` to check that `foo` exists and is the intended parent directory\n"
+  .. "\n2. Command Execution:\n"
+  .. "   - Always quote file paths that contain spaces with double quotes (e.g., Remove-Item -LiteralPath \"path with spaces\\file.txt\")\n"
+  .. "   - Examples of proper quoting:\n"
+  .. "     - New-Item -ItemType Directory -Path \"My Documents\" (correct)\n"
+  .. "     - New-Item -ItemType Directory -Path My Documents (incorrect - path is split)\n"
+  .. "     - & \"path with spaces\\script.ps1\" (correct)\n"
+  .. "     - path with spaces\\script.ps1 (incorrect - path is split and not invoked)\n"
+  .. "   - After ensuring proper quoting, execute the command.\n"
+  .. "   - Capture the output of the command.\n"
+  .. "\nUsage notes:\n"
+  .. "   - The command argument is required.\n"
+  .. "   - You can specify an optional timeout in milliseconds. If not specified, commands will time out after 120000ms.\n"
+  .. "   - If the output exceeds 2000 lines or 51200 bytes, it will be truncated and the full output will be written to a file. You can use Read with offset/limit to read specific sections or Grep to search the full content. Do NOT use `Select-Object -First`, `Select-Object -Last`, or other truncation commands to limit output; the full output will already be captured to a file for more precise searching.\n"
+  .. "\n   - Avoid using Shell with PowerShell file/content cmdlets unless explicitly instructed or when these cmdlets are truly necessary for the task. Instead, always prefer using the dedicated tools for these commands:\n"
+  .. "     - File search: Use Glob (NOT Get-ChildItem)\n"
+  .. "     - Content search: Use Grep (NOT Select-String)\n"
+  .. "     - Read files: Use Read (NOT Get-Content)\n"
+  .. "     - Edit files: Use Edit (NOT Set-Content)\n"
+  .. "     - Write files: Use Write (NOT Set-Content/Out-File or here-strings)\n"
+  .. "     - Communication: Output text directly (NOT Write-Output/Write-Host)\n"
+  .. "   - When issuing multiple commands:\n"
+  .. "     - If the commands are independent and can run in parallel, make multiple bash tool calls in a single message. For example, if you need to run \"git status\" and \"git diff\", send a single message with two bash tool calls in parallel.\n"
+  .. "     - "
+  .. SHELL_CHAIN_GUIDANCE
+  .. "\n     - Use `;` only when you need to run commands sequentially but don't care if earlier commands fail\n"
+  .. "     - DO NOT use newlines to separate commands (newlines are ok in quoted strings)\n"
+  .. "   - AVOID changing directories inside the command. Use the `workdir` parameter to change directories instead.\n"
+  .. "     <good-example>\n"
+  .. "     Use workdir=\"project\\subdir\" with command: pytest tests\n"
+  .. "     </good-example>\n"
+  .. "     <bad-example>\n"
+  .. "     Set-Location -LiteralPath \"project\\subdir\" && pytest tests\n"
+  .. "     </bad-example>"
+local SHELL_WORKDIR_SECTION = "All commands run in the current working directory by default. Use the `workdir` parameter if you need to run a command in a different directory. AVOID changing directories inside the command - use `workdir` instead."
+
+local function shell_description(version)
+  local template = fetch_repo_text(version, TOOL_DESC_DIR .. "shell/shell.txt")
+  if template == nil then return nil end
+  local values = {
+    intro = SHELL_INTRO,
+    os = "win32",
+    shell = "pwsh",
+    tmp = SHELL_TMP_DIR,
+    workdirSection = SHELL_WORKDIR_SECTION,
+    commandSection = SHELL_COMMAND_SECTION,
+  }
+  -- Single pass with a function replacement: substituted text is never
+  -- rescanned and `%` in it needs no escaping. Unknown placeholders stay.
+  return (template:gsub("%${(%w+)}", function(name) return values[name] end))
+end
+
+-- Tool description prose comes from the tool sibling .txt files. Parameter
+-- schemas below are structural (TS-annotation-sourced) and pinned against
+-- live captures, not prose.
 local TOOL_DESC_FILES = {
   read = "read.txt",
   write = "write.txt",
@@ -246,249 +331,190 @@ local TOOL_DESC_FILES = {
   grep = "grep.txt",
 }
 
-local function tool_description(name)
-  local file = TOOL_DESC_FILES[name]
-  if file == nil then return nil end
-  return fetch_repo_text(TOOL_DESC_DIR .. file, "tooldesc:" .. name)
-end
-
--- pwsh/win32 render of tool/shell/shell.txt, ported from
--- tool/shell/prompt.ts (powershellCommandSection + chainGuidance PS branch,
--- limits 2000 lines / 51200 bytes, 120000ms default timeout).
--- The tmp path is machine-specific upstream; the fallback preserves the
--- proven Windows-client bytes and is documented, not derived.
-local SHELL_TMP_FALLBACK = "C:\\Users\\Thinker\\AppData\\Local\\Temp\\opencode"
-
-local function shell_description()
-  local template = fetch_repo_text(TOOL_DESC_DIR .. "shell/shell.txt", "tooldesc:shell-template")
-  if type(template) ~= "string" or template == "" then return nil end
-  local chain = "If the commands depend on each other and must run sequentially, use a single bash tool call with '&&' to chain them together (e.g., `git add . && git commit -m \"message\" && git push`). For instance, if one operation must complete before another starts (like New-Item before Copy-Item, Write before bash for git operations, or git add before git commit), run these operations sequentially instead."
-  local notes = "# PowerShell (7+) shell notes\n"
-    .. "- This cross-platform shell supports pipeline chain operators (`&&` and `||`).\n"
-    .. "- Use double quotes for interpolated strings (`\"Hello $name\"`), single quotes for verbatim strings.\n"
-    .. "- Prefer full cmdlet names like `Get-ChildItem`, `Set-Content`, `Remove-Item`, and `New-Item` over aliases.\n"
-    .. "- Use `$(...)` for subexpressions. Use `@(...)` for array expressions.\n"
-    .. "- To call a native executable whose path contains spaces, use the call operator: `& \"path/to/exe\" args`.\n"
-    .. "- Escape special characters with the PowerShell backtick character."
-  local command_section = notes
-    .. "\n\nBefore executing the command, please follow these steps:\n\n"
-    .. "1. Directory Verification:\n"
-    .. "   - If the command will create new directories or files, first use `Test-Path -LiteralPath <parent>` to verify the parent directory exists and is the correct location\n"
-    .. "   - For example, before creating `foo\\bar`, first use `Test-Path -LiteralPath \"foo\"` to check that `foo` exists and is the intended parent directory\n"
-    .. "\n2. Command Execution:\n"
-    .. "   - Always quote file paths that contain spaces with double quotes (e.g., Remove-Item -LiteralPath \"path with spaces\\file.txt\")\n"
-    .. "   - Examples of proper quoting:\n"
-    .. "     - New-Item -ItemType Directory -Path \"My Documents\" (correct)\n"
-    .. "     - New-Item -ItemType Directory -Path My Documents (incorrect - path is split)\n"
-    .. "     - & \"path with spaces\\script.ps1\" (correct)\n"
-    .. "     - path with spaces\\script.ps1 (incorrect - path is split and not invoked)\n"
-    .. "   - After ensuring proper quoting, execute the command.\n"
-    .. "   - Capture the output of the command.\n"
-    .. "\nUsage notes:\n"
-    .. "   - The command argument is required.\n"
-    .. "   - You can specify an optional timeout in milliseconds. If not specified, commands will time out after 120000ms.\n"
-    .. "   - If the output exceeds 2000 lines or 51200 bytes, it will be truncated and the full output will be written to a file. You can use Read with offset/limit to read specific sections or Grep to search the full content. Do NOT use `Select-Object -First`, `Select-Object -Last`, or other truncation commands to limit output; the full output will already be captured to a file for more precise searching.\n"
-    .. "\n   - Avoid using Shell with PowerShell file/content cmdlets unless explicitly instructed or when these cmdlets are truly necessary for the task. Instead, always prefer using the dedicated tools for these commands:\n"
-    .. "     - File search: Use Glob (NOT Get-ChildItem)\n"
-    .. "     - Content search: Use Grep (NOT Select-String)\n"
-    .. "     - Read files: Use Read (NOT Get-Content)\n"
-    .. "     - Edit files: Use Edit (NOT Set-Content)\n"
-    .. "     - Write files: Use Write (NOT Set-Content/Out-File or here-strings)\n"
-    .. "     - Communication: Output text directly (NOT Write-Output/Write-Host)\n"
-    .. "   - When issuing multiple commands:\n"
-    .. "     - If the commands are independent and can run in parallel, make multiple bash tool calls in a single message. For example, if you need to run \"git status\" and \"git diff\", send a single message with two bash tool calls in parallel.\n"
-    .. "     - "
-    .. chain
-    .. "\n     - Use `;` only when you need to run commands sequentially but don't care if earlier commands fail\n"
-    .. "     - DO NOT use newlines to separate commands (newlines are ok in quoted strings)\n"
-    .. "   - AVOID changing directories inside the command. Use the `workdir` parameter to change directories instead.\n"
-    .. "     <good-example>\n"
-    .. "     Use workdir=\"project\\subdir\" with command: pytest tests\n"
-    .. "     </good-example>\n"
-    .. "     <bad-example>\n"
-    .. "     Set-Location -LiteralPath \"project\\subdir\" && pytest tests\n"
-    .. "     </bad-example>"
-  local workdir_section = "All commands run in the current working directory by default. Use the `workdir` parameter if you need to run a command in a different directory. AVOID changing directories inside the command - use `workdir` instead."
-  local rendered = template
-  rendered = rendered:gsub(
-    "${intro}",
-    "Executes a given PowerShell (7+) command with optional timeout, ensuring proper handling and security measures.",
-    1
-  )
-  rendered = rendered:gsub("${os}", "win32", 1)
-  rendered = rendered:gsub("${shell}", "pwsh", 1)
-  rendered = rendered:gsub("${tmp}", SHELL_TMP_FALLBACK, 1)
-  rendered = rendered:gsub("${workdirSection}", workdir_section, 1)
-  rendered = rendered:gsub("${commandSection}", command_section, 1)
-  return rendered
-end
-
 local SCHEMA_DRAFT = "https://json-schema.org/draft/2020-12/schema"
 local HUGE_INT = 9007199254740991
 
-local function tool_params(name)
-  if name == "bash" then
-    return {
-      ["$schema"] = SCHEMA_DRAFT,
-      type = "object",
-      properties = {
-        command = { type = "string", description = "The command to execute" },
-        timeout = { minimum = -HUGE_INT, exclusiveMinimum = 0, type = "integer", maximum = HUGE_INT },
-        workdir = { type = "string" },
+local TOOL_PARAMS = {
+  bash = {
+    ["$schema"] = SCHEMA_DRAFT,
+    type = "object",
+    properties = {
+      command = { type = "string", description = "The command to execute" },
+      timeout = { minimum = -HUGE_INT, exclusiveMinimum = 0, type = "integer", maximum = HUGE_INT },
+      workdir = { type = "string" },
+    },
+    required = { "command" },
+  },
+  read = {
+    ["$schema"] = SCHEMA_DRAFT,
+    type = "object",
+    properties = {
+      filePath = { type = "string", description = "The absolute path to the file or directory to read" },
+      offset = { minimum = 0, type = "integer", maximum = HUGE_INT },
+      limit = { minimum = 0, type = "integer", maximum = HUGE_INT },
+    },
+    required = { "filePath" },
+  },
+  write = {
+    ["$schema"] = SCHEMA_DRAFT,
+    type = "object",
+    properties = {
+      content = { type = "string", description = "The content to write to the file" },
+      filePath = {
+        type = "string",
+        description = "The absolute path to the file to write (must be absolute, not relative)",
       },
-      required = { "command" },
-    }
-  elseif name == "read" then
-    return {
-      ["$schema"] = SCHEMA_DRAFT,
-      type = "object",
-      properties = {
-        filePath = { type = "string", description = "The absolute path to the file or directory to read" },
-        offset = { minimum = 0, type = "integer", maximum = HUGE_INT },
-        limit = { minimum = 0, type = "integer", maximum = HUGE_INT },
-      },
-      required = { "filePath" },
-    }
-  elseif name == "write" then
-    return {
-      ["$schema"] = SCHEMA_DRAFT,
-      type = "object",
-      properties = {
-        content = { type = "string", description = "The content to write to the file" },
-        filePath = {
-          type = "string",
-          description = "The absolute path to the file to write (must be absolute, not relative)",
-        },
-      },
-      required = { "content", "filePath" },
-    }
-  elseif name == "edit" then
-    return {
-      ["$schema"] = SCHEMA_DRAFT,
-      type = "object",
-      properties = {
-        filePath = { type = "string", description = "The absolute path to the file to modify" },
-        oldString = { type = "string", description = "The text to replace" },
-        newString = { type = "string", description = "The text to replace it with (must be different from oldString)" },
-        replaceAll = { type = "boolean", description = "Replace all occurrences of oldString (default false)" },
-      },
-      required = { "filePath", "oldString", "newString" },
-    }
-  elseif name == "glob" then
-    return {
-      ["$schema"] = SCHEMA_DRAFT,
-      type = "object",
-      properties = {
-        pattern = { type = "string", description = "The glob pattern to match files against" },
-        path = { type = "string", description = "The directory to search in. If not specified, the current working directory will be used. IMPORTANT: Omit this field to use the default directory. DO NOT enter \"undefined\" or \"null\" - simply omit it for the default behavior. Must be a valid directory path if provided." },
-      },
-      required = { "pattern" },
-    }
-  elseif name == "grep" then
-    return {
-      ["$schema"] = SCHEMA_DRAFT,
-      type = "object",
-      properties = {
-        pattern = { type = "string", description = "The regex pattern to search for in file contents" },
-        path = { type = "string", description = "The directory to search in. Defaults to the current working directory." },
-        include = { type = "string", description = 'File pattern to include in the search (e.g. "*.js", "*.{ts,tsx}")' },
-      },
-      required = { "pattern" },
-    }
+    },
+    required = { "content", "filePath" },
+  },
+  edit = {
+    ["$schema"] = SCHEMA_DRAFT,
+    type = "object",
+    properties = {
+      filePath = { type = "string", description = "The absolute path to the file to modify" },
+      oldString = { type = "string", description = "The text to replace" },
+      newString = { type = "string", description = "The text to replace it with (must be different from oldString)" },
+      replaceAll = { type = "boolean", description = "Replace all occurrences of oldString (default false)" },
+    },
+    required = { "filePath", "oldString", "newString" },
+  },
+  glob = {
+    ["$schema"] = SCHEMA_DRAFT,
+    type = "object",
+    properties = {
+      pattern = { type = "string", description = "The glob pattern to match files against" },
+      path = { type = "string", description = "The directory to search in. If not specified, the current working directory will be used. IMPORTANT: Omit this field to use the default directory. DO NOT enter \"undefined\" or \"null\" - simply omit it for the default behavior. Must be a valid directory path if provided." },
+    },
+    required = { "pattern" },
+  },
+  grep = {
+    ["$schema"] = SCHEMA_DRAFT,
+    type = "object",
+    properties = {
+      pattern = { type = "string", description = "The regex pattern to search for in file contents" },
+      path = { type = "string", description = "The directory to search in. Defaults to the current working directory." },
+      include = { type = "string", description = 'File pattern to include in the search (e.g. "*.js", "*.{ts,tsx}")' },
+    },
+    required = { "pattern" },
+  },
+}
+
+---------------------------------------------------------------------------
+-- Tools
+---------------------------------------------------------------------------
+
+local function tool_name(t)
+  local fn = t["function"]
+  if type(fn) == "table" and type(fn.name) == "string" and fn.name ~= "" then return fn.name end
+  if type(t.name) == "string" then return t.name end
+  return ""
+end
+
+-- Tool definitions the caller sent. The router hands over an array.
+local function client_tools(tools)
+  local out = {}
+  if type(tools) == "table" then
+    for _, t in ipairs(tools) do
+      if type(t) == "table" then table.insert(out, t) end
+    end
   end
-  return nil
+  return out
 end
 
 local INJECTED_TOOL_NAMES = { "bash", "read", "write", "edit", "glob", "grep" }
 
--- Genuine main turns always carry tools. When the caller sends none, inject
--- the six built-ins (descriptions fetched, schemas structural). Returns
--- (nil, err) when a description is unavailable.
-local function injected_tools()
+-- Genuine main turns always carry tools: the six built-ins join every
+-- request (descriptions fetched, schemas structural). Returns (nil, err)
+-- when a description is unavailable.
+local function injected_tools(version)
   local out = {}
   for _, name in ipairs(INJECTED_TOOL_NAMES) do
     local desc
     if name == "bash" then
-      desc = shell_description()
+      desc = shell_description(version)
     else
-      desc = tool_description(name)
+      desc = fetch_repo_text(version, TOOL_DESC_DIR .. TOOL_DESC_FILES[name])
     end
-    if type(desc) ~= "string" or desc == "" then
-      return nil, { message = "tool description unavailable (" .. name .. ")", code = "server_error", status = 502 }
+    if desc == nil or desc == "" then
+      return nil, fault("tool description unavailable (" .. name .. ")", "server_error", 502)
     end
     table.insert(out, {
       type = "function",
-      ["function"] = { name = name, description = desc, parameters = tool_params(name) },
+      ["function"] = { name = name, description = desc, parameters = TOOL_PARAMS[name] },
     })
   end
   return out
 end
 
-local function merge_tools(client_tools)
-  local out = json.decode("[]")
-  local seen = {}
-  for _, t in ipairs(normalize_tools(client_tools)) do
-    local name = tool_name(t)
-    if name ~= "" then seen[name] = true end
+-- Client tools first, then every built-in the client did not define itself.
+local function chat_tools(version, request)
+  local out, seen = {}, {}
+  for _, t in ipairs(client_tools(request.tools)) do
+    seen[tool_name(t)] = true
     table.insert(out, t)
   end
-  local injected, err = injected_tools()
-  if injected == nil then return nil, err end
-  for _, t in ipairs(injected) do
-    local name = tool_name(t)
-    if name == "" or not seen[name] then table.insert(out, t) end
+  local builtins, err = injected_tools(version)
+  if builtins == nil then return nil, err end
+  for _, t in ipairs(builtins) do
+    if not seen[tool_name(t)] then table.insert(out, t) end
   end
   return out
 end
 
-local function merge_tools_resp(client_tools)
-  local out = json.decode("[]")
-  local seen = {}
-  for _, t in ipairs(client_tools or {}) do
-    local name = ""
-    if type(t) == "table" then
-      if type(t["function"]) == "table" and type(t["function"].name) == "string" then
-        name = t["function"].name
-      elseif type(t.name) == "string" then
-        name = t.name
-      end
-    end
-    if name ~= "" then seen[name] = true end
-    if type(t) == "table" and type(t.name) == "string" then
-      table.insert(out, t)
-    else
-      table.insert(out, {
-        type = "function",
-        name = name,
-        description = (type(t["function"]) == "table" and t["function"].description) or "",
-        parameters = (type(t["function"]) == "table" and t["function"].parameters)
-          or { type = "object", properties = {}, required = json.decode("[]") },
-      })
+-- Chat- or Responses-shaped definition to a Responses function tool.
+-- Unnamed definitions (hosted tools) have no Responses equivalent.
+local function to_responses_tool(t)
+  local name = tool_name(t)
+  if name == "" then return nil end
+  local fn = type(t["function"]) == "table" and t["function"] or {}
+  local description = fn.description
+  if type(description) ~= "string" or description == "" then description = t.description end
+  local parameters = fn.parameters or t.parameters
+  if parameters == nil then
+    parameters = { type = "object", properties = {}, required = WIRE_EMPTY_ARRAY }
+  end
+  return { type = "function", name = name, description = description or "", parameters = parameters }
+end
+
+local function responses_tools(version, request)
+  local out, seen = {}, {}
+  for _, t in ipairs(client_tools(request.tools)) do
+    local converted = to_responses_tool(t)
+    if converted ~= nil then
+      seen[converted.name] = true
+      table.insert(out, converted)
     end
   end
-  local injected, err = injected_tools()
-  if injected == nil then return nil, err end
-  for _, t in ipairs(injected) do
-    local fn = t["function"] or {}
-    local resp_tool = {
-      type = "function",
-      name = fn.name or "",
-      description = fn.description or "",
-      parameters = fn.parameters or { type = "object", properties = {} },
-    }
-    if resp_tool.name == "" or not seen[resp_tool.name] then table.insert(out, resp_tool) end
+  local builtins, err = injected_tools(version)
+  if builtins == nil then return nil, err end
+  for _, t in ipairs(builtins) do
+    local fn = t["function"]
+    if not seen[fn.name] then
+      table.insert(out, { type = "function", name = fn.name, description = fn.description, parameters = fn.parameters })
+    end
   end
   return out
 end
+
+local function output_token_budget(request)
+  local value = tonumber(request.max_completion_tokens)
+  if value == nil or value <= 0 then value = tonumber(request.max_tokens) end
+  if value == nil or value <= 0 then return DEFAULT_OUTPUT_TOKENS end
+  return math.max(value, MIN_OUTPUT_TOKENS)
+end
+
+---------------------------------------------------------------------------
+-- ULID-shaped ids and anonymous headers
+---------------------------------------------------------------------------
 
 local ULID_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-local HEXD = "0123456789abcdef"
+local HEX_DIGITS = "0123456789abcdef"
 
 local function hex12(n)
   local out = {}
   for i = 12, 1, -1 do
     local d = n % 16
-    out[i] = HEXD:sub(d + 1, d + 1)
+    out[i] = HEX_DIGITS:sub(d + 1, d + 1)
     n = (n - d) / 16
   end
   return table.concat(out)
@@ -500,29 +526,20 @@ local function time_head(descending, ms, counter)
   return hex12(cur)
 end
 
-local function rand_bytes(n)
-  local ok, hex = pcall(llm_router.random_hex, n)
-  if not ok or type(hex) ~= "string" or #hex < n * 2 then
-    error("opencode-free: llm_router.random_hex(" .. tostring(n) .. ") failed")
-  end
-  return hex
-end
-
 local function ulid_tail()
-  local hex = rand_bytes(14)
+  local hex = llm_router.random_hex(14)
   local out = {}
   for i = 1, 14 do
-    local byte = tonumber(hex:sub(i * 2 - 1, i * 2), 16) or 0
-    local c = byte % 62
+    local c = tonumber(hex:sub(i * 2 - 1, i * 2), 16) % 62
     out[i] = ULID_CHARS:sub(c + 1, c + 1)
   end
   return table.concat(out)
 end
 
--- ULID-shaped ids. The time head uses the current second plus a uniform
--- sub-second part, matching the genuine millisecond distribution.
+-- The time head uses the current second plus a uniform sub-second part,
+-- matching the genuine millisecond distribution.
 local function mint_ms()
-  local jitter = tonumber(rand_bytes(2):sub(1, 4), 16) or 0
+  local jitter = tonumber(llm_router.random_hex(2):sub(1, 4), 16)
   return os.time() * 1000 + (jitter % 1000)
 end
 
@@ -530,80 +547,134 @@ local function mint_session(ms) return "ses_" .. time_head(true, ms, 1) .. ulid_
 
 local function mint_msg(ms) return "msg_" .. time_head(false, ms, 2) .. ulid_tail() end
 
--- Session id chained per conversation turn: the lookup key hashes the
--- dialogue prefix without the latest exchange, the store key hashes the
--- full dialogue. Each turn rotates the entry (delete old, store new) under
--- a 10-minute TTL, so one session id follows the conversation. The same
--- id serves as prompt_cache_key verbatim.
-local SESSION_SCOPE = "session_v2"
-local SESSION_TTL = 600
+-- Free tier is anonymous: every request carries Bearer public, the
+-- ULID-shaped session pair, and the run-scoped request id.
+local function opencode_headers(version, ses, msg)
+  return {
+    ["User-Agent"] = user_agent(version),
+    ["Content-Type"] = "application/json",
+    ["Accept"] = "application/json",
+    ["Authorization"] = "Bearer public",
+    ["x-opencode-client"] = "cli",
+    ["x-opencode-project"] = "global",
+    ["x-opencode-session"] = ses,
+    ["x-opencode-session-id"] = ses,
+    ["x-opencode-request"] = msg,
+  }
+end
+
+---------------------------------------------------------------------------
+-- Conversation identity: session id and reasoning blobs
+---------------------------------------------------------------------------
+
+-- Every request carries the full history, so the conversation it continues
+-- is the longest earlier dialogue that is a prefix of its messages. Dialogue
+-- keys chain over the messages: keys[i] identifies messages[1..i] (model
+-- scoped, so identical dialogue on different models never shares state), and
+-- one pass over the history yields every prefix key.
+--
+-- The gap between two requests of one conversation is not fixed: a plain
+-- turn appends an assistant reply plus a user message, a tool round appends
+-- the assistant message plus one result per parallel call. So a lookup scans
+-- prefixes from the longest down instead of assuming a fixed distance.
 local DLG_NS = "9e4f1a2b-3c5d-4e6f-8a9b-0c1d2e3f4a5b"
+-- Messages appended between consecutive requests of one conversation stay far
+-- below this; it only bounds the scan on a miss (forks, compacted history).
+local LOOKBACK = 64
 
-local function dlg_slice(messages, from, to)
-  local out = {}
-  if type(messages) ~= "table" then return out end
-  for index = from, to do
-    if type(messages[index]) == "table" then table.insert(out, messages[index]) end
+local function dialogue_keys(request, model_name)
+  local keys = {}
+  if type(request.messages) ~= "table" then return keys end
+  local chain = model_name
+  for i, message in ipairs(request.messages) do
+    local encoded, err = encode_json(message, "message")
+    if encoded == nil then return nil, err end
+    chain = llm_router.uuid_v5(DLG_NS, chain .. "|" .. encoded)
+    keys[i] = model_name .. "|dlg_" .. chain
   end
-  return out
+  return keys
 end
 
-local function dlg_count(request)
-  if type(request.messages) == "table" then return #request.messages end
-  return 0
-end
+local function is_filled_string(value) return type(value) == "string" and value ~= "" end
 
--- Legacy root key: model plus router partition hash, else model plus raw
--- first-message bytes. Fallback for dialogue hashing only.
-local function conv_key(request, model)
-  if type(request.cache_key) == "string" and request.cache_key ~= "" then
-    return model .. "|" .. request.cache_key
+local function is_filled_array(value) return type(value) == "table" and #value > 0 end
+
+-- Longest prefix length in [newest - LOOKBACK + 1, newest] with an accepted
+-- stored value, plus that value. (nil) when none.
+local function find_prefix(scope, keys, newest, accept)
+  for n = newest, math.max(newest - LOOKBACK + 1, 1), -1 do
+    local value = store_get(scope, keys[n])
+    if accept(value) then return n, value end
   end
-  local first = ""
-  if type(request.messages) == "table" and type(request.messages[1]) == "table" then
-    first = debug_json(request.messages[1]):sub(1, 256)
+  return nil
+end
+
+-- One session id follows a conversation. Each request moves the entry from
+-- the prefix it continued to its own full dialogue (10-minute TTL). A request
+-- identical to a stored dialogue (client retry after an error) keeps the
+-- entry and reuses the id; a fork finds the entry already moved and starts
+-- a new session. The id doubles as prompt_cache_key.
+local SESSION_SCOPE = "session_v3"
+local SESSION_TTL = 600
+
+local function resolve_session(keys)
+  local count = #keys
+  local n, ses = find_prefix(SESSION_SCOPE, keys, count, is_filled_string)
+  if n == nil then
+    ses = mint_session(mint_ms())
+    llm_router.log("debug", "session missed", { messages = count })
+  else
+    if n < count then store_delete(SESSION_SCOPE, keys[n]) end
+    llm_router.log("debug", "session loaded", { messages = count, count = count - n })
   end
-  return model .. "|" .. first
+  if count > 0 then store_set(SESSION_SCOPE, keys[count], ses, SESSION_TTL) end
+  return ses
 end
 
--- Dialogue hash key for messages[from..to], model-scoped so identical
--- dialogue on different models never shares a session. Falls back to the
--- legacy root key when hashing is unavailable.
-local function dlg_key(request, model, from, to)
-  local serial = debug_json(dlg_slice(request.messages, from, to))
-  local ok, id = pcall(llm_router.uuid_v5, DLG_NS, tostring(model) .. "|" .. serial)
-  if ok and type(id) == "string" and id ~= "" then return tostring(model) .. "|dlg_" .. id end
-  return conv_key(request, model)
-end
+-- Reasoning identity persists per conversation (10-minute TTL): each
+-- completed turn stores its reasoning {id, blob} pairs under its own full
+-- dialogue; the next request replays the ones stored under the longest
+-- strict prefix of its history, FIFO with their server-issued ids. Items
+-- without a stored pair are omitted (the validator rejects reconstructed
+-- shells). The request's own dialogue is excluded: a retry must not replay
+-- the blobs of the response it is about to produce.
+local BLOB_SCOPE = "reasoning_blobs_v2"
+local BLOB_TTL = 600
 
-local function dlg_old_key(request, model)
-  local count = dlg_count(request)
-  return dlg_key(request, model, 1, math.max(count - 2, 0))
-end
-
-local function dlg_new_key(request, model)
-  return dlg_key(request, model, 1, dlg_count(request))
-end
-
-local function stable_session(request, model)
-  local old_key = dlg_old_key(request, model)
-  local new_key = dlg_new_key(request, model)
-  local ok, ses = pcall(llm_router.storage.get, SESSION_SCOPE, old_key)
-  if ok and type(ses) == "string" and ses ~= "" then
-    pcall(llm_router.storage.delete, SESSION_SCOPE, old_key)
-    pcall(llm_router.storage.set, SESSION_SCOPE, new_key, ses, { ttl = SESSION_TTL })
-    llm_router.log("debug", "session loaded", { event = "session" })
-    return ses
+local function load_blobs(keys)
+  local n, blobs = find_prefix(BLOB_SCOPE, keys, #keys - 1, is_filled_array)
+  if n == nil then
+    llm_router.log("debug", "reasoning blobs missed", { event = "reasoning_replay" })
+    return {}
   end
-  local fresh = mint_session(mint_ms())
-  pcall(llm_router.storage.set, SESSION_SCOPE, new_key, fresh, { ttl = SESSION_TTL })
-  llm_router.log("debug", "session missed", { event = "session" })
-  return fresh
+  llm_router.log("debug", "reasoning blobs loaded", { count = #blobs, event = "reasoning_replay" })
+  return blobs
 end
+
+local function save_blobs(keys, blobs)
+  local count = #keys
+  if count == 0 or #blobs == 0 then return end
+  store_set(BLOB_SCOPE, keys[count], blobs, BLOB_TTL)
+end
+
+local function reasoning_blobs(response)
+  local blobs = {}
+  if type(response.output) ~= "table" then return blobs end
+  for _, item in ipairs(response.output) do
+    if type(item) == "table" and item.type == "reasoning" and is_filled_string(item.encrypted_content) then
+      table.insert(blobs, { id = item.id, blob = item.encrypted_content })
+    end
+  end
+  return blobs
+end
+
+---------------------------------------------------------------------------
+-- Free-tier identity
+---------------------------------------------------------------------------
 
 -- Free-tier identity: -free suffix or the known keyless set. Unknown
--- non-suffixed ids default to premium (fail-safe). Proven-broken free
--- ids stay listed nowhere: remove them here when upstream heals.
+-- non-suffixed ids default to premium (fail-safe). Proven-broken free ids
+-- stay listed nowhere: remove them here when upstream heals.
 -- 2026-09-30: jev-1.13-free (upstream 502s), deepseek-v4-flash-free and
 -- ling-3.0-flash-fin-free (fatal 400s).
 -- 2026-10-10: exo-free (upstream 410: model removed).
@@ -622,24 +693,394 @@ local function is_free_model(id)
   return KNOWN_FREE[id] == true
 end
 
--- Free tier is anonymous: every request carries Bearer public, the
--- ULID-shaped session pair, and the run-scoped request id.
-local function opencode_headers(endpoint, ses, msg)
+---------------------------------------------------------------------------
+-- Exit selection and rate-limit memory
+---------------------------------------------------------------------------
+
+-- The anonymous tier enforces its quota per exit IP and the limit lifts
+-- after about six hours. A 429 marks the exit in plugin storage with that
+-- TTL; selection skips marked exits, so a limited IP is never retried until
+-- the entry expires. Expired rows read as missing. Storage faults fail open:
+-- an unmarked exit only costs one extra attempt.
+local RL_SCOPE = "exit_limited"
+local RL_TTL = 6 * 3600
+local RL_NS = "6d3c2b0e-8f55-4c0a-9d4e-1b7a5e2f9c31"
+-- A 403 marks the exit for an hour: blocked egress addresses recover sooner
+-- than rate-limited ones.
+local FORBIDDEN_TTL = 3600
+-- A 5xx or transport break marks the exit briefly: flaky egress recovers
+-- faster than blocked or limited addresses.
+local SERVER_ERROR_TTL = 600
+-- Per-fetch width: one pool query returns up to this many candidates, and
+-- the exit iterator yields them one by one before fetching past marked heads.
+local MAX_PROXY_CANDIDATES = 30
+-- Transient upstream faults: the exit may be flaky while upstream stays
+-- healthy.
+local TRANSIENT_STATUS = { [500] = true, [502] = true, [503] = true, [504] = true }
+
+-- The direct connection: no proxy_url.
+local DIRECT_EXIT = {}
+
+local function is_direct(px) return (px.url or "") == "" end
+
+-- Keys hash the proxy URL so embedded credentials never land in storage.
+local function exit_key(px)
+  if is_direct(px) then return "direct" end
+  return llm_router.uuid_v5(RL_NS, px.url)
+end
+
+-- The direct exit is never parked: without a pool it is the only egress, so
+-- parking it blocks every request until the entry expires.
+local function exit_limited(px)
+  if is_direct(px) then return false end
+  return store_get(RL_SCOPE, exit_key(px)) ~= nil
+end
+
+local function mark_exit(px, reason, ttl)
+  if is_direct(px) then return end
+  store_set(RL_SCOPE, exit_key(px), { at = os.time(), reason = reason }, ttl)
+end
+
+-- Transport breaks bind to the exit, not the request. Marks are short so
+-- future selections skip the flaky egress without hiding an upstream-wide
+-- outage. Cancellation never marks: without transport details the failure
+-- carries no exit blame.
+local function mark_exit_transport(px, err)
+  if err.transport ~= true or is_direct(px) then return end
+  mark_exit(px, "server_error", SERVER_ERROR_TTL)
+  llm_router.log("warn", "exit transport failed", {
+    code = "server_error",
+    reason = tostring(err.reason or "network"),
+    exit = exit_key(px),
+  })
+end
+
+-- Lazy exit iterator: yields one unmarked exit per call, fetching past
+-- marked pool heads on demand. Returns the next function plus a counts table
+-- carrying skipped. Ends (nil) when the pool is exhausted or the direct
+-- fallback is spent. The pool search waits for live exits on the first fetch
+-- only; later fetches never wait. A direct pool or an expired wait degrades
+-- to one direct attempt, and the direct leg is never parked. A cancelled
+-- request ends the iteration: cancellation never degrades to a direct hit.
+local function exit_stream(provider_config)
+  local pool = nil
+  if type(provider_config) == "table" and type(provider_config.proxy) == "table" then
+    local configured = provider_config.proxy.pool
+    if type(configured) == "string" and configured ~= "" then pool = configured end
+  end
+  local counts = { skipped = 0 }
+  local seen, pending = {}, {}
+  local first_fetch, finished = true, false
+  local function next_exit()
+    while true do
+      if #pending > 0 then return table.remove(pending, 1) end
+      if finished then return nil end
+      local opts = { pool = pool, exclude = seen, limit = MAX_PROXY_CANDIDATES, fallback = "direct" }
+      if not first_fetch then opts.timeout_ms = 1 end
+      first_fetch = false
+      local res = llm_router.proxies.require(opts)
+      if res == nil then
+        finished = true
+        return nil
+      end
+      if #res.proxies == 0 then
+        finished = true
+        return DIRECT_EXIT
+      end
+      local usable = 0
+      for _, px in ipairs(res.proxies) do
+        table.insert(seen, px.url)
+        if exit_limited(px) then
+          counts.skipped = counts.skipped + 1
+        else
+          table.insert(pending, px)
+          usable = usable + 1
+        end
+      end
+      llm_router.log("debug", "selecting exits", { usable = usable, skipped = counts.skipped, event = "exits" })
+    end
+  end
+  return next_exit, counts
+end
+
+-- Per-request outcome counters for the terminal message.
+local function new_run()
   return {
-    ["User-Agent"] = user_agent(endpoint),
-    ["Content-Type"] = "application/json",
-    ["Accept"] = "application/json",
-    ["Authorization"] = "Bearer public",
-    ["x-opencode-client"] = "cli",
-    ["x-opencode-project"] = "global",
-    ["x-opencode-session"] = ses,
-    ["x-opencode-session-id"] = ses,
-    ["x-opencode-request"] = msg,
+    denied = 0, -- exits answered with 403
+    saw_quota = false, -- any 429 classified as quota
   }
 end
 
--- Plain-text view of a chat message. Content arrives either as a string
--- or as an array of content parts (multimodal/tool messages).
+-- Terminal error when the attempt loop ends without success. Never fatal:
+-- exhaustion always surfaces as a short-retry 429 so clients back off and
+-- retry instead of giving up.
+local RETRY_AFTER_SECONDS = "30"
+
+local function terminal_error(run, exits, attempted)
+  local code = "rate_limit"
+  local what = "free tier rate limited"
+  if run.saw_quota then
+    code = "insufficient_quota"
+    what = "free-tier quota busy"
+  end
+  local why = "tried everything known"
+  if attempted == 0 and exits.skipped > 0 then why = "all known exits parked" end
+  local extra = ""
+  if run.denied > 0 then extra = " (" .. tostring(run.denied) .. " exits denied with 403)" end
+  llm_router.log("error", "exits exhausted", { code = code, attempt = attempted, count = exits.skipped })
+  return {
+    message = what .. ", retry in ~" .. RETRY_AFTER_SECONDS .. " seconds (" .. why .. ")" .. extra,
+    code = code,
+    status = 429,
+    headers = { ["Retry-After"] = RETRY_AFTER_SECONDS },
+  }
+end
+
+---------------------------------------------------------------------------
+-- Upstream error mapping
+---------------------------------------------------------------------------
+
+-- Upstream retry horizon in seconds, or nil. Prefers retry-after-ms, then
+-- retry-after numeric seconds, then the HTTP-date form. Clamped to
+-- [60, 86400]; absent or unparseable headers fall back to RL_TTL.
+-- Header names arrive lowercased from the HTTP client.
+local RETRY_TTL_MIN = 60
+local RETRY_TTL_MAX = 86400
+local HTTP_MONTHS = {
+  jan = 1, feb = 2, mar = 3, apr = 4, may = 5, jun = 6,
+  jul = 7, aug = 8, sep = 9, oct = 10, nov = 11, dec = 12,
+}
+
+local function clamp_ttl(seconds)
+  return math.max(RETRY_TTL_MIN, math.min(RETRY_TTL_MAX, math.floor(seconds)))
+end
+
+local function header_number(headers, key)
+  local raw = headers[key]
+  if type(raw) ~= "string" then return nil end
+  return tonumber(raw:match("^%s*(%d+%.?%d*)%s*$"))
+end
+
+-- Days since 1970-01-01 of a proleptic Gregorian date.
+local function days_from_civil(year, month, day)
+  if month <= 2 then year = year - 1 end
+  local era = math.floor(year / 400)
+  local year_of_era = year - era * 400
+  local day_of_year = math.floor((153 * ((month + 9) % 12) + 2) / 5) + day - 1
+  local day_of_era = year_of_era * 365 + math.floor(year_of_era / 4) - math.floor(year_of_era / 100) + day_of_year
+  return era * 146097 + day_of_era - 719468
+end
+
+-- Epoch seconds of an HTTP-date (always GMT). Computed from the calendar
+-- date, not os.time{...}, which would read the fields in the local zone.
+local function http_date_epoch(raw)
+  if type(raw) ~= "string" then return nil end
+  local day, mon, year, hh, mm, ss = raw:match("^%a+, (%d+) (%a+) (%d+) (%d+):(%d+):(%d+) GMT$")
+  local month = mon and HTTP_MONTHS[mon:lower()]
+  if day == nil or month == nil then return nil end
+  return days_from_civil(tonumber(year), month, tonumber(day)) * 86400
+    + tonumber(hh) * 3600 + tonumber(mm) * 60 + tonumber(ss)
+end
+
+local function retry_ttl_seconds(resp)
+  local headers = {}
+  if type(resp.headers) == "table" then headers = resp.headers end
+  local ms = header_number(headers, "retry-after-ms")
+  if ms ~= nil and ms > 0 then return clamp_ttl(ms / 1000) end
+  local secs = header_number(headers, "retry-after")
+  if secs ~= nil and secs > 0 then return clamp_ttl(secs) end
+  local epoch = http_date_epoch(headers["retry-after"])
+  local now = os.time()
+  if epoch ~= nil and epoch > now then return clamp_ttl(epoch - now) end
+  return nil
+end
+
+local function is_quota_body(body)
+  local lower = body:lower()
+  return lower:find("freeusagelimiterror", 1, true) ~= nil
+    or lower:find("quota", 1, true) ~= nil
+    or lower:find("free usage", 1, true) ~= nil
+end
+
+-- Free-tier mapping. The tier is anonymous and every 429 binds to the exit
+-- IP, quota wording included (the quota limiter answers per IP). The exit is
+-- marked for the upstream retry horizon (6-hour fallback) and the request
+-- moves to the next one; when all exits are limited the terminal 429 reaches
+-- the client. Returns (NEXT, err) to try the next exit or (STOP, err) to
+-- return err at once. Only ever called for non-200 answers.
+local function map_upstream(run, resp, model_name, px)
+  local status = resp.status
+  local body = tostring(resp.body or "")
+  dump_response(resp, model_name)
+  if status == 401 then
+    if body:find(FINGERPRINT_MARKER, 1, true) then
+      return STOP, fault("free tier rejected the client fingerprint", "server_error", 401)
+    end
+    -- Paid models answer 401 without an API key binding on the anonymous
+    -- tier: fail the request, never mark anything.
+    if not is_free_model(model_name) then
+      return STOP, fault("model '" .. model_name .. "' is not available on the free tier", "invalid_request_error", 401)
+    end
+    return STOP, fault("free tier rejected the anonymous credential", "authentication_error", 401)
+  end
+  if status == 426 then
+    return STOP, fault("free-tier client upgrade required", "authentication_error", 426)
+  end
+  if status == 429 then
+    local quota = is_quota_body(body)
+    local ttl = retry_ttl_seconds(resp) or RL_TTL
+    llm_router.log("debug", "exit rate limited", { ttl = ttl, quota = quota, exit = exit_key(px), event = "rate_limit" })
+    mark_exit(px, quota and "quota" or "rate_limit", ttl)
+    if quota then
+      run.saw_quota = true
+      return NEXT, fault("free-tier quota exhausted", "insufficient_quota", 429)
+    end
+    return NEXT, fault("free tier rate limited on current exit", "rate_limit", 429)
+  end
+  if status == 403 then
+    -- Blocked egress address: the exit is at fault, not the request.
+    run.denied = run.denied + 1
+    llm_router.log("warn", "exit forbidden", { exit = exit_key(px), body = body:sub(1, 1000), event = "forbidden" })
+    mark_exit(px, "forbidden", FORBIDDEN_TTL)
+    return NEXT, fault("free tier denied the current exit", "server_error", 403)
+  end
+  if status == 400 or status == 404 or status == 422 then
+    return STOP, fault("free tier rejected the request with status " .. tostring(status), "invalid_request_error", status)
+  end
+  if TRANSIENT_STATUS[status] then
+    mark_exit(px, "server_error", SERVER_ERROR_TTL)
+    llm_router.log("warn", "exit server error", { status = status, code = "server_error", exit = exit_key(px) })
+    return NEXT, fault("free tier returned status " .. tostring(status) .. " on current exit", "server_error", status)
+  end
+  return STOP, fault("free tier returned status " .. tostring(status), "server_error", status)
+end
+
+---------------------------------------------------------------------------
+-- Dynamic model catalog
+---------------------------------------------------------------------------
+
+-- Zen /models supplies the membership whitelist (ids only);
+-- models.opencode.ai/api.json enriches whitelisted ids with limits,
+-- modalities and reasoning flags, and enrichment for ids outside the
+-- whitelist is discarded. Rows cache in plugin storage for a day: a miss or
+-- an expired entry forces a refresh, and any fetch or parse failure serves
+-- an empty list, never stale rows.
+local MODEL_CACHE_SCOPE = "model_catalog"
+local MODEL_CACHE_TTL = 86400
+-- Router-required constants the catalog does not provide, plus the
+-- conservative defaults for whitelisted ids the catalog does not enrich.
+local MODEL_RPM = 60
+local MODEL_TPM = 100000
+local MODEL_RPD = 500
+local MODEL_DEFAULT_CONTEXT_WINDOW = 200000
+local MODEL_DEFAULT_MAX_TOKENS = 32000
+
+local function decode_json_table(text)
+  local ok, value = pcall(json.decode, text)
+  if ok and type(value) == "table" then return value end
+  return nil
+end
+
+local function string_list(value, default)
+  if type(value) ~= "table" then return default end
+  local out = {}
+  for _, item in ipairs(value) do
+    if type(item) == "string" and item ~= "" then table.insert(out, item) end
+  end
+  if #out == 0 then return default end
+  return out
+end
+
+-- One router-shaped row from a whitelisted id plus its enrichment entry
+-- (nil when the catalog lacks the id, which keeps the safe defaults).
+local function build_model_row(name, entry)
+  if type(entry) ~= "table" then entry = {} end
+  local limit = type(entry.limit) == "table" and entry.limit or {}
+  local modalities = type(entry.modalities) == "table" and entry.modalities or {}
+  local context_window = math.floor(tonumber(limit.context) or 0)
+  if context_window <= 0 then context_window = MODEL_DEFAULT_CONTEXT_WINDOW end
+  local max_tokens = math.floor(tonumber(limit.output) or 0)
+  if max_tokens <= 0 then max_tokens = MODEL_DEFAULT_MAX_TOKENS end
+  local row = {
+    name = name,
+    display_name = name,
+    context_window = context_window,
+    max_tokens = max_tokens,
+    rpm = MODEL_RPM,
+    tpm = MODEL_TPM,
+    rpd = MODEL_RPD,
+    supported_parameters = { "tools", "tool_choice", "response_format", "temperature", "top_p", "max_tokens" },
+    input_modalities = string_list(modalities.input, { "text" }),
+    output_modalities = string_list(modalities.output, { "text" }),
+    endpoints = { "chat/completions" },
+  }
+  if entry.reasoning == true then row.reasoning = { default_enabled = true } end
+  return row
+end
+
+-- The catalog fetches are anonymous upstream (UA opencode/latest/<ver>/cli,
+-- no auth or session headers), so they use bare clients, not
+-- opencode_headers. Returns nil on failure (never an empty table: the router
+-- rejects {} but maps nil to an empty model list).
+local function refresh_model_catalog()
+  local version = opencode_version()
+  if version == nil then return nil end
+  local headers = { ["User-Agent"] = catalog_user_agent(version), ["Accept"] = "application/json" }
+  local client = llm_router.http_client({})
+  local resp, err = client:request({ method = "GET", url = BASE_URL .. "/models", headers = headers })
+  if err ~= nil or resp.status ~= 200 then
+    llm_router.log("warn", "model list fetch failed", { status = resp and resp.status, reason = err and err.message })
+    return nil
+  end
+  local parsed = decode_json_table(resp.body)
+  if parsed == nil or type(parsed.data) ~= "table" then return nil end
+  local whitelist = {}
+  for _, m in ipairs(parsed.data) do
+    if type(m) == "table" and is_free_model(m.id) then whitelist[m.id] = true end
+  end
+  local enriched = {}
+  local catalog_client = llm_router.http_client({ timeout_ms = 60000 })
+  local eres, eerr = catalog_client:request({ method = "GET", url = MODELS_DEV_URL, headers = headers })
+  if eerr == nil and eres.status == 200 then
+    local catalog = decode_json_table(eres.body)
+    if catalog ~= nil and type(catalog.opencode) == "table" and type(catalog.opencode.models) == "table" then
+      enriched = catalog.opencode.models
+    end
+  else
+    llm_router.log("warn", "model enrichment fetch failed", { status = eres and eres.status, reason = eerr and eerr.message })
+  end
+  -- Sorted names keep the served catalog deterministic across refreshes.
+  local names = {}
+  for name in pairs(whitelist) do table.insert(names, name) end
+  table.sort(names)
+  local rows = {}
+  for _, name in ipairs(names) do table.insert(rows, build_model_row(name, enriched[name])) end
+  -- An empty refresh stores nothing, so the next call retries instead of
+  -- pinning an empty catalog for the TTL. A failed cache write still serves
+  -- the fresh rows to this caller.
+  if #rows == 0 then return nil end
+  store_set(MODEL_CACHE_SCOPE, "infos", rows, MODEL_CACHE_TTL)
+  return rows
+end
+
+---------------------------------------------------------------------------
+-- Payloads
+---------------------------------------------------------------------------
+
+-- Responses requires call_id values no longer than 64 characters. Native
+-- ids stay when possible; oversized ids shorten deterministically so
+-- function_call and function_call_output references remain identical.
+local CALL_ID_NAMESPACE = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+
+local function normalize_call_id(raw)
+  if #raw <= 64 then return raw end
+  local normalized = "call_" .. llm_router.uuid_v5(CALL_ID_NAMESPACE, raw)
+  llm_router.log("debug", "normalized call id", { from_len = #raw, to_len = #normalized })
+  return normalized
+end
+
+-- Plain-text view of a chat message. Content arrives either as a string or
+-- as an array of content parts (multimodal/tool messages).
 local function message_text(m)
   local content = m.content
   if type(content) == "string" then return content end
@@ -655,830 +1096,574 @@ local function message_text(m)
   return table.concat(parts, "\n")
 end
 
--- Exit-IP rate-limit memory. The anonymous tier enforces its quota per exit
--- IP and the limit lifts after about six hours. A 429 marks the exit in
--- plugin storage with that TTL; selection skips marked exits, so a limited
--- IP is never retried until the entry expires. Expired rows read as missing.
--- Storage faults fail open: an unmarked exit only costs one extra attempt.
-local RL_SCOPE = "exit_limited"
-local RL_TTL = 6 * 3600
-local RL_NS = "6d3c2b0e-8f55-4c0a-9d4e-1b7a5e2f9c31"
--- Per-fetch width: one pool query returns up to this many candidates, and
--- the exit iterator yields them one by one before fetching past marked heads.
-local MAX_PROXY_CANDIDATES = 30
--- A 403 marks the exit for an hour: blocked egress addresses recover sooner
--- than rate-limited ones.
-local FORBIDDEN_TTL = 3600
--- A 5xx or transport break marks the exit briefly: flaky egress recovers
--- faster than blocked or limited addresses.
-local SERVER_ERROR_TTL = 600
--- Country filter for pooled exits. Empty accepts any country.
-local PROXY_COUNTRIES = {}
--- Exits denied with 403 during this request (the plugin state is fresh per
--- request), counted for terminal message flavor.
-local denied = 0
--- Whether any 429 classified as quota (fresh per request, like denied).
-local saw_quota = false
-
--- Keys hash the proxy URL so embedded credentials never land in storage.
--- The empty URL (direct connection) maps to its own fixed key.
-local function exit_key(px)
-  local url = (type(px) == "table" and px.url) or ""
-  if url == "" then return "direct" end
-  local ok, id = pcall(llm_router.uuid_v5, RL_NS, url)
-  if ok and type(id) == "string" and id ~= "" then return id end
-  return url
-end
-
--- The direct exit is never parked: without a pool it is the only egress,
--- so parking it blocks every request until the entry expires.
-local function is_direct(px)
-  local url = (type(px) == "table" and px.url) or ""
-  return url == ""
-end
-
-local function exit_limited(px)
-  if is_direct(px) then return false end
-  local ok, v = pcall(llm_router.storage.get, RL_SCOPE, exit_key(px))
-  return ok and v ~= nil
-end
-
-local function mark_exit_limited(px, reason, ttl)
-  if is_direct(px) then return end
-  pcall(llm_router.storage.set, RL_SCOPE, exit_key(px), { at = os.time(), reason = reason }, { ttl = ttl or RL_TTL })
-end
-
--- Transport breaks bind to the exit, not the request. Marks are short so
--- future selections skip the flaky egress without hiding an upstream-wide
--- outage. Cancellation never marks: without transport details the failure
--- carries no exit blame.
-local function mark_exit_transport(px, err)
-  if type(err) ~= "table" or err.transport ~= true then return end
-  if is_direct(px) then return end
-  local reason = "network"
-  if type(err.reason) == "string" and err.reason ~= "" then reason = err.reason end
-  mark_exit_limited(px, "server_error", SERVER_ERROR_TTL)
-  llm_router.log("warn", "exit transport failed", { code = "server_error", reason = reason, exit = exit_key(px), event = "transport" })
-end
-
--- HTTP 5xx answers bind to the exit the same way: mark briefly and move to
--- the next exit instead of failing the request at once.
-local function mark_exit_server_error(px, status)
-  mark_exit_limited(px, "server_error", SERVER_ERROR_TTL)
-  llm_router.log("warn", "exit server error", { status = status, code = "server_error", exit = exit_key(px), event = "server_error" })
-end
-
--- Lazy exit iterator: yields one unmarked exit per call, fetching past
--- marked pool heads on demand. Returns the next function plus a counts
--- table carrying skipped. Ends (nil) when the pool is exhausted or the
--- direct fallback is spent. The pool search waits for live exits on the
--- first fetch only; later fetches never wait. A direct pool or an expired
--- wait degrades to one direct attempt, and the direct leg is never parked.
-local function exit_stream(ctx)
-  local pool = nil
-  if ctx.provider_config and ctx.provider_config.proxy and ctx.provider_config.proxy.pool ~= "" then
-    pool = ctx.provider_config.proxy.pool
-  end
-  local counts = { skipped = 0 }
-  local seen, pending = {}, {}
-  local fetched, tried_direct = false, false
-  local function next_exit()
-    while true do
-      if #pending > 0 then return table.remove(pending, 1) end
-      local opts = {
-        pool = pool,
-        countries = PROXY_COUNTRIES,
-        exclude = seen,
-        limit = MAX_PROXY_CANDIDATES,
-        fallback = "direct",
-      }
-      if fetched then opts.timeout_ms = 1 end
-      fetched = true
-      local res = llm_router.proxies.require(opts)
-      if not res or #res.proxies == 0 then
-        if tried_direct then return nil end
-        tried_direct = true
-        return {}
-      end
-      local fresh = 0
-      for _, px in ipairs(res.proxies) do
-        table.insert(seen, px.url)
-        if exit_limited(px) then
-          counts.skipped = counts.skipped + 1
-        else
-          table.insert(pending, px)
-          fresh = fresh + 1
-        end
-      end
-      if fresh == 0 then
-        llm_router.log("debug", "selecting exits", { usable = 0, skipped = counts.skipped, event = "exits" })
-      end
-    end
-  end
-  return next_exit, counts
-end
-
--- Terminal error when the attempt loop ends without success. Never fatal:
--- exhaustion always surfaces as a short-retry 429 since the stack cannot
--- emit Retry-After headers from plugins. 3s when known-untried candidates
--- remain (the client retry picks them up); 30s when everything known was
--- tried or is parked.
-local function terminal_error(skipped, attempted, observed)
-  local code = "rate_limit"
-  local what = "free tier rate limited"
-  if saw_quota then
-    code = "insufficient_quota"
-    what = "free-tier quota busy"
-  end
-  local extra = ""
-  if denied > 0 then extra = " (" .. tostring(denied) .. " exits denied with 403)" end
-  local retry_after = "30"
-  local why = "tried everything known"
-  if attempted == 0 and skipped > 0 then
-    why = "all known exits parked"
-  elseif observed > attempted then
-    retry_after = "3"
-    why = "untried exits remain"
-  end
-  return {
-    message = what .. ", retry in ~" .. retry_after .. " seconds (" .. why .. ")" .. extra,
-    code = code,
-    status = 429,
-    headers = { ["retry-after"] = retry_after },
-  }
-end
-
--- Upstream retry horizon in seconds, or nil. Prefers retry-after-ms, then
--- retry-after numeric seconds, then the HTTP-date form. Clamped to
--- [60, 86400]; absent or unparseable headers fall back to RL_TTL.
--- Header names arrive lowercased from the HTTP client.
-local RETRY_TTL_MIN = 60
-local RETRY_TTL_MAX = 86400
-local HTTP_MONTHS = {
-  jan = 1, feb = 2, mar = 3, apr = 4, may = 5, jun = 6,
-  jul = 7, aug = 8, sep = 9, oct = 10, nov = 11, dec = 12,
-}
-
-local function retry_ttl_seconds(resp)
-  local headers = {}
-  if type(resp) == "table" and type(resp.headers) == "table" then headers = resp.headers end
-  local function num(key)
-    local raw = headers[key]
-    if type(raw) ~= "string" or raw == "" then return nil end
-    return tonumber(raw:match("^%s*(.-)%s*$"))
-  end
-  local ms = num("retry-after-ms")
-  if ms ~= nil and ms > 0 then
-    return math.max(RETRY_TTL_MIN, math.min(RETRY_TTL_MAX, math.floor(ms / 1000)))
-  end
-  local secs = num("retry-after")
-  if secs == nil then secs = num("retry_after") end
-  if secs ~= nil and secs > 0 then
-    return math.max(RETRY_TTL_MIN, math.min(RETRY_TTL_MAX, math.floor(secs)))
-  end
-  local raw = headers["retry-after"]
-  if type(raw) == "string" and raw ~= "" then
-    local day, mon, year, hh, mm, ss =
-      raw:match("^%a+, (%d+) (%a+) (%d+) (%d+):(%d+):(%d+) GMT$")
-    local month = mon and HTTP_MONTHS[mon:lower()]
-    if day and month and year then
-      local target = os.time({
-        year = tonumber(year),
-        month = month,
-        day = tonumber(day),
-        hour = tonumber(hh),
-        min = tonumber(mm),
-        sec = tonumber(ss),
-      })
-      if target and target > os.time() then
-        return math.max(RETRY_TTL_MIN, math.min(RETRY_TTL_MAX, target - os.time()))
-      end
-    end
-  end
+-- Reasoning trace of an assistant message: reasoning_content, or the
+-- `reasoning` spelling some upstreams use.
+local function reasoning_text(m)
+  local text = m.reasoning_content
+  if type(text) ~= "string" or text == "" then text = m.reasoning end
+  if type(text) == "string" and text ~= "" then return text end
   return nil
 end
 
--- Free-tier mapping. The tier is anonymous and every 429 binds to the exit
--- IP, quota wording included (the quota limiter answers per IP). The exit
--- is marked for the upstream retry horizon (6-hour fallback) and the
--- request moves to the next one; when all exits are limited the last 429
--- reaches the client. Outcomes: "proxy" tries the next exit, "done"
--- returns the terminal error at once.
-local function map_upstream(resp, model_name, px)
-  local body_str = tostring(resp.body or "")
-  if resp.status ~= 200 then dump_response(resp, model_name) end
-  if resp.status == 401 and body_str:find("only be used from within OpenCode", 1, true) then
-    return "done", { message = "free tier rejected the client fingerprint", code = "server_error", status = 401 }
-  end
-  -- Paid models answer 401 without an API key binding on the anonymous
-  -- tier: fail the request, never mark anything.
-  if resp.status == 401 and not is_free_model(model_name) then
-    return "done",
-      {
-        message = "model '" .. tostring(model_name) .. "' is not available on the free tier",
-        code = "invalid_request_error",
-        status = 401,
-      }
-  end
-  if resp.status == 401 then
-    return "done",
-      { message = "free tier rejected the anonymous credential", code = "authentication_error", status = 401 }
-  end
-  if resp.status == 426 then
-    return "done", { message = "free-tier client upgrade required", code = "authentication_error", status = 426 }
-  end
-  if resp.status == 429 then
-    local lower_body = body_str:lower()
-    local quota = lower_body:find("freeusagelimiterror", 1, true) ~= nil
-      or lower_body:find("quota", 1, true) ~= nil
-      or lower_body:find("free usage", 1, true) ~= nil
-    local ttl = retry_ttl_seconds(resp) or RL_TTL
-    llm_router.log("debug", "exit rate limited", { ttl = ttl, quota = quota, event = "rate_limit" })
-    if quota then saw_quota = true end
-    mark_exit_limited(px, quota and "quota" or "rate_limit", ttl)
-    if quota then
-      return "proxy", { message = "free-tier quota exhausted", code = "insufficient_quota", status = 429 }
-    end
-    return "proxy", { message = "free tier rate limited on current exit", code = "rate_limit", status = 429 }
-  end
-  if resp.status == 403 then
-    -- Blocked egress address: the exit is at fault, not the request. Mark it
-    -- for an hour and move to the next one.
-    denied = denied + 1
-    llm_router.log("warn", "exit forbidden", { exit = exit_key(px), body = body_str:sub(1, 1000), event = "forbidden" })
-    mark_exit_limited(px, "forbidden", FORBIDDEN_TTL)
-    return "proxy", { message = "free tier denied the current exit", code = "server_error", status = 403 }
-  end
-  if resp.status == 400 or resp.status == 404 or resp.status == 422 then
-    return "done",
-      {
-        message = "free tier rejected the request with status " .. tostring(resp.status),
-        code = "invalid_request_error",
-        status = resp.status,
-      }
-  end
-  if resp.status == 500 or resp.status == 502 or resp.status == 503 or resp.status == 504 then
-    -- Transient server fault: the exit may be flaky while upstream stays
-    -- healthy. Mark briefly and move to the next exit.
-    mark_exit_server_error(px, resp.status)
-    return "proxy",
-      {
-        message = "free tier returned status " .. tostring(resp.status) .. " on current exit",
-        code = "server_error",
-        status = resp.status,
-      }
-  end
-  return "done",
-    { message = "free tier returned status " .. tostring(resp.status), code = "server_error", status = resp.status }
-end
-
--- Dynamic model catalog. Zen /models supplies the membership whitelist
--- (ids only); models.opencode.ai/api.json enriches whitelisted ids with
--- limits, modalities and reasoning flags, and enrichment for ids outside
--- the whitelist is discarded. Rows cache in plugin storage for a day: a
--- miss or an expired entry forces a refresh, and any fetch or parse
--- failure serves an empty list, never stale or hardcoded rows.
-local MODEL_CACHE_SCOPE = "model_catalog"
-local MODEL_CACHE_TTL = 86400
--- Router-required constants the catalog does not provide, plus the
--- conservative fallback for whitelisted ids the catalog does not enrich.
-local MODEL_CACHE_RPM = 60
-local MODEL_CACHE_TPM = 100000
-local MODEL_CACHE_RPD = 500
-local MODEL_DEFAULT_CONTEXT_WINDOW = 200000
-local MODEL_DEFAULT_MAX_TOKENS = 32000
-
--- The catalog fetch is anonymous upstream (UA opencode/latest/<ver>/cli,
--- no auth or session headers), so it uses a bare client, not opencode_headers.
-local function string_list(value, fallback)
-  if type(value) ~= "table" then return fallback end
-  local out = {}
-  for i = 1, #value do
-    if type(value[i]) == "string" and value[i] ~= "" then table.insert(out, value[i]) end
-  end
-  if #out == 0 then return fallback end
-  return out
-end
-
--- One router-shaped row from a whitelisted id plus its enrichment entry
--- (nil when the catalog lacks the id, which keeps the safe defaults).
-local function build_model_row(name, entry)
-  local row = { name = name, display_name = name }
-  local limit = {}
-  if type(entry) == "table" and type(entry.limit) == "table" then limit = entry.limit end
-  local context_window = math.floor(tonumber(limit.context) or 0)
-  if context_window <= 0 then context_window = MODEL_DEFAULT_CONTEXT_WINDOW end
-  row.context_window = context_window
-  local max_tokens = math.floor(tonumber(limit.output) or 0)
-  if max_tokens <= 0 then max_tokens = MODEL_DEFAULT_MAX_TOKENS end
-  row.max_tokens = max_tokens
-  row.rpm = MODEL_CACHE_RPM
-  row.tpm = MODEL_CACHE_TPM
-  row.rpd = MODEL_CACHE_RPD
-  row.supported_parameters = { "tools", "tool_choice", "response_format", "temperature", "top_p", "max_tokens" }
-  local modalities = {}
-  if type(entry) == "table" and type(entry.modalities) == "table" then modalities = entry.modalities end
-  row.input_modalities = string_list(modalities.input, { "text" })
-  row.output_modalities = string_list(modalities.output, { "text" })
-  row.endpoints = { "chat/completions" }
-  if type(entry) == "table" and entry.reasoning == true then row.reasoning = { default_enabled = true } end
-  return row
-end
-
-local function refresh_model_catalog()
-  local client = llm_router.http_client({})
-  local resp, err = client:request({
-    method = "GET",
-    url = BASE_URL .. "/models",
-    headers = { ["User-Agent"] = catalog_ua(), ["Accept"] = "application/json" },
-  })
-  if err or resp.status ~= 200 then return nil end
-  local ok, parsed = pcall(json.decode, resp.body)
-  if not ok or not parsed or type(parsed.data) ~= "table" then return nil end
-  local whitelist = {}
-  for _, m in ipairs(parsed.data) do
-    if type(m) == "table" and type(m.id) == "string" and is_free_model(m.id) then whitelist[m.id] = true end
-  end
-  local enriched = {}
-  local catalog_client = llm_router.http_client({ timeout_ms = 60000 })
-  local eres, eerr = catalog_client:request({
-    method = "GET",
-    url = MODELS_DEV_URL,
-    headers = { ["User-Agent"] = catalog_ua(), ["Accept"] = "application/json" },
-  })
-  if not eerr and eres.status == 200 then
-    local ok2, catalog = pcall(json.decode, eres.body)
-    if ok2 and type(catalog) == "table" and type(catalog.opencode) == "table" then
-      if type(catalog.opencode.models) == "table" then enriched = catalog.opencode.models end
-    end
-  end
-  -- Sorted names keep the served catalog deterministic across refreshes.
-  local names = {}
-  for name, _ in pairs(whitelist) do
-    if type(name) == "string" and name ~= "" then table.insert(names, name) end
-  end
-  table.sort(names)
-  local rows = {}
-  for _, name in ipairs(names) do
-    table.insert(rows, build_model_row(name, enriched[name]))
-  end
-  -- An empty refresh stores nothing, so the next call retries instead of
-  -- pinning an empty catalog for the TTL. A failed cache write still
-  -- serves the fresh rows to this caller. Nil (never an empty table: the
-  -- router rejects {} but maps nil to an empty model list) reports failure.
-  if #rows == 0 then return nil end
-  pcall(llm_router.storage.set, MODEL_CACHE_SCOPE, "infos", rows, { ttl = MODEL_CACHE_TTL })
-  return rows
-end
-
--- Responses requires call_id values no longer than 64 characters.
--- Keep native ids when possible; deterministically shorten oversized ids so
--- function_call and function_call_output references remain identical.
-local CALL_ID_NAMESPACE = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
-local function normalize_call_id(raw)
-  if type(raw) ~= "string" or raw == "" then return "call_unknown" end
-  if #raw <= 64 then return raw end
-  local ok, hashed = pcall(llm_router.uuid_v5, CALL_ID_NAMESPACE, raw)
-  if ok and type(hashed) == "string" and hashed ~= "" then
-    local normalized = "call_" .. hashed
-    llm_router.log("debug", "normalized call id", { from_len = #raw, to_len = #normalized })
-    return normalized
-  end
-  local normalized = raw:sub(1, 64)
-  llm_router.log("debug", "truncated call id", { from_len = #raw, to_len = 64 })
-  return normalized
-end
-
--- Reasoning identity persists per conversation (10-minute TTL): each
--- completed turn stores its reasoning {id, blob} pairs; the builder replays
--- them FIFO with their server-issued ids. Items without a stored pair are
--- omitted (the validator rejects reconstructed shells).
-local BLOB_SCOPE = "reasoning_blobs"
-local BLOB_TTL = 600
-
-local function blob_push(request, model, pairs)
-  if #pairs == 0 then return end
-  pcall(llm_router.storage.set, BLOB_SCOPE, dlg_new_key(request, model), pairs, { ttl = BLOB_TTL })
-end
-
-local function blob_take_all(request, model)
-  local ok, pairs = pcall(llm_router.storage.get, BLOB_SCOPE, dlg_old_key(request, model))
-  if ok and type(pairs) == "table" and #pairs > 0 then
-    llm_router.log("debug", "reasoning blobs loaded", { count = #pairs, event = "reasoning_blobs" })
-    return pairs
-  end
-  llm_router.log("debug", "reasoning blobs missed", { event = "reasoning_blobs" })
+local function messages_of(request)
+  if type(request.messages) == "table" then return request.messages end
   return {}
 end
 
-local function collect_pairs(raw)
-  local pairs = {}
-  if type(raw) ~= "table" or type(raw.output) ~= "table" then return pairs end
-  for _, item in ipairs(raw.output) do
-    if
-      type(item) == "table"
-      and item.type == "reasoning"
-      and type(item.encrypted_content) == "string"
-      and item.encrypted_content ~= ""
-    then
-      table.insert(pairs, { id = item.id, blob = item.encrypted_content })
-    end
-  end
-  return pairs
-end
-
--- Build the OpenAI Responses input from chat messages.
-local function build_responses_input(messages, pairs)
+-- Build the OpenAI Responses input from chat messages. Returns (nil, err)
+-- for conversations that cannot be expressed faithfully.
+local function build_responses_input(messages, blobs)
   local input = {}
-  local pair_idx = 1
-  for _, m in ipairs(messages or {}) do
-    local role = m.role
-    if role == "system" then
-      local text = message_text(m)
-      if text ~= "" then table.insert(input, { role = "system", content = text }) end
-    elseif role == "user" then
-      local text = message_text(m)
-      if text ~= "" then table.insert(input, { role = "user", content = { { type = "input_text", text = text } } }) end
-    elseif role == "assistant" then
-      -- Reasoning text round-trips so upstream reuses prior thinking
-      -- instead of re-reasoning every turn. Responses carry no encrypted
-      -- content through the chat protocol, so only the summary reshapes.
-      local rc = m.reasoning_content
-      if type(rc) ~= "string" or rc == "" then rc = m.reasoning end
-      local rc = m.reasoning_content
-      if type(rc) ~= "string" or rc == "" then rc = m.reasoning end
-      if type(rc) == "string" and rc ~= "" then
-        local pair = pairs[pair_idx]
-        pair_idx = pair_idx + 1
-        if type(pair) == "table" and type(pair.blob) == "string" and pair.blob ~= "" then
-          local item = { type = "reasoning", summary = json.decode("[]"), encrypted_content = pair.blob }
-          if type(pair.id) == "string" and pair.id ~= "" then item.id = pair.id end
-          llm_router.log("debug", "replaying reasoning", { reasoning_id = item.id, event = "reasoning_replay" })
-          table.insert(input, item)
+  local next_blob = 1
+  for _, m in ipairs(messages) do
+    if type(m) == "table" then
+      local role = m.role
+      if role == "system" then
+        local text = message_text(m)
+        if text ~= "" then table.insert(input, { role = "system", content = text }) end
+      elseif role == "user" then
+        local text = message_text(m)
+        if text ~= "" then
+          table.insert(input, { role = "user", content = { { type = "input_text", text = text } } })
         end
-      end
-      local text = message_text(m)
-      if text ~= "" then
-        table.insert(input, { role = "assistant", content = { { type = "output_text", text = text } } })
-      end
-      for _, tc in ipairs(m.tool_calls or {}) do
-        local name = tc["function"] and tc["function"].name or ""
-        if name ~= "" then
-          local args = tc["function"].arguments or "{}"
-          if args == "" then args = "{}" end
-          table.insert(
-            input,
-            { type = "function_call", call_id = normalize_call_id(tc.id), name = name, arguments = args }
-          )
+      elseif role == "assistant" then
+        -- Reasoning text round-trips so upstream reuses prior thinking
+        -- instead of re-reasoning every turn. The chat protocol carries no
+        -- encrypted content, so only a stored blob makes an item.
+        if reasoning_text(m) ~= nil then
+          local stored = blobs[next_blob]
+          next_blob = next_blob + 1
+          if type(stored) == "table" and is_filled_string(stored.blob) then
+            local item = { type = "reasoning", summary = WIRE_EMPTY_ARRAY, encrypted_content = stored.blob }
+            if is_filled_string(stored.id) then item.id = stored.id end
+            llm_router.log("debug", "replaying reasoning", { reasoning_id = item.id, event = "reasoning_replay" })
+            table.insert(input, item)
+          end
         end
+        local text = message_text(m)
+        if text ~= "" then
+          table.insert(input, { role = "assistant", content = { { type = "output_text", text = text } } })
+        end
+        if type(m.tool_calls) == "table" then
+          for _, tc in ipairs(m.tool_calls) do
+            local fn = type(tc) == "table" and tc["function"]
+            if type(fn) == "table" and is_filled_string(fn.name) then
+              if not is_filled_string(tc.id) then
+                return nil, fault("assistant tool call without an id", "invalid_request_error", 400)
+              end
+              local args = fn.arguments
+              if not is_filled_string(args) then args = "{}" end
+              table.insert(input, { type = "function_call", call_id = normalize_call_id(tc.id), name = fn.name, arguments = args })
+            end
+          end
+        end
+      elseif role == "tool" then
+        if not is_filled_string(m.tool_call_id) then
+          return nil, fault("tool message without tool_call_id", "invalid_request_error", 400)
+        end
+        table.insert(input, { type = "function_call_output", call_id = normalize_call_id(m.tool_call_id), output = message_text(m) })
       end
-    elseif role == "tool" then
-      table.insert(
-        input,
-        { type = "function_call_output", call_id = normalize_call_id(m.tool_call_id), output = message_text(m) }
-      )
     end
   end
-  if #input == 0 then table.insert(input, { role = "user", content = { { type = "input_text", text = "ping" } } }) end
+  if #input == 0 then
+    return nil, fault("request has no usable messages", "invalid_request_error", 400)
+  end
   return input
 end
 
-local function build_responses_tools(tools)
-  local out = {}
-  for _, t in ipairs(normalize_tools(tools)) do
-    local name = t.name or ""
-    local desc = t.description or ""
-    local params = t.parameters
-    if t["function"] then
-      if t["function"].name and t["function"].name ~= "" then name = t["function"].name end
-      if t["function"].description and t["function"].description ~= "" then desc = t["function"].description end
-      if t["function"].parameters then params = t["function"].parameters end
-    end
-    if name ~= "" then
-      if params == nil then params = { type = "object", properties = {}, required = json.decode("[]") } end
-      table.insert(out, { type = "function", name = name, description = desc, parameters = params })
-    end
-  end
-  return out
-end
+local REASONING_EFFORTS = { minimal = true, low = true, medium = true, high = true, xhigh = true, max = true }
 
 -- Anonymous chat payload in the genuine client's shape: the fetched agent
 -- head leads every turn (no title path), temperature is never sent, tools
--- merge client definitions over the injected built-ins.
-local function build_anon_chat_payload(request, model)
-  local normalized_tools = normalize_tools(request.tools)
-  local head, err = agent_prompt(model)
+-- merge client definitions over the injected built-ins. `c` is the prepared
+-- request context (see prepare_job).
+local function build_chat_payload(c)
+  local head, err = agent_prompt(c.version, c.model_name)
   if head == nil then return nil, err end
   local messages = { { role = "system", content = head } }
-  for _, m in ipairs(request.messages or {}) do
-    table.insert(messages, m)
-  end
+  for _, m in ipairs(messages_of(c.request)) do table.insert(messages, m) end
   local payload = {
-    model = model,
+    model = c.model_name,
     messages = messages,
     stream = true,
     stream_options = { include_usage = true },
+    max_tokens = output_token_budget(c.request),
   }
-  payload.max_tokens = output_token_budget(request)
-  if request.top_p and request.top_p > 0 then payload.top_p = request.top_p end
-  local merged, merr = merge_tools(request.tools)
-  if merged == nil then return nil, merr end
-  if #merged > 0 then
-    payload.tools = merged
-    if request.tool_choice then
-      payload.tool_choice = request.tool_choice
-    else
-      payload.tool_choice = "auto"
-    end
-  end
-  if type(request.response_format) == "table" then payload.response_format = request.response_format end
-  llm_router.log("debug", "built chat payload", { tools = #merged, messages = #messages, event = "payload" })
+  local top_p = tonumber(c.request.top_p)
+  if top_p ~= nil and top_p > 0 then payload.top_p = top_p end
+  local tools, terr = chat_tools(c.version, c.request)
+  if tools == nil then return nil, terr end
+  payload.tools = tools
+  payload.tool_choice = c.request.tool_choice or "auto"
+  if type(c.request.response_format) == "table" then payload.response_format = c.request.response_format end
+  llm_router.log("debug", "built chat payload", { tools = #tools, messages = #messages, event = "payload" })
   return payload
 end
 
--- Anonymous Responses payload. reasoning travels only as caller effort;
--- the title-turn default is gone with the title path. prompt_cache_key is
--- the raw session id; include requests encrypted reasoning blobs.
-local function build_anon_responses_payload(request, model, ses)
-  local normalized_tools = normalize_tools(request.tools)
-  local head, err = agent_prompt(model)
+-- Anonymous Responses payload. Reasoning travels only as caller effort;
+-- prompt_cache_key is the raw session id, as the genuine client sends it;
+-- include requests encrypted reasoning blobs.
+local function build_responses_payload(c)
+  local head, err = agent_prompt(c.version, c.model_name)
   if head == nil then return nil, err end
+  local history, ierr = build_responses_input(messages_of(c.request), load_blobs(c.keys))
+  if history == nil then return nil, ierr end
   local input = { { role = "developer", content = head } }
-  for _, item in ipairs(build_responses_input(request.messages, blob_take_all(request, model))) do
-    table.insert(input, item)
-  end
+  for _, item in ipairs(history) do table.insert(input, item) end
   local payload = {
-    model = model,
+    model = c.model_name,
     input = input,
     stream = true,
+    max_output_tokens = output_token_budget(c.request),
+    store = false,
+    prompt_cache_key = c.ses,
+    include = { "reasoning.encrypted_content" },
   }
-  payload.max_output_tokens = output_token_budget(request)
-  payload.store = false
-  -- Stable partition across turns: the raw session id, as the genuine client sends it.
-  payload.prompt_cache_key = ses
-  payload.include = { "reasoning.encrypted_content" }
-  local effort = request.reasoning_effort
-  if
-    effort == "low"
-    or effort == "medium"
-    or effort == "high"
-    or effort == "xhigh"
-    or effort == "minimal"
-    or effort == "max"
-  then
-    payload.reasoning = { effort = effort, summary = "auto" }
-  end
-  if request.top_p and request.top_p > 0 then payload.top_p = request.top_p end
-  local tools_from_builder = build_responses_tools(normalized_tools)
-  local merged, merr = merge_tools_resp(tools_from_builder)
-  if merged == nil then return nil, merr end
-  if #merged > 0 then
-    payload.tools = merged
-    if request.tool_choice then
-      payload.tool_choice = request.tool_choice
-    else
-      payload.tool_choice = "auto"
-    end
-  end
-  llm_router.log("debug", "built responses payload", { tools = #(payload.tools or {}), input = #input, event = "payload" })
-  local rf = request.response_format
-  if type(rf) == "table" and type(rf.type) == "string" then
+  local effort = c.request.reasoning_effort
+  if REASONING_EFFORTS[effort] then payload.reasoning = { effort = effort, summary = "auto" } end
+  local top_p = tonumber(c.request.top_p)
+  if top_p ~= nil and top_p > 0 then payload.top_p = top_p end
+  local tools, terr = responses_tools(c.version, c.request)
+  if tools == nil then return nil, terr end
+  payload.tools = tools
+  payload.tool_choice = c.request.tool_choice or "auto"
+  llm_router.log("debug", "built responses payload", { tools = #tools, input = #input, event = "payload" })
+  local rf = c.request.response_format
+  if type(rf) == "table" then
     if rf.type == "json_object" then
       payload.text = { format = { type = "json_object" } }
     elseif rf.type == "json_schema" and type(rf.json_schema) == "table" then
-      local fmt = { type = "json_schema", strict = true }
-      if type(rf.json_schema.name) == "string" then fmt.name = rf.json_schema.name end
-      if type(rf.json_schema.schema) == "table" then fmt.schema = rf.json_schema.schema end
-      payload.text = { format = fmt }
+      local format = { type = "json_schema", strict = true }
+      if type(rf.json_schema.name) == "string" then format.name = rf.json_schema.name end
+      if type(rf.json_schema.schema) == "table" then format.schema = rf.json_schema.schema end
+      payload.text = { format = format }
     end
   end
   return payload
 end
 
--- Assemble one chat.completion from a streamed Responses SSE body.
-local function assemble_responses_stream(body, model, request)
-  local text_parts = {}
-  local reasoning_parts = {}
-  local fn_by_index = {}
-  local fn_order = {}
-  local prompt_tokens, completion_tokens, total_tokens = 0, 0, 0
-  local out_model = model
-  local terminal_finish = nil
-  local function fn_slot(index)
-    local acc = fn_by_index[index]
-    if not acc then
-      acc = { call_id = "", name = "", args = {} }
-      fn_by_index[index] = acc
-      table.insert(fn_order, index)
-    end
-    return acc
-  end
-  for line in (body .. "\n"):gmatch("([^\n]*)\n") do
-    if line:sub(1, 6) == "data: " then
-      local data = line:sub(7)
-      if data ~= "[DONE]" and data ~= "" then
-        local ok, ev = pcall(json.decode, data)
-        if ok and type(ev) == "table" and type(ev.type) == "string" then
-          local et = ev.type
-          if et == "response.output_text.delta" and type(ev.delta) == "string" then
-            table.insert(text_parts, ev.delta)
-          elseif et == "response.reasoning_summary_text.delta" and type(ev.delta) == "string" then
-            table.insert(reasoning_parts, ev.delta)
-          elseif
-            (et == "response.output_item.added" or et == "response.output_item.done")
-            and type(ev.item) == "table"
-            and ev.item.type == "function_call"
-          then
-            local acc = fn_slot(ev.output_index or 0)
-            if type(ev.item.call_id) == "string" and ev.item.call_id ~= "" then acc.call_id = ev.item.call_id end
-            if type(ev.item.name) == "string" and ev.item.name ~= "" then acc.name = ev.item.name end
-            if type(ev.item.arguments) == "string" and ev.item.arguments ~= "" then acc.args[1] = ev.item.arguments end
-          elseif et == "response.function_call_arguments.delta" and type(ev.delta) == "string" then
-            local acc_for_delta = fn_slot(ev.output_index or 0)
-            acc_for_delta.args[1] = (acc_for_delta.args[1] or "") .. ev.delta
-          elseif et == "response.function_call_arguments.done" then
-            -- Arguments complete; assembly reads the accumulated buffer.
-          elseif (et == "response.completed" or et == "response.incomplete") and type(ev.response) == "table" then
-            local r = ev.response
-            if type(r.model) == "string" and r.model ~= "" then out_model = r.model end
-            blob_push(request, model, collect_pairs(r))
-            if type(r.usage) == "table" then
-              prompt_tokens = r.usage.input_tokens or 0
-              completion_tokens = r.usage.output_tokens or 0
-              total_tokens = r.usage.total_tokens or (prompt_tokens + completion_tokens)
-              local details = r.usage.input_tokens_details
-              if type(details) == "table" and tonumber(details.cached_tokens) then
-                llm_router.log(
-                  "debug",
-                  "cache hit",
-                  { cached_tokens = details.cached_tokens, input_tokens = prompt_tokens, event = "cache" }
-                )
-              end
-            end
-            if
-              et == "response.incomplete"
-              and type(r.incomplete_details) == "table"
-              and r.incomplete_details.reason == "max_output_tokens"
-            then
-              terminal_finish = "length"
-            end
-          end
-        end
-      end
-    end
-  end
-  table.sort(fn_order)
-  local tool_calls = {}
-  for _, idx in ipairs(fn_order) do
-    local acc = fn_by_index[idx]
-    if acc.name ~= "" then
-      table.insert(tool_calls, {
-        id = acc.call_id,
-        type = "function",
-        ["function"] = { name = acc.name, arguments = acc.args[1] or "" },
-      })
-    end
-  end
-  local finish = terminal_finish or "stop"
-  if #tool_calls > 0 then finish = "tool_calls" end
-  local tool_calls_final = tool_calls
-  if #tool_calls == 0 then tool_calls_final = json.decode("[]") end
-  local content = table.concat(text_parts)
-  llm_router.log("debug", "assembled completion", { finish = finish, prompt_tokens = prompt_tokens, completion_tokens = completion_tokens, text_chars = #content, event = "assemble" })
-  local message = { role = "assistant", content = content, tool_calls = tool_calls_final }
-  local reasoning = table.concat(reasoning_parts)
-  if reasoning ~= "" then message.reasoning_content = reasoning end
-  return {
-    id = "zen-" .. tostring(os.time()),
-    object = "chat.completion",
-    created = os.time(),
-    model = out_model,
-    choices = {
-      { index = 0, message = message, finish_reason = finish },
-    },
-    usage = {
-      prompt_tokens = prompt_tokens,
-      completion_tokens = completion_tokens,
-      total_tokens = total_tokens,
-    },
-  }
+---------------------------------------------------------------------------
+-- Upstream SSE to chat chunks
+---------------------------------------------------------------------------
+
+-- Both upstream protocols stream server-sent events. A reader turns the
+-- lines of one attempt into chat.completion.chunk tables handed to `emit`:
+-- the chat reader forwards upstream chunks, the Responses reader converts
+-- events. Streaming forwards the chunks to the client; unary collects them
+-- into one completion, so each protocol has a single translation.
+-- reader.line(line) consumes one SSE line, reader.finish() runs after a
+-- clean end of stream, reader.emitted tells whether anything reached `emit`.
+
+-- Payload of an SSE data line; nil for other lines, [DONE], empty data.
+local function sse_data(line)
+  local data = line:match("^data: ?(.-)\r?$")
+  if data == nil or data == "" or data == "[DONE]" then return nil end
+  return data
 end
 
--- Assemble one chat.completion from a streamed chat/completions body.
-local function assemble_chat_response(body, model)
-  local text_parts = {}
-  local reasoning_parts = {}
-  local tc_acc = {}
-  local tc_order = {}
-  local prompt_tokens, completion_tokens, total_tokens = 0, 0, 0
+local function log_cache_hit(usage, input_tokens)
+  local details = usage.input_tokens_details
+  if type(details) == "table" and tonumber(details.cached_tokens) then
+    llm_router.log("debug", "cache hit", { cached_tokens = details.cached_tokens, input_tokens = input_tokens, event = "cache" })
+  end
+end
+
+local function new_chat_reader(c, emit)
+  local reader = { emitted = false }
+
+  function reader.line(line)
+    local data = sse_data(line)
+    if data == nil then return end
+    local chunk = decode_json_table(data)
+    if chunk == nil then return end
+    local has_choices = type(chunk.choices) == "table" and #chunk.choices > 0
+    if not has_choices and chunk.usage == nil then return end
+    chunk.model = c.full_model
+    emit(chunk)
+    reader.emitted = true
+  end
+
+  function reader.finish() end
+
+  return reader
+end
+
+local function new_responses_reader(c, emit)
+  local reader = { emitted = false }
+  local calls = {} -- output_index -> { call_id, name, args, emitted }
+  local tool_count = 0
+  local usage = nil
   local finish = "stop"
-  for line in (body .. "\n"):gmatch("([^\n]*)\n") do
-    if line:sub(1, 6) == "data: " then
-      local data = line:sub(7)
-      if data ~= "[DONE]" and data ~= "" then
-        local ok, chunk = pcall(json.decode, data)
-        if ok and type(chunk) == "table" then
-          if type(chunk.choices) == "table" then
-            for _, ch in ipairs(chunk.choices) do
-              if type(ch) == "table" then
-                local delta = ch.delta
-                if type(delta) == "table" then
-                  if type(delta.content) == "string" and delta.content ~= "" then
-                    table.insert(text_parts, delta.content)
-                  end
-                  -- Upstream chat deltas carry the trace as reasoning_content;
-                  -- older shapes used reasoning. Accept both.
-                  local reasoning = delta.reasoning_content
-                  if type(reasoning) ~= "string" or reasoning == "" then reasoning = delta.reasoning end
-                  if type(reasoning) == "string" and reasoning ~= "" then table.insert(reasoning_parts, reasoning) end
-                  if type(delta.tool_calls) == "table" then
-                    for _, tc in ipairs(delta.tool_calls) do
-                      if type(tc) == "table" then
-                        local idx = tc.index or 0
-                        local acc = tc_acc[idx]
-                        if not acc then
-                          acc = { id = "", name = "", args = {} }
-                          tc_acc[idx] = acc
-                          table.insert(tc_order, idx)
-                        end
-                        if type(tc.id) == "string" and tc.id ~= "" then acc.id = tc.id end
-                        local fn = tc["function"]
-                        if type(fn) == "table" then
-                          if type(fn.name) == "string" and fn.name ~= "" then acc.name = fn.name end
-                          if type(fn.arguments) == "string" and fn.arguments ~= "" then acc.args[1] = fn.arguments end
-                        end
-                      end
-                    end
-                  end
-                end
-                if type(ch.finish_reason) == "string" and ch.finish_reason ~= "" then finish = ch.finish_reason end
-              end
-            end
-          end
-          if type(chunk.usage) == "table" then
-            prompt_tokens = chunk.usage.prompt_tokens or 0
-            completion_tokens = chunk.usage.completion_tokens or 0
-            total_tokens = chunk.usage.total_tokens or (prompt_tokens + completion_tokens)
-          end
-        end
+
+  local function send(chunk)
+    chunk.model = c.full_model
+    emit(chunk)
+    reader.emitted = true
+  end
+
+  local function call_slot(index)
+    local slot = calls[index]
+    if slot == nil then
+      slot = { call_id = "", name = "", args = "", emitted = false }
+      calls[index] = slot
+    end
+    return slot
+  end
+
+  local function tool_call_entry(slot)
+    local entry = {
+      index = tool_count,
+      id = slot.call_id,
+      type = "function",
+      ["function"] = { name = slot.name, arguments = slot.args },
+    }
+    tool_count = tool_count + 1
+    slot.emitted = true
+    return entry
+  end
+
+  local function handle_function_item(event_type, item, output_index)
+    local slot = call_slot(output_index)
+    if is_filled_string(item.call_id) then slot.call_id = item.call_id end
+    if is_filled_string(item.name) then slot.name = item.name end
+    if is_filled_string(item.arguments) then slot.args = item.arguments end
+    if event_type == "response.output_item.done" and slot.name ~= "" and not slot.emitted then
+      send({ choices = { { index = 0, delta = { role = "assistant", tool_calls = { tool_call_entry(slot) } } } } })
+    end
+  end
+
+  local function handle_terminal(event_type, response)
+    save_blobs(c.keys, reasoning_blobs(response))
+    if type(response.usage) == "table" then
+      local prompt = response.usage.input_tokens or 0
+      local completion = response.usage.output_tokens or 0
+      usage = {
+        prompt_tokens = prompt,
+        completion_tokens = completion,
+        total_tokens = response.usage.total_tokens or (prompt + completion),
+      }
+      log_cache_hit(response.usage, prompt)
+    end
+    if event_type == "response.incomplete" then
+      finish = "length"
+      if type(response.incomplete_details) == "table" and response.incomplete_details.reason == "content_filter" then
+        finish = "content_filter"
       end
     end
   end
-  table.sort(tc_order)
-  local tool_calls = {}
-  for _, idx in ipairs(tc_order) do
-    local acc = tc_acc[idx]
-    if acc.name ~= "" then
-      table.insert(tool_calls, {
-        id = acc.id,
-        type = "function",
-        ["function"] = { name = acc.name, arguments = acc.args[1] or "" },
-      })
+
+  function reader.line(line)
+    local data = sse_data(line)
+    if data == nil then return end
+    local event = decode_json_table(data)
+    if event == nil or type(event.type) ~= "string" then return end
+    local event_type = event.type
+    if event_type == "response.output_text.delta" then
+      if is_filled_string(event.delta) then
+        send({ choices = { { index = 0, delta = { role = "assistant", content = event.delta } } } })
+      end
+    elseif event_type == "response.reasoning_summary_text.delta" then
+      if is_filled_string(event.delta) then
+        send({ choices = { { index = 0, delta = { role = "assistant", reasoning_content = event.delta } } } })
+      end
+    elseif event_type == "response.output_item.added" or event_type == "response.output_item.done" then
+      if type(event.item) == "table" and event.item.type == "function_call" then
+        handle_function_item(event_type, event.item, event.output_index or 0)
+      end
+    elseif event_type == "response.function_call_arguments.delta" then
+      if type(event.delta) == "string" then
+        local slot = call_slot(event.output_index or 0)
+        slot.args = slot.args .. event.delta
+      end
+    elseif event_type == "response.completed" or event_type == "response.incomplete" then
+      if type(event.response) == "table" then handle_terminal(event_type, event.response) end
     end
   end
-  if #tool_calls > 0 and finish == "stop" then finish = "tool_calls" end
-  local tool_calls_final = tool_calls
-  if #tool_calls == 0 then tool_calls_final = json.decode("[]") end
-  local content = table.concat(text_parts)
-  llm_router.log("debug", "assembled completion", { finish = finish, prompt_tokens = prompt_tokens, completion_tokens = completion_tokens, text_chars = #content, event = "assemble" })
-  local message = { role = "assistant", content = content, tool_calls = tool_calls_final }
-  local reasoning = table.concat(reasoning_parts)
-  if reasoning ~= "" then message.reasoning_content = reasoning end
-  return {
-    id = "zen-" .. tostring(os.time()),
-    object = "chat.completion",
-    created = os.time(),
-    model = model,
-    choices = {
-      { index = 0, message = message, finish_reason = finish },
-    },
-    usage = {
-      prompt_tokens = prompt_tokens,
-      completion_tokens = completion_tokens,
-      total_tokens = total_tokens,
-    },
-  }
+
+  -- Terminal chunk: finish reason plus usage. Tool calls emitted above stay
+  -- out; anything accumulated but unemitted rides here.
+  function reader.finish()
+    local indexes = {}
+    for index, slot in pairs(calls) do
+      if slot.name ~= "" and not slot.emitted then table.insert(indexes, index) end
+    end
+    table.sort(indexes)
+    local pending = {}
+    for _, index in ipairs(indexes) do table.insert(pending, tool_call_entry(calls[index])) end
+    local terminal = { index = 0, delta = { role = "assistant" }, finish_reason = finish }
+    if #pending > 0 then terminal.delta.tool_calls = pending end
+    if tool_count > 0 then terminal.finish_reason = "tool_calls" end
+    local chunk = { choices = { terminal } }
+    if usage ~= nil then chunk.usage = usage end
+    send(chunk)
+  end
+
+  return reader
 end
 
--- One upstream fetch: returns (body) or (nil, action, err) where action is
--- "retry" (next exit) or "done" (terminal, return at once).
-local function fetch_body(client, url, headers, body, model_name, px)
+-- Folds the chunks of one upstream stream into a single chat.completion.
+local function new_collector()
+  local text, trace = {}, {}
+  local calls, order = {}, {}
+  local usage, finish = nil, nil
+
+  -- Slot of a streamed tool call. Calls normally carry an index; for
+  -- upstreams that omit it a new id opens a new call and anything else
+  -- continues the latest one.
+  local function call_slot(tc)
+    local index = tc.index
+    if type(index) ~= "number" then
+      local last = order[#order]
+      if last ~= nil and (not is_filled_string(tc.id) or tc.id == calls[last].id) then
+        index = last
+      else
+        index = (last or -1) + 1
+      end
+    end
+    local slot = calls[index]
+    if slot == nil then
+      slot = { id = "", name = "", args = {} }
+      calls[index] = slot
+      table.insert(order, index)
+    end
+    return slot
+  end
+
+  local function add_tool_call(tc)
+    local slot = call_slot(tc)
+    if is_filled_string(tc.id) then slot.id = tc.id end
+    local fn = tc["function"]
+    if type(fn) == "table" then
+      if is_filled_string(fn.name) then slot.name = fn.name end
+      -- Argument fragments arrive piecewise and concatenate.
+      if type(fn.arguments) == "string" then table.insert(slot.args, fn.arguments) end
+    end
+  end
+
+  local function add_choice(choice)
+    local delta = choice.delta
+    if type(delta) == "table" then
+      if is_filled_string(delta.content) then table.insert(text, delta.content) end
+      local reasoning = reasoning_text(delta)
+      if reasoning ~= nil then table.insert(trace, reasoning) end
+      if type(delta.tool_calls) == "table" then
+        for _, tc in ipairs(delta.tool_calls) do
+          if type(tc) == "table" then add_tool_call(tc) end
+        end
+      end
+    end
+    if is_filled_string(choice.finish_reason) then finish = choice.finish_reason end
+  end
+
+  local collector = {}
+
+  function collector.add(chunk)
+    if type(chunk.choices) == "table" then
+      for _, choice in ipairs(chunk.choices) do
+        if type(choice) == "table" then add_choice(choice) end
+      end
+    end
+    if type(chunk.usage) == "table" then
+      local prompt = chunk.usage.prompt_tokens or 0
+      local completion = chunk.usage.completion_tokens or 0
+      usage = {
+        prompt_tokens = prompt,
+        completion_tokens = completion,
+        total_tokens = chunk.usage.total_tokens or (prompt + completion),
+      }
+    end
+  end
+
+  function collector.build(model)
+    table.sort(order)
+    local tool_calls = {}
+    for _, index in ipairs(order) do
+      local slot = calls[index]
+      if slot.name ~= "" then
+        table.insert(tool_calls, {
+          id = slot.id,
+          type = "function",
+          ["function"] = { name = slot.name, arguments = table.concat(slot.args) },
+        })
+      end
+    end
+    local finish_reason = finish or "stop"
+    if #tool_calls > 0 and finish_reason == "stop" then finish_reason = "tool_calls" end
+    if #tool_calls == 0 then tool_calls = empty_array() end
+    local content = table.concat(text)
+    local message = { role = "assistant", content = content, tool_calls = tool_calls }
+    local reasoning = table.concat(trace)
+    if reasoning ~= "" then message.reasoning_content = reasoning end
+    usage = usage or { prompt_tokens = 0, completion_tokens = 0, total_tokens = 0 }
+    llm_router.log("debug", "assembled completion", {
+      finish = finish_reason,
+      prompt_tokens = usage.prompt_tokens,
+      completion_tokens = usage.completion_tokens,
+      text_chars = #content,
+    })
+    return {
+      id = "chatcmpl-" .. llm_router.random_hex(12),
+      object = "chat.completion",
+      created = os.time(),
+      model = model,
+      choices = { { index = 0, message = message, finish_reason = finish_reason } },
+      usage = usage,
+    }
+  end
+
+  return collector
+end
+
+---------------------------------------------------------------------------
+-- Requests
+---------------------------------------------------------------------------
+
+-- Protocol families first: muse-spark/gpt/grok serve /responses even for
+-- their -free variants. Remaining -free models are chat-protocol.
+local PROTOCOLS = {
+  chat = { path = "chat/completions", build_payload = build_chat_payload, new_reader = new_chat_reader },
+  responses = { path = "responses", build_payload = build_responses_payload, new_reader = new_responses_reader },
+}
+
+local function protocol_for_model(model_name)
+  local m = model_name:lower()
+  if m:match("^gpt%-") or m:match("muse%-spark") or m:match("^grok%-") then return PROTOCOLS.responses end
+  return PROTOCOLS.chat
+end
+
+-- Everything that does not depend on the exit: session, payload, wire body,
+-- headers. Built once per request, before any proxy is requested, so a
+-- malformed request or missing remote text fails at once. Returns (nil, err)
+-- on failure.
+local function prepare_job(request)
+  local model_name = request.model_name
+  local protocol = protocol_for_model(model_name)
+  local version, verr = opencode_version()
+  if version == nil then return nil, verr end
+  local keys, kerr = dialogue_keys(request, model_name)
+  if keys == nil then return nil, kerr end
+  local job = {
+    request = request,
+    model_name = model_name,
+    full_model = request.model,
+    protocol = protocol,
+    version = version,
+    keys = keys,
+    ses = resolve_session(keys),
+    url = BASE_URL .. "/" .. protocol.path,
+  }
+  local payload, perr = protocol.build_payload(job)
+  if payload == nil then return nil, perr end
+  local body, eerr = wire_body(payload)
+  if body == nil then return nil, eerr end
+  job.body = body
+  job.headers = opencode_headers(version, job.ses, mint_msg(mint_ms()))
+  return job
+end
+
+local function log_request_start(label, request, job_protocol)
+  llm_router.log("debug", label, {
+    model = request.model,
+    endpoint = job_protocol.path,
+    tools = #client_tools(request.tools),
+    messages = #messages_of(request),
+    event = "request_start",
+  })
+end
+
+-- Whether a failed attempt may move to another exit: the client marks
+-- transport faults that happened on a proxied leg before any stream output
+-- reached the caller as retryable. Everything else (cancellation, direct
+-- leg, faults after output started) is final.
+local function transport_verdict(err)
+  if err.retryable == true then return NEXT end
+  return STOP
+end
+
+-- One unary attempt. Returns (body) or (nil, verdict, err).
+local function attempt_unary(run, client, job, px)
   local resp, err = client:request({
     method = "POST",
-    url = url,
-    headers = headers,
-    body = body,
+    url = job.url,
+    headers = job.headers,
+    body = job.body,
     proxy_url = px.url,
   })
-  if err then
+  if err ~= nil then
     mark_exit_transport(px, err)
-    return nil, "retry", err
+    return nil, transport_verdict(err), err
   end
   if resp.status == 200 then return resp.body end
-  dump_request(url, headers, body)
-  local action, terr = map_upstream(resp, model_name, px)
-  return nil, action, terr
+  dump_request(job)
+  local verdict, mapped = map_upstream(run, resp, job.model_name, px)
+  return nil, verdict, mapped
 end
+
+-- One streaming attempt. Returns "ok", or (verdict, err).
+local function attempt_stream(run, client, job, px, emit)
+  local reader = job.protocol.new_reader(job, emit)
+  local mapped_verdict = nil
+  local _, err = client:stream({
+    method = "POST",
+    url = job.url,
+    headers = job.headers,
+    body = job.body,
+    proxy_url = px.url,
+    on_response = function(head)
+      llm_router.log("debug", "stream responded", { status = head.status, event = "stream_response" })
+      if head.status ~= 200 then
+        dump_request(job)
+        local verdict, mapped = map_upstream(run, head, job.model_name, px)
+        mapped_verdict = verdict
+        return mapped
+      end
+    end,
+    on_line = function(line)
+      llm_router.log("debug", "server-sent event", { line = line, event = "sse" })
+      reader.line(line)
+    end,
+  })
+  if err == nil then
+    reader.finish()
+    return "ok"
+  end
+  mark_exit_transport(px, err)
+  -- The stream belongs to the attempt once output started: no failover.
+  if reader.emitted then return STOP, err end
+  return mapped_verdict or transport_verdict(err), err
+end
+
+local function log_attempt_failure(event, message, verdict, err, attempt)
+  local severity = "warn"
+  if verdict == STOP then severity = "error" end
+  llm_router.log(severity, message, {
+    code = err.code,
+    status = err.status,
+    reason = err.message,
+    attempt = attempt,
+    event = event,
+  })
+end
+
+-- Runs `attempt(px, attempt_number)` once per exit until it reports a final
+-- outcome: it returns (false) to try the next exit, or (true, value, err) to
+-- finish with that result. Exhausting the exits ends in the terminal 429.
+local function run_attempts(ctx, run, attempt)
+  local next_exit, exits = exit_stream(ctx.provider_config)
+  local attempted = 0
+  while true do
+    local px = next_exit()
+    if px == nil then break end
+    attempted = attempted + 1
+    local final, value, err = attempt(px, attempted)
+    if final then return value, err end
+  end
+  return nil, terminal_error(run, exits, attempted)
+end
+
+---------------------------------------------------------------------------
+-- Provider registration
+---------------------------------------------------------------------------
 
 llm_router.register("opencode-free", {
   icon = "https://opencode.ai/favicon.ico",
@@ -1486,373 +1671,98 @@ llm_router.register("opencode-free", {
   proxy_schema = {},
 
   get_model_infos = function(ctx)
-    local cached = llm_router.storage.get(MODEL_CACHE_SCOPE, "infos")
-    if type(cached) == "table" and #cached > 0 then
-      llm_router.log("debug", "model catalog loaded", { count = #cached, event = "model_catalog" })
+    local cached = store_get(MODEL_CACHE_SCOPE, "infos")
+    if is_filled_array(cached) then
+      llm_router.log("debug", "model catalog loaded", { count = #cached })
       return cached
     end
-    llm_router.log("debug", "model catalog missed", { event = "model_catalog" })
+    llm_router.log("debug", "model catalog missed")
     return refresh_model_catalog()
   end,
 
   -- Model liveness: the tier is anonymous, so a single direct
   -- discriminator POST proves existence with zero generation spend
   -- (rejection happens pre-generation). Free names answer 403
-  -- FreeTierError (gated to genuine clients, not missing); paid names
-  -- answer 401 (not on tier); unknown names answer 400 Model-unavailable.
-  -- Probes never write storage marks.
+  -- FreeTierError (gated to genuine clients, not missing); paid names answer
+  -- 401 (not on tier); unknown names answer 400 Model-unavailable. Probes
+  -- never write storage marks.
   check_model = function(ctx, model_ref)
-    local endpoint = model_ref.endpoint or "chat"
-    if endpoint ~= "chat" and endpoint ~= "vision" then
-      return { status = "unknown", message = "endpoint not supported: " .. tostring(endpoint) }
+    local capability = model_ref.endpoint or "chat"
+    if capability ~= "chat" and capability ~= "vision" then
+      return { status = "unknown", message = "endpoint not supported: " .. tostring(capability) }
     end
     local model_name = model_ref.model_name or ""
     if model_name == "" then return { status = "unknown", message = "model name is required" } end
+    local version = opencode_version()
+    if version == nil then return { status = "unknown", message = "client version unavailable" } end
     local client = llm_router.http_client({ timeout_ms = 15000 })
     local ms = mint_ms()
-    local ses = mint_session(ms)
-    local msg = mint_msg(ms)
-    llm_router.log("debug", "probing model", { model = model_ref.model, endpoint = endpoint })
+    llm_router.log("debug", "probing model", { model = model_ref.model, endpoint = capability })
     local resp, err = client:request({
       method = "POST",
       url = BASE_URL .. "/chat/completions",
-      headers = opencode_headers("/chat/completions", ses, msg),
+      headers = opencode_headers(version, mint_session(ms), mint_msg(ms)),
       body = json.encode({ model = model_name, messages = { { role = "user", content = "hi" } }, max_tokens = 1 }),
     })
-    if err then
-      local message = "request failed"
-      if type(err) == "table" and type(err.message) == "string" then message = err.message end
-      return { status = "unknown", message = message }
+    if err ~= nil then
+      return { status = "unknown", message = type(err.message) == "string" and err.message or "request failed" }
     end
-    local body_str = tostring(resp.body or "")
-    if resp.status == 200 then
-      return { status = "healthy", response = "ok" }
-    end
-    if resp.status == 400 and string.find(body_str, "Model is unavailable", 1, true) then
+    local status = resp.status
+    local body = tostring(resp.body or "")
+    if status == 200 then return { status = "healthy", response = "ok" } end
+    if status == 400 and body:find("Model is unavailable", 1, true) then
       return { status = "unhealthy", message = "model not found upstream" }
     end
-    if resp.status == 401 and not is_free_model(model_name) then
+    if status == 401 and not is_free_model(model_name) then
       return { status = "unhealthy", message = "model is not available on the free tier" }
     end
-    if resp.status == 403 and string.find(body_str, "only be used from within OpenCode", 1, true) then
+    if status == 403 and body:find(FINGERPRINT_MARKER, 1, true) then
       return { status = "healthy", response = "ok" }
     end
-    if resp.status == 429 then
-      local lower_body = string.lower(body_str)
-      if string.find(lower_body, "freeusagelimiterror", 1, true) ~= nil
-        or string.find(lower_body, "quota", 1, true) ~= nil
-        or string.find(lower_body, "free usage", 1, true) ~= nil then
-        return { status = "quota_exceeded", message = "quota exhausted" }
-      end
+    if status == 429 then
+      if is_quota_body(body) then return { status = "quota_exceeded", message = "quota exhausted" } end
       return { status = "unknown", message = "rate limited" }
     end
-    if resp.status == 401 or resp.status == 403 or resp.status == 426 then
-      return { status = "unknown", message = "status " .. tostring(resp.status) }
-    end
-    return { status = "unknown", message = "status " .. tostring(resp.status) }
+    return { status = "unknown", message = "status " .. tostring(status) }
   end,
 
   complete = function(ctx, request)
-    local model = request.model_name
-    local endpoint = endpoint_for_model(model)
-    local client = llm_router.http_client({})
-    -- Run-scoped ids: one session per conversation, one request id per run.
-    local ses = stable_session(request, model)
-    local msg = mint_msg(mint_ms())
-
-    llm_router.log(
-      "debug",
-      "starting request",
-      {
-        model = tostring(request.model),
-        model_name = tostring(model),
-        endpoint = tostring(endpoint),
-        tools = #normalize_tools(request.tools),
-        messages = type(request.messages) == "table" and #request.messages or -1,
-        tool_choice = debug_json(request.tool_choice),
-        event = "request_start",
-      }
-    )
-
-    local next_exit, exit_counts = exit_stream(ctx)
-    local attempted = 0
-    while true do
-      local px = next_exit()
-      if px == nil then break end
-      attempted = attempted + 1
-        if endpoint == "/responses" then
-          -- Anonymous Responses path: stream upstream like the genuine
-          -- client and assemble the event stream into one completion.
-          -- Generations over large contexts run long; the wide timeout only
-          -- bounds dead connections, progress streams underneath it.
-          local resp_client = llm_router.http_client({ timeout_ms = 300000 })
-          local payload, perr = build_anon_responses_payload(request, model, ses)
-          if payload == nil then return nil, perr end
-          local headers = opencode_headers(endpoint, ses, msg)
-          local body = wire_body(payload)
-          llm_router.log("debug", "sending request", { method = "POST", url = BASE_URL .. "/responses", body_len = #body, event = "http" })
-          local raw_body, action, err = fetch_body(resp_client, BASE_URL .. "/responses", headers, body, model, px)
-          if raw_body then return assemble_responses_stream(raw_body, model, request) end
-          llm_router.log("warn", "request failed", { code = err.code, status = err.status, reason = err.message, event = "http_error" })
-          if action == "done" then return nil, err end
-        else
-          -- Anonymous chat path: the free-tier gate only serves stream:true
-          -- requests shaped like the genuine client, so always stream upstream
-          -- and assemble the SSE body into one completion here.
-          local payload, perr = build_anon_chat_payload(request, model)
-          if payload == nil then return nil, perr end
-          local headers = opencode_headers(endpoint, ses, msg)
-          local body = wire_body(payload)
-          llm_router.log("debug", "sending request", { method = "POST", url = BASE_URL .. "/chat/completions", body_len = #body, event = "http" })
-          local raw_body, action, err = fetch_body(client, BASE_URL .. "/chat/completions", headers, body, model, px)
-          if raw_body then return assemble_chat_response(raw_body, request.model) end
-          llm_router.log("warn", "request failed", { code = err.code, status = err.status, reason = err.message, event = "http_error" })
-          if action == "done" then return nil, err end
-        end
-    end
-    return nil, terminal_error(exit_counts.skipped, attempted, attempted)
+    log_request_start("starting request", request, protocol_for_model(request.model_name))
+    local job, err = prepare_job(request)
+    if job == nil then return nil, err end
+    local run = new_run()
+    local client = llm_router.http_client({ timeout_ms = GENERATION_TIMEOUT_MS })
+    return run_attempts(ctx, run, function(px, attempt)
+      llm_router.log("debug", "sending request", { endpoint = job.protocol.path, body_len = #job.body, attempt = attempt, event = "http" })
+      local body, verdict, ferr = attempt_unary(run, client, job, px)
+      if body ~= nil then
+        local collector = new_collector()
+        local reader = job.protocol.new_reader(job, collector.add)
+        for line in (body .. "\n"):gmatch("([^\n]*)\n") do reader.line(line) end
+        reader.finish()
+        return true, collector.build(job.full_model)
+      end
+      log_attempt_failure("http_error", "request failed", verdict, ferr, attempt)
+      return verdict == STOP, nil, ferr
+    end)
   end,
 
   complete_stream = function(ctx, request, emit)
-    local model = request.model_name
-    local endpoint = endpoint_for_model(model)
-    llm_router.log(
-      "debug",
-      "starting stream",
-      {
-        model = tostring(request.model),
-        model_name = tostring(model),
-        endpoint = tostring(endpoint),
-        tools = #normalize_tools(request.tools),
-        messages = type(request.messages) == "table" and #request.messages or -1,
-        event = "request_start",
-      }
-    )
-    local client = llm_router.http_client({})
-    local full_model = request.model
-    local last_err = nil
-    local ses = stable_session(request, model)
-    local msg = mint_msg(mint_ms())
-
-    local next_exit, exit_counts = exit_stream(ctx)
-    local attempted = 0
-    while true do
-      local px = next_exit()
-      if px == nil then break end
-      attempted = attempted + 1
-      local done = false
-      local fatal = false
-
-      if endpoint == "/chat/completions" then
-        local payload, perr = build_anon_chat_payload(request, model)
-        if payload == nil then return nil, perr end
-        local headers = opencode_headers(endpoint, ses, msg)
-        local body = wire_body(payload)
-        llm_router.log("debug", "sending stream", { method = "POST", url = BASE_URL .. "/chat/completions", body_len = #body, event = "stream" })
-        local _, stream_err = client:stream({
-          method = "POST",
-          url = BASE_URL .. "/chat/completions",
-          headers = headers,
-          body = body,
-          proxy_url = px.url,
-          on_response = function(r)
-            llm_router.log("debug", "stream responded", { status = r.status, body = tostring(r.body or ""), event = "stream_response" })
-            if r.status ~= 200 then
-              dump_request(BASE_URL .. "/chat/completions", headers, body)
-              local action, terr = map_upstream(r, model, px)
-              if action == "done" then fatal = true end
-              return terr
-            end
-          end,
-          on_line = function(line)
-            llm_router.log("debug", "server-sent event", { line = tostring(line), event = "sse" })
-            if line:sub(1, 6) ~= "data: " then return end
-            local data = line:sub(7)
-            if data == "[DONE]" or data == "" then return end
-            local ok, chunk = pcall(json.decode, data)
-            if not ok or type(chunk) ~= "table" then return end
-            local has_choices = type(chunk.choices) == "table" and #chunk.choices > 0
-            if not has_choices and chunk.usage == nil then return end
-            chunk.model = full_model
-            emit(chunk)
-            done = true
-          end,
-        })
-        if stream_err then
-          mark_exit_transport(px, stream_err)
-          llm_router.log("warn", "stream failed", { code = stream_err.code, status = stream_err.status, reason = stream_err.message, event = "stream_error" })
-          last_err = stream_err
-          if fatal then return nil, last_err end
-          if done then return nil, last_err end
-        else
-          llm_router.log("debug", "stream completed", { endpoint = endpoint, event = "stream_done" })
-          return
-        end
+    log_request_start("starting stream", request, protocol_for_model(request.model_name))
+    local job, err = prepare_job(request)
+    if job == nil then return nil, err end
+    local run = new_run()
+    local client = llm_router.http_client({ timeout_ms = GENERATION_TIMEOUT_MS })
+    return run_attempts(ctx, run, function(px, attempt)
+      llm_router.log("debug", "sending stream", { endpoint = job.protocol.path, body_len = #job.body, attempt = attempt, event = "stream" })
+      local outcome, serr = attempt_stream(run, client, job, px, emit)
+      if outcome == "ok" then
+        llm_router.log("debug", "stream completed", { endpoint = job.protocol.path, event = "stream_done" })
+        return true
       end
-
-      if endpoint == "/responses" then
-        -- Anonymous Responses stream: forward upstream SSE as chat chunks
-        -- incrementally, like the chat path. Wide timeout: generations over
-        -- large contexts run long, progress streams underneath it.
-        local stream_client = llm_router.http_client({ timeout_ms = 300000 })
-        local payload, perr = build_anon_responses_payload(request, model, ses)
-        if payload == nil then return nil, perr end
-        local headers = opencode_headers(endpoint, ses, msg)
-        local body = wire_body(payload)
-        llm_router.log("debug", "sending stream", { method = "POST", url = BASE_URL .. "/responses", body_len = #body, event = "stream" })
-        local fn_state = {}
-        local usage = nil
-        local finish = "stop"
-        local saw_tools = false
-        local function fn_acc(index)
-          local acc = fn_state[index]
-          if not acc then
-            acc = { call_id = "", name = "", args = "", emitted = false }
-            fn_state[index] = acc
-          end
-          return acc
-        end
-        local _, stream_err = stream_client:stream({
-          method = "POST",
-          url = BASE_URL .. "/responses",
-          headers = headers,
-          body = body,
-          proxy_url = px.url,
-          on_response = function(r)
-            llm_router.log("debug", "stream responded", { status = r.status, event = "stream_response" })
-            if r.status ~= 200 then
-              dump_request(BASE_URL .. "/responses", headers, body)
-              local action, terr = map_upstream(r, model, px)
-              if action == "done" then fatal = true end
-              return terr
-            end
-          end,
-          on_line = function(line)
-            if line:sub(1, 6) ~= "data: " then return end
-            local data = line:sub(7)
-            if data == "[DONE]" or data == "" then return end
-            local ok, ev = pcall(json.decode, data)
-            if not ok or type(ev) ~= "table" or type(ev.type) ~= "string" then return end
-            local et = ev.type
-            -- Accepted lifecycle events without payload effects.
-            if
-              et == "response.created"
-              or et == "response.in_progress"
-              or et == "response.content_part.added"
-              or et == "response.content_part.done"
-              or et == "response.function_call_arguments.done"
-            then
-              return
-            end
-            if et == "response.output_text.delta" and type(ev.delta) == "string" and ev.delta ~= "" then
-              emit({
-                model = full_model,
-                choices = { { index = 0, delta = { role = "assistant", content = ev.delta } } },
-              })
-              done = true
-            elseif et == "response.reasoning_summary_text.delta" and type(ev.delta) == "string" and ev.delta ~= "" then
-              emit({
-                model = full_model,
-                choices = { { index = 0, delta = { role = "assistant", reasoning_content = ev.delta } } },
-              })
-              done = true
-            elseif
-              (et == "response.output_item.added" or et == "response.output_item.done")
-              and type(ev.item) == "table"
-              and ev.item.type == "function_call"
-            then
-              local acc = fn_acc(ev.output_index or 0)
-              if type(ev.item.call_id) == "string" and ev.item.call_id ~= "" then acc.call_id = ev.item.call_id end
-              if type(ev.item.name) == "string" and ev.item.name ~= "" then acc.name = ev.item.name end
-              if type(ev.item.arguments) == "string" and ev.item.arguments ~= "" then acc.args = ev.item.arguments end
-              if et == "response.output_item.done" and acc.name ~= "" and not acc.emitted then
-                acc.emitted = true
-                saw_tools = true
-                emit({
-                  model = full_model,
-                  choices = {
-                    {
-                      index = 0,
-                      delta = {
-                        role = "assistant",
-                        tool_calls = {
-                          {
-                            id = acc.call_id,
-                            type = "function",
-                            ["function"] = { name = acc.name, arguments = acc.args },
-                          },
-                        },
-                      },
-                    },
-                  },
-                })
-                done = true
-              end
-            elseif et == "response.function_call_arguments.delta" and type(ev.delta) == "string" then
-              local acc_for_delta = fn_acc(ev.output_index or 0)
-              acc_for_delta.args = acc_for_delta.args .. ev.delta
-            elseif (et == "response.completed" or et == "response.incomplete") and type(ev.response) == "table" then
-              local r = ev.response
-              blob_push(request, model, collect_pairs(r))
-              if type(r.usage) == "table" then
-                usage = {
-                  prompt_tokens = r.usage.input_tokens or 0,
-                  completion_tokens = r.usage.output_tokens or 0,
-                  total_tokens = r.usage.total_tokens or 0,
-                }
-                local details = r.usage.input_tokens_details
-                if type(details) == "table" and tonumber(details.cached_tokens) then
-                  llm_router.log(
-                    "debug",
-                    "cache hit",
-                    { cached_tokens = details.cached_tokens, input_tokens = usage.prompt_tokens, event = "cache" }
-                  )
-                end
-              end
-              if et == "response.incomplete" then finish = "length" end
-            end
-          end,
-        })
-        if stream_err then
-          mark_exit_transport(px, stream_err)
-          llm_router.log("warn", "stream failed", { code = stream_err.code, status = stream_err.status, reason = stream_err.message, event = "stream_error" })
-          last_err = stream_err
-          if fatal then return nil, last_err end
-          if done then return nil, last_err end
-        else
-          -- Terminal chunk: finish reason plus usage. Tool calls emitted
-          -- above stay out; anything accumulated but unemitted rides here.
-          local order = {}
-          for idx, acc in pairs(fn_state) do
-            if acc.name ~= "" and not acc.emitted then table.insert(order, idx) end
-          end
-          table.sort(order)
-          local pending_calls = {}
-          for _, idx in ipairs(order) do
-            local acc = fn_state[idx]
-            saw_tools = true
-            table.insert(pending_calls, {
-              id = acc.call_id,
-              type = "function",
-              ["function"] = { name = acc.name, arguments = acc.args },
-            })
-          end
-          local terminal = { index = 0, delta = { role = "assistant" }, finish_reason = finish }
-          if #pending_calls > 0 then
-            terminal.delta.tool_calls = pending_calls
-            terminal.finish_reason = "tool_calls"
-          elseif saw_tools then
-            terminal.finish_reason = "tool_calls"
-          end
-          local chunk = { model = full_model, choices = { terminal } }
-          if usage then chunk.usage = usage end
-          emit(chunk)
-          llm_router.log("debug", "stream completed", { endpoint = endpoint, event = "stream_done" })
-          return
-        end
-      end
-    end
-    return nil, terminal_error(exit_counts.skipped, attempted, attempted)
+      log_attempt_failure("stream_error", "stream failed", outcome, serr, attempt)
+      return outcome == STOP, nil, serr
+    end)
   end,
 
   -- Verified reasoning support the upstream catalog does not advertise.
