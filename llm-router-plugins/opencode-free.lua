@@ -1,6 +1,6 @@
 --- @plugin OpenCode Free
 --- @author TheSlopMachine
---- @version 6.6.0
+--- @version 6.6.1
 --- @plugin_api 1.5
 --- @description OpenAI/Anthropic/Google compatible free provider OpenCode Free (no key required)
 --- @allow_host opencode.ai
@@ -631,31 +631,8 @@ local function resolve_session(keys)
   return ses
 end
 
--- Reasoning identity persists per conversation (10-minute TTL): each
--- completed turn stores its reasoning {id, blob} pairs under its own full
--- dialogue; the next request replays the ones stored under the longest
--- strict prefix of its history, FIFO with their server-issued ids. Items
--- without a stored pair are omitted (the validator rejects reconstructed
--- shells). The request's own dialogue is excluded: a retry must not replay
--- the blobs of the response it is about to produce.
-local BLOB_SCOPE = "reasoning_blobs_v2"
-local BLOB_TTL = 600
-
-local function load_blobs(keys)
-  local n, blobs = find_prefix(BLOB_SCOPE, keys, #keys - 1, is_filled_array)
-  if n == nil then
-    llm_router.log("debug", "reasoning blobs missed", { event = "reasoning_replay" })
-    return {}
-  end
-  llm_router.log("debug", "reasoning blobs loaded", { count = #blobs, event = "reasoning_replay" })
-  return blobs
-end
-
-local function save_blobs(keys, blobs)
-  local count = #keys
-  if count == 0 or #blobs == 0 then return end
-  store_set(BLOB_SCOPE, keys[count], blobs, BLOB_TTL)
-end
+-- Reasoning blobs are not keyed by dialogue position: see "Reasoning replay"
+-- in the payload section. They belong to the assistant turn that made them.
 
 local function reasoning_blobs(response)
   local blobs = {}
@@ -808,6 +785,7 @@ local function new_run()
   return {
     denied = 0, -- exits answered with 403
     saw_quota = false, -- any 429 classified as quota
+    last_failure = nil, -- message of the latest non-limit failure (cut-off stream, 5xx, ...)
   }
 end
 
@@ -827,6 +805,7 @@ local function terminal_error(run, exits, attempted)
   if attempted == 0 and exits.skipped > 0 then why = "all known exits parked" end
   local extra = ""
   if run.denied > 0 then extra = " (" .. tostring(run.denied) .. " exits denied with 403)" end
+  if run.last_failure ~= nil then extra = extra .. " (last failure: " .. run.last_failure .. ")" end
   llm_router.log("error", "exits exhausted", { code = code, attempt = attempted, count = exits.skipped })
   return {
     message = what .. ", retry in ~" .. RETRY_AFTER_SECONDS .. " seconds (" .. why .. ")" .. extra,
@@ -1110,11 +1089,53 @@ local function messages_of(request)
   return {}
 end
 
+-- Reasoning replay. Encrypted reasoning blobs ({id, blob}) belong to the
+-- assistant turn that produced them, and the history replays each one in
+-- front of that turn, as the genuine client does with store=false. A turn is
+-- recognized by what survives the round trip through the client: its first
+-- tool call id, or else its text. Blobs live under that anchor (24-hour TTL),
+-- not under a dialogue position. Positional matching handed the newest
+-- response's blobs to the oldest assistant message: the replayed prefix then
+-- changed on every request (no prompt-cache hit past the static head) and the
+-- model saw its latest reasoning attached to its first step. A turn without
+-- a stored blob replays nothing (the validator rejects reconstructed shells).
+local REASONING_SCOPE = "reasoning_by_turn"
+local REASONING_TTL = 24 * 3600
+local ANCHOR_NS = "3b1f6c52-7a0d-4e9b-b2c8-5d4a9f0e1c73"
+
+local function text_anchor(text)
+  if text == "" then return nil end
+  return "text:" .. text
+end
+
+-- Anchor of an assistant message in the client's history.
+local function message_anchor(m)
+  if type(m.tool_calls) == "table" then
+    for _, tc in ipairs(m.tool_calls) do
+      if type(tc) == "table" and is_filled_string(tc.id) then return "call:" .. tc.id end
+    end
+  end
+  return text_anchor(message_text(m))
+end
+
+-- Keys hash the anchor: call ids and text are arbitrary strings.
+local function anchor_key(anchor) return llm_router.uuid_v5(ANCHOR_NS, anchor) end
+
+local function save_reasoning(anchor, blobs)
+  if anchor == nil or #blobs == 0 then return end
+  store_set(REASONING_SCOPE, anchor_key(anchor), blobs, REASONING_TTL)
+end
+
+local function load_reasoning(anchor)
+  local blobs = store_get(REASONING_SCOPE, anchor_key(anchor))
+  if is_filled_array(blobs) then return blobs end
+  return {}
+end
+
 -- Build the OpenAI Responses input from chat messages. Returns (nil, err)
 -- for conversations that cannot be expressed faithfully.
-local function build_responses_input(messages, blobs)
+local function build_responses_input(messages)
   local input = {}
-  local next_blob = 1
   for _, m in ipairs(messages) do
     if type(m) == "table" then
       local role = m.role
@@ -1127,17 +1148,15 @@ local function build_responses_input(messages, blobs)
           table.insert(input, { role = "user", content = { { type = "input_text", text = text } } })
         end
       elseif role == "assistant" then
-        -- Reasoning text round-trips so upstream reuses prior thinking
-        -- instead of re-reasoning every turn. The chat protocol carries no
-        -- encrypted content, so only a stored blob makes an item.
-        if reasoning_text(m) ~= nil then
-          local stored = blobs[next_blob]
-          next_blob = next_blob + 1
-          if type(stored) == "table" and is_filled_string(stored.blob) then
-            local item = { type = "reasoning", summary = WIRE_EMPTY_ARRAY, encrypted_content = stored.blob }
-            if is_filled_string(stored.id) then item.id = stored.id end
-            llm_router.log("debug", "replaying reasoning", { reasoning_id = item.id, event = "reasoning_replay" })
-            table.insert(input, item)
+        local anchor = message_anchor(m)
+        if anchor ~= nil then
+          for _, stored in ipairs(load_reasoning(anchor)) do
+            if type(stored) == "table" and is_filled_string(stored.blob) then
+              local item = { type = "reasoning", summary = WIRE_EMPTY_ARRAY, encrypted_content = stored.blob }
+              if is_filled_string(stored.id) then item.id = stored.id end
+              llm_router.log("debug", "replaying reasoning", { reasoning_id = item.id, event = "reasoning_replay" })
+              table.insert(input, item)
+            end
           end
         end
         local text = message_text(m)
@@ -1206,7 +1225,7 @@ end
 local function build_responses_payload(c)
   local head, err = agent_prompt(c.version, c.model_name)
   if head == nil then return nil, err end
-  local history, ierr = build_responses_input(messages_of(c.request), load_blobs(c.keys))
+  local history, ierr = build_responses_input(messages_of(c.request))
   if history == nil then return nil, ierr end
   local input = { { role = "developer", content = head } }
   for _, item in ipairs(history) do table.insert(input, item) end
@@ -1268,22 +1287,82 @@ local function log_cache_hit(usage, input_tokens)
   end
 end
 
+-- A stream that stops without its terminal event was cut off: an exit or the
+-- gateway dropped the connection cleanly, which the HTTP layer cannot tell
+-- from a finished stream. It must surface as a failure. Reported as a normal
+-- completion it makes the agent believe its turn ended mid-work, and a tool
+-- call cut off inside its arguments would reach the caller as a finished one.
+-- Readers report (true) after a complete stream and (false, info) otherwise,
+-- with info = {err, transient, truncated}.
+local function truncated_stream()
+  return {
+    err = fault("upstream stream ended without a terminal event", "server_error", 502),
+    transient = true,
+    truncated = true,
+  }
+end
+
+-- Codes that retrying elsewhere cannot fix.
+local PERMANENT_FAILURE_MARKERS = { "invalid", "context_length", "content", "policy", "unsupported" }
+
+-- Failure the upstream reported inside a 200 stream (response.failed, an
+-- error event, or an error chunk on the chat protocol).
+local function reported_failure(event)
+  local detail = event.error
+  if type(detail) ~= "table" and type(event.response) == "table" then detail = event.response.error end
+  if type(detail) ~= "table" then detail = event end
+  local code = tostring(detail.code or "")
+  local message = "upstream reported a failure"
+  if is_filled_string(detail.message) then message = "upstream stream failed: " .. detail.message:sub(1, 200) end
+  local transient = true
+  for _, marker in ipairs(PERMANENT_FAILURE_MARKERS) do
+    if code:find(marker, 1, true) then transient = false end
+  end
+  local err
+  if transient then
+    err = fault(message, "server_error", 502)
+  else
+    err = fault(message, "invalid_request_error", 400)
+  end
+  return { err = err, transient = transient }
+end
+
 local function new_chat_reader(c, emit)
   local reader = { emitted = false }
+  local terminal = false
+  local failure = nil
 
   function reader.line(line)
+    if line:match("^data: ?%[DONE%]") then
+      terminal = true
+      return
+    end
     local data = sse_data(line)
     if data == nil then return end
     local chunk = decode_json_table(data)
     if chunk == nil then return end
+    if type(chunk.error) == "table" then
+      failure = failure or reported_failure(chunk)
+      return
+    end
     local has_choices = type(chunk.choices) == "table" and #chunk.choices > 0
-    if not has_choices and chunk.usage == nil then return end
+    if has_choices then
+      for _, choice in ipairs(chunk.choices) do
+        if type(choice) == "table" and is_filled_string(choice.finish_reason) then terminal = true end
+      end
+    elseif chunk.usage == nil then
+      return
+    end
     chunk.model = c.full_model
     emit(chunk)
     reader.emitted = true
   end
 
-  function reader.finish() end
+  function reader.finish()
+    if failure ~= nil then return false, failure end
+    if not terminal then return false, truncated_stream() end
+    return true
+  end
 
   return reader
 end
@@ -1292,8 +1371,13 @@ local function new_responses_reader(c, emit)
   local reader = { emitted = false }
   local calls = {} -- output_index -> { call_id, name, args, emitted }
   local tool_count = 0
+  local first_call_id = nil -- anchor of the turn: what the client's history will carry
+  local text = {}
   local usage = nil
   local finish = "stop"
+  local blobs = {}
+  local terminal = false
+  local failure = nil
 
   local function send(chunk)
     chunk.model = c.full_model
@@ -1319,6 +1403,7 @@ local function new_responses_reader(c, emit)
     }
     tool_count = tool_count + 1
     slot.emitted = true
+    if first_call_id == nil and slot.call_id ~= "" then first_call_id = slot.call_id end
     return entry
   end
 
@@ -1333,7 +1418,8 @@ local function new_responses_reader(c, emit)
   end
 
   local function handle_terminal(event_type, response)
-    save_blobs(c.keys, reasoning_blobs(response))
+    terminal = true
+    blobs = reasoning_blobs(response)
     if type(response.usage) == "table" then
       local prompt = response.usage.input_tokens or 0
       local completion = response.usage.output_tokens or 0
@@ -1360,6 +1446,7 @@ local function new_responses_reader(c, emit)
     local event_type = event.type
     if event_type == "response.output_text.delta" then
       if is_filled_string(event.delta) then
+        table.insert(text, event.delta)
         send({ choices = { { index = 0, delta = { role = "assistant", content = event.delta } } } })
       end
     elseif event_type == "response.reasoning_summary_text.delta" then
@@ -1377,12 +1464,18 @@ local function new_responses_reader(c, emit)
       end
     elseif event_type == "response.completed" or event_type == "response.incomplete" then
       if type(event.response) == "table" then handle_terminal(event_type, event.response) end
+    elseif event_type == "response.failed" or event_type == "error" then
+      failure = failure or reported_failure(event)
     end
   end
 
   -- Terminal chunk: finish reason plus usage. Tool calls emitted above stay
-  -- out; anything accumulated but unemitted rides here.
+  -- out; anything accumulated but unemitted rides here. Only a stream that
+  -- reached response.completed or response.incomplete gets one: tool calls
+  -- accumulated by a cut-off stream are never delivered.
   function reader.finish()
+    if failure ~= nil then return false, failure end
+    if not terminal then return false, truncated_stream() end
     local indexes = {}
     for index, slot in pairs(calls) do
       if slot.name ~= "" and not slot.emitted then table.insert(indexes, index) end
@@ -1390,12 +1483,23 @@ local function new_responses_reader(c, emit)
     table.sort(indexes)
     local pending = {}
     for _, index in ipairs(indexes) do table.insert(pending, tool_call_entry(calls[index])) end
-    local terminal = { index = 0, delta = { role = "assistant" }, finish_reason = finish }
-    if #pending > 0 then terminal.delta.tool_calls = pending end
-    if tool_count > 0 then terminal.finish_reason = "tool_calls" end
-    local chunk = { choices = { terminal } }
+    local final = { index = 0, delta = { role = "assistant" }, finish_reason = finish }
+    if #pending > 0 then final.delta.tool_calls = pending end
+    if tool_count > 0 then final.finish_reason = "tool_calls" end
+    local chunk = { choices = { final } }
     if usage ~= nil then chunk.usage = usage end
     send(chunk)
+    if tool_count == 0 and #text == 0 then
+      llm_router.log("warn", "completion without output", { finish = finish })
+    end
+    local anchor = nil
+    if first_call_id ~= nil then
+      anchor = "call:" .. first_call_id
+    else
+      anchor = text_anchor(table.concat(text))
+    end
+    save_reasoning(anchor, blobs)
+    return true
   end
 
   return reader
@@ -1580,6 +1684,19 @@ local function transport_verdict(err)
   return STOP
 end
 
+-- Settles a reader after a clean end of stream. A cut-off or failed stream
+-- never counts as a completion: before anything reached the caller the
+-- request moves to the next exit (when the failure looks transient), after
+-- it the failure is final. `streaming` is false for unary requests, whose
+-- chunks only feed the collector and have not reached the caller.
+local function close_reader(px, reader, streaming)
+  local ok, info = reader.finish()
+  if ok then return "ok" end
+  if info.truncated then mark_exit(px, "server_error", SERVER_ERROR_TTL) end
+  if (streaming and reader.emitted) or not info.transient then return STOP, info.err end
+  return NEXT, info.err
+end
+
 -- One unary attempt. Returns (body) or (nil, verdict, err).
 local function attempt_unary(run, client, job, px)
   local resp, err = client:request({
@@ -1623,17 +1740,17 @@ local function attempt_stream(run, client, job, px, emit)
       reader.line(line)
     end,
   })
-  if err == nil then
-    reader.finish()
-    return "ok"
-  end
+  if err == nil then return close_reader(px, reader, true) end
   mark_exit_transport(px, err)
   -- The stream belongs to the attempt once output started: no failover.
   if reader.emitted then return STOP, err end
   return mapped_verdict or transport_verdict(err), err
 end
 
-local function log_attempt_failure(event, message, verdict, err, attempt)
+local function log_attempt_failure(run, event, message, verdict, err, attempt)
+  -- Rate limits and denials have their own counters; anything else is the
+  -- real cause the terminal message should not hide.
+  if verdict == NEXT and err.status ~= 429 and err.status ~= 403 then run.last_failure = err.message end
   local severity = "warn"
   if verdict == STOP then severity = "error" end
   llm_router.log(severity, message, {
@@ -1739,10 +1856,11 @@ llm_router.register("opencode-free", {
         local collector = new_collector()
         local reader = job.protocol.new_reader(job, collector.add)
         for line in (body .. "\n"):gmatch("([^\n]*)\n") do reader.line(line) end
-        reader.finish()
-        return true, collector.build(job.full_model)
+        local outcome, rerr = close_reader(px, reader, false)
+        if outcome == "ok" then return true, collector.build(job.full_model) end
+        verdict, ferr = outcome, rerr
       end
-      log_attempt_failure("http_error", "request failed", verdict, ferr, attempt)
+      log_attempt_failure(run, "http_error", "request failed", verdict, ferr, attempt)
       return verdict == STOP, nil, ferr
     end)
   end,
@@ -1760,7 +1878,7 @@ llm_router.register("opencode-free", {
         llm_router.log("debug", "stream completed", { endpoint = job.protocol.path, event = "stream_done" })
         return true
       end
-      log_attempt_failure("stream_error", "stream failed", outcome, serr, attempt)
+      log_attempt_failure(run, "stream_error", "stream failed", outcome, serr, attempt)
       return outcome == STOP, nil, serr
     end)
   end,
