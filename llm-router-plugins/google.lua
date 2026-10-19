@@ -1,6 +1,6 @@
 --- @plugin Google AI Studio
 --- @author TheSlopMachine
---- @version 5.2.0
+--- @version 5.2.3
 --- @plugin_api 1.5
 --- @description Google Gemini models via AI Studio API
 --- @allow_host generativelanguage.googleapis.com
@@ -85,9 +85,9 @@ local function usable_credentials(model_name)
   return usable, total
 end
 
--- Gemini serves US exits: proxy selection filters the pool accordingly.
-local PROXY_COUNTRIES = { "US" }
-
+-- Gemini API is served in most countries (not RU, BY, CN, IR and a few others):
+-- proxy selection accepts any exit from a country where free proxies are common.
+local PROXY_COUNTRIES = { "US", "DE", "FR", "GB", "NL", "CA", "SG", "JP", "IN", "BR", "PL", "ID", "TR", "SE", "IT", "ES", "KR", "AU" }
 -- Unconfigured providers go direct: only an explicit pool selection
 -- (dashboard proxy switch) routes through pooled exits.
 local function pick_proxies(ctx, limit)
@@ -174,6 +174,16 @@ local function map_upstream(ctx, resp, cred_id, model_name)
   end
   llm_router.log("debug", "unexpected status", { status = status, code = "server_error", cred_id = cred_id })
   return "proxy", { message = "gemini returned status " .. tostring(status), code = "server_error", status = status }
+end
+
+-- Exit-level failure: worth retrying the same request on the next proxy
+-- (5xx, or a geo block surfaced as 400).
+local function exit_retryable(resp)
+  if resp.status >= 500 then return true end
+  if resp.status == 400 then
+    return string.find(string.lower(tostring(resp.body or "")), "location is not supported", 1, true) ~= nil
+  end
+  return false
 end
 
 local function map_finish_reason(r)
@@ -1022,113 +1032,134 @@ llm_router.register("google", {
     end
     local client = llm_router.http_client({})
     local key = api_key_of(creds[1].data)
-    local url = BASE_URL .. "/models"
-    local infos = {}
-    while url do
-      local resp, err = client:request({
-        method = "GET",
-        url = url,
-        headers = { ["x-goog-api-key"] = key },
-      })
-      if err then return nil, err end
-      if resp.status ~= 200 then
-        return nil,
-          {
+    local exits, exits_err = pick_proxies(ctx, 5)
+    if not exits then return nil, exits_err end
+    local last_err = nil
+    for _, px in ipairs(exits) do
+      local failed = nil
+      local url = BASE_URL .. "/models"
+      local infos = {}
+      while url do
+        local resp, err = client:request({
+          method = "GET",
+          url = url,
+          headers = { ["x-goog-api-key"] = key },
+          proxy_url = px.url,
+        })
+        if err then
+          llm_router.log("debug", "discovery transport error", { reason = tostring(err.message or err) })
+          failed = err
+          break
+        end
+        if resp.status ~= 200 then
+          llm_router.log("error", "google discovery rejected", {
+            status = resp.status,
+            body = string.sub(tostring(resp.body or ""), 1, 500),
+          })
+          local derr = {
             message = "google model discovery failed with status " .. tostring(resp.status),
             code = "server_error",
             status = resp.status,
           }
-      end
-      local page = json.decode(resp.body)
-      for _, entry in ipairs(page.models or {}) do
-        local name = model_short_name(entry)
-        local skip = false
-        if not supports_generate_content(entry) then skip = true end
-        local lower = name:lower()
-        -- Embedding models serve :embedContent instead of :generateContent;
-        -- they are listed below with the embeddings endpoint, not skipped.
-        local is_embedding = lower:find("embedding", 1, true) ~= nil
-        if is_embedding then
-          for _, m in ipairs(entry.supportedGenerationMethods or {}) do
-            if m == "embedContent" then skip = false end
+          if exit_retryable(resp) then
+            failed = derr
+            break
           end
+          return nil, derr
         end
-        if lower:find("aqa", 1, true) then skip = true end
-        if not skip then
-          local display = entry.displayName
-          if display == nil or display == "" then display = name end
-          -- Gemini vision/audio input is real for gemini-family models;
-          -- gemma-4 takes images (audio unverified). Other families stay
-          -- text-only. Output stays text: this adapter never requests
-          -- IMAGE/AUDIO response modalities on chat completions.
-          local in_modalities = { "text" }
-          if lower:match("^gemini") then
-            in_modalities = { "text", "image", "audio" }
-          elseif lower:match("^gemma") then
-            in_modalities = { "text", "image" }
-          end
-          local out_modalities = { "text" }
-          local endpoints = nil
-          local params = {
-            "tools",
-            "tool_choice",
-            "response_format",
-            "structured_outputs",
-            "temperature",
-            "top_p",
-            "max_tokens",
-            "seed",
-            "stop",
-            "reasoning",
-            "reasoning_effort",
-            "web_search",
-          }
+        local page = json.decode(resp.body)
+        for _, entry in ipairs(page.models or {}) do
+          local name = model_short_name(entry)
+          local skip = false
+          if not supports_generate_content(entry) then skip = true end
+          local lower = name:lower()
+          -- Embedding models serve :embedContent instead of :generateContent;
+          -- they are listed below with the embeddings endpoint, not skipped.
+          local is_embedding = lower:find("embedding", 1, true) ~= nil
           if is_embedding then
-            -- Embedding models take text in and return vectors; no chat.
-            in_modalities = { "text" }
-            out_modalities = { "embedding" }
-            endpoints = { "embeddings" }
-            params = { "dimensions" }
-          elseif is_tts_model(name) then
-            -- TTS previews take text in and speak audio out; they do not chat.
-            in_modalities = { "text" }
-            out_modalities = { "audio" }
-            endpoints = { "audio/speech" }
-            params = { "temperature" }
-          elseif is_image_model(name) then
-            -- Nano Banana family chats and renders images.
-            out_modalities = { "text", "image" }
-            endpoints = { "chat/completions", "images/generations" }
+            for _, m in ipairs(entry.supportedGenerationMethods or {}) do
+              if m == "embedContent" then skip = false end
+            end
           end
-          local info = {
-            name = name,
-            display_name = display,
-            rpm = estimate_rpm(name),
-            tpm = estimate_tpm(name),
-            rpd = estimate_rpd(name),
-            context_window = entry.inputTokenLimit or 0,
-            max_tokens = entry.outputTokenLimit or 0,
-            input_modalities = in_modalities,
-            output_modalities = out_modalities,
-            supported_parameters = params,
-          }
-          if endpoints then info.endpoints = endpoints end
-          table.insert(infos, info)
-          if entry.thinking == true then
-            infos[#infos].reasoning = {
-              default_enabled = true,
-              supported_efforts = { "high", "medium", "low", "minimal", "none" },
+          if lower:find("aqa", 1, true) then skip = true end
+          if not skip then
+            local display = entry.displayName
+            if display == nil or display == "" then display = name end
+            -- Gemini vision/audio input is real for gemini-family models;
+            -- gemma-4 takes images (audio unverified). Other families stay
+            -- text-only. Output stays text: this adapter never requests
+            -- IMAGE/AUDIO response modalities on chat completions.
+            local in_modalities = { "text" }
+            if lower:match("^gemini") then
+              in_modalities = { "text", "image", "audio" }
+            elseif lower:match("^gemma") then
+              in_modalities = { "text", "image" }
+            end
+            local out_modalities = { "text" }
+            local endpoints = nil
+            local params = {
+              "tools",
+              "tool_choice",
+              "response_format",
+              "structured_outputs",
+              "temperature",
+              "top_p",
+              "max_tokens",
+              "seed",
+              "stop",
+              "reasoning",
+              "reasoning_effort",
+              "web_search",
             }
+            if is_embedding then
+              -- Embedding models take text in and return vectors; no chat.
+              in_modalities = { "text" }
+              out_modalities = { "embedding" }
+              endpoints = { "embeddings" }
+              params = { "dimensions" }
+            elseif is_tts_model(name) then
+              -- TTS previews take text in and speak audio out; they do not chat.
+              in_modalities = { "text" }
+              out_modalities = { "audio" }
+              endpoints = { "audio/speech" }
+              params = { "temperature" }
+            elseif is_image_model(name) then
+              -- Nano Banana family chats and renders images.
+              out_modalities = { "text", "image" }
+              endpoints = { "chat/completions", "images/generations" }
+            end
+            local info = {
+              name = name,
+              display_name = display,
+              rpm = estimate_rpm(name),
+              tpm = estimate_tpm(name),
+              rpd = estimate_rpd(name),
+              context_window = entry.inputTokenLimit or 0,
+              max_tokens = entry.outputTokenLimit or 0,
+              input_modalities = in_modalities,
+              output_modalities = out_modalities,
+              supported_parameters = params,
+            }
+            if endpoints then info.endpoints = endpoints end
+            table.insert(infos, info)
+            if entry.thinking == true then
+              infos[#infos].reasoning = {
+                default_enabled = true,
+                supported_efforts = { "high", "medium", "low", "minimal", "none" },
+              }
+            end
           end
         end
+        if page.nextPageToken and page.nextPageToken ~= "" then
+          url = BASE_URL .. "/models?pageToken=" .. page.nextPageToken
+        else
+          url = nil
+        end
       end
-      if page.nextPageToken and page.nextPageToken ~= "" then
-        url = BASE_URL .. "/models?pageToken=" .. page.nextPageToken
-      else
-        url = nil
-      end
+      if not failed then return infos end
+      last_err = failed
     end
-    return infos
+    return nil, last_err
   end,
 
   -- Account liveness: the keyed /models listing answers 200 for live keys.
@@ -1138,11 +1169,18 @@ llm_router.register("google", {
     local key = api_key_of(credential.data)
     if key == "" then return { status = "unhealthy", message = "api_key is required" } end
     local client = llm_router.http_client({ timeout_ms = 15000 })
-    local resp, err = client:request({
-      method = "GET",
-      url = BASE_URL .. "/models",
-      headers = { ["x-goog-api-key"] = key },
-    })
+    local exits, exits_err = pick_proxies(ctx, 5)
+    if not exits then return { status = "unknown", message = exits_err.message } end
+    local resp, err
+    for _, px in ipairs(exits) do
+      resp, err = client:request({
+        method = "GET",
+        url = BASE_URL .. "/models",
+        headers = { ["x-goog-api-key"] = key },
+        proxy_url = px.url,
+      })
+      if err == nil and not exit_retryable(resp) then break end
+    end
     if err then
       local message = "request failed"
       if type(err) == "table" and type(err.message) == "string" then message = err.message end
