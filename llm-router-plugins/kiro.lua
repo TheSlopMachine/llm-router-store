@@ -1,6 +1,6 @@
 --- @plugin Kiro AI
 --- @author TheSlopMachine
---- @version 5.2.2
+--- @version 5.3.0
 --- @plugin_api 1.5
 --- @description AWS Kiro models via device login (OAuth2 with proactive refresh)
 --- @allow_host codewhisperer.us-east-1.amazonaws.com
@@ -90,18 +90,30 @@ local function parse_model_list(body)
         local name = item.modelName
         if type(name) ~= "string" or name == "" then name = item.name end
         if type(name) ~= "string" or name == "" then name = id end
+        -- Raw catalog entry, so real capabilities (input types, limits) can be read.
+        local raw_ok, raw = pcall(json.encode, item)
+        llm_router.log("info", "kiro catalog entry", { model = id, raw = raw_ok and string.sub(raw, 1, 2000) or "unencodable" })
         local context = 200000
+        local max_output = 32000
         if type(item.tokenLimits) == "table" then
           local max_input = tonumber(item.tokenLimits.maxInputTokens)
           if max_input and max_input > 0 then context = math.floor(max_input) end
+          local out_limit = tonumber(item.tokenLimits.maxOutputTokens)
+          if out_limit and out_limit > 0 then max_output = math.floor(out_limit) end
+        end
+        local modalities = { "text" }
+        if type(item.supportedInputTypes) == "table" then
+          for _, kind in ipairs(item.supportedInputTypes) do
+            if tostring(kind):upper() == "IMAGE" then table.insert(modalities, "image") end
+          end
         end
         table.insert(out, {
           name = id,
           display_name = name,
           context_window = context,
-          max_tokens = 32000,
+          max_tokens = max_output,
           supported_parameters = { "tools" },
-          input_modalities = { "text" },
+          input_modalities = modalities,
           output_modalities = { "text" },
           endpoints = { "chat/completions" },
         })
@@ -124,8 +136,14 @@ local function fetch_model_list(client, url, token, profile_arn)
       ["User-Agent"] = "AWS-SDK-JS/3.0.0 kiro-ide/1.0.0",
     },
   })
-  if err then return nil end
-  if resp.status ~= 200 then return nil end
+  if err then
+    llm_router.log("warn", "kiro catalog request failed", { url = url, reason = type(err) == "table" and tostring(err.message) or tostring(err) })
+    return nil
+  end
+  if resp.status ~= 200 then
+    llm_router.log("warn", "kiro catalog rejected", { url = url, status = resp.status, body = string.sub(tostring(resp.body or ""), 1, 300) })
+    return nil
+  end
   return parse_model_list(resp.body)
 end
 
@@ -185,7 +203,7 @@ local function with_thinking_variants(models)
         context_window = m.context_window,
         max_tokens = m.max_tokens,
         supported_parameters = { "tools" },
-        input_modalities = { "text" },
+        input_modalities = m.input_modalities,
         output_modalities = { "text" },
         endpoints = { "chat/completions" },
         reasoning = { default_enabled = true, supported_efforts = { "max", "xhigh", "high", "medium", "low" } },
@@ -421,6 +439,28 @@ end
 
 local function invalid_request(message) return { message = message, code = "invalid_request_error", status = 400 } end
 
+local IMAGE_FORMATS = { ["image/png"] = "png", ["image/jpeg"] = "jpeg", ["image/jpg"] = "jpeg", ["image/gif"] = "gif", ["image/webp"] = "webp" }
+
+-- Image parts of a user message as Kiro images. Kiro takes inline base64
+-- only, so remote URLs are refused instead of being dropped silently.
+local function message_images(m)
+  local out = {}
+  if type(m.content) ~= "table" then return out, nil end
+  for _, p in ipairs(m.content) do
+    if type(p) == "table" and (p.type == "image_url" or p.image_url ~= nil) then
+      local url = p.image_url
+      if type(url) == "table" then url = url.url end
+      if type(url) ~= "string" then return nil, invalid_request("image_url part has no url") end
+      local mime, data = url:match("^data:([^;,]+);base64,(.+)$")
+      if not mime then return nil, invalid_request("kiro accepts images only as base64 data URLs") end
+      local format = IMAGE_FORMATS[mime:lower()]
+      if not format then return nil, invalid_request("unsupported image type: " .. mime) end
+      table.insert(out, { format = format, source = { bytes = data } })
+    end
+  end
+  return out, nil
+end
+
 -- Bedrock rejects a tool schema whose required field is not an array of
 -- property names. An empty Lua table encodes as a JSON object, so an empty
 -- required list is omitted instead of transmitted.
@@ -505,6 +545,7 @@ local function convert_messages(messages, tools, model)
   local history = {}
   local current_role = nil
   local user_parts = {}
+  local user_images = {}
   local assistant_parts = {}
   local tool_results = {}
   local tool_specifications = nil
@@ -516,12 +557,13 @@ local function convert_messages(messages, tools, model)
 
   local function flush_user()
     local content = table.concat(user_parts, "\n\n"):match("^%s*(.-)%s*$")
-    if content == "" and #tool_results == 0 then
+    if content == "" and #tool_results == 0 and #user_images == 0 then
       user_parts = {}
       return
     end
     local msg = { content = content, modelId = model }
-    if msg.content == "" then msg.content = "continue" end
+    if msg.content == "" then msg.content = (#user_images > 0) and "(image attached)" or "continue" end
+    if #user_images > 0 then msg.images = user_images end
     if #tool_results > 0 then msg.userInputMessageContext = { toolResults = tool_results } end
     if #tools > 0 and #history == 0 then
       msg.userInputMessageContext = msg.userInputMessageContext or {}
@@ -529,6 +571,7 @@ local function convert_messages(messages, tools, model)
     end
     table.insert(history, { userInputMessage = msg })
     user_parts = {}
+    user_images = {}
     tool_results = {}
   end
 
@@ -577,6 +620,9 @@ local function convert_messages(messages, tools, model)
       else
         local text = message_text(m):match("^%s*(.-)%s*$")
         if text ~= "" then table.insert(user_parts, text) end
+        local images, image_error = message_images(m)
+        if image_error then return nil, nil, image_error end
+        for _, image in ipairs(images) do table.insert(user_images, image) end
       end
     end
   end
@@ -1001,8 +1047,14 @@ local function do_refresh(data)
       grantType = "refresh_token",
     }),
   })
-  if err then return nil end
-  if resp.status ~= 200 then return nil end
+  if err then
+    llm_router.log("warn", "kiro token refresh failed", { reason = type(err) == "table" and tostring(err.message) or tostring(err) })
+    return nil
+  end
+  if resp.status ~= 200 then
+    llm_router.log("warn", "kiro token refresh rejected", { status = resp.status, body = string.sub(tostring(resp.body or ""), 1, 300) })
+    return nil
+  end
   local out = json.decode(resp.body)
   if not out.accessToken or out.accessToken == "" then return nil end
   local merged = {}
@@ -1180,30 +1232,33 @@ llm_router.register("kiro", {
     if #creds == 0 then
       return nil, { message = "no kiro credentials configured", code = "invalid_request_error", status = 400 }
     end
-    local first = creds[1]
-    local token = token_of(first.data)
-    if token == "" then
-      return nil,
-        {
-          message = "kiro access token is required for model discovery",
-          code = "authentication_error",
-          status = 401,
-        }
+    local with_token = 0
+    for _, cred in ipairs(creds) do
+      local token = token_of(cred.data)
+      if token ~= "" then
+        with_token = with_token + 1
+        local data = cred.data or {}
+        local region = runtime_region(cred, ctx.provider_config)
+        -- Short cap: with several credentials an unreachable AWS would otherwise
+        -- hold discovery for minutes.
+        local client = llm_router.http_client({ timeout_ms = 20000 })
+        for _, url in ipairs(discovery_endpoints(region)) do
+          local models = fetch_model_list(client, url, token)
+          if models then return with_thinking_variants(models) end
+        end
+        -- Desktop-style accounts serve the catalog under their profile ARN.
+        -- Builder ID must not send it (yields 403), so this stays a retry.
+        local arn = data.profile_arn
+        if type(arn) ~= "string" or arn == "" then arn = data.profileArn end
+        if type(arn) == "string" and arn ~= "" then
+          local models = fetch_model_list(client, discovery_endpoints(region)[1], token, arn)
+          if models then return with_thinking_variants(models) end
+        end
+        llm_router.log("warn", "kiro discovery failed for credential", { cred_id = cred.id })
+      end
     end
-    local data = first.data or {}
-    local region = runtime_region(first, ctx.provider_config)
-    local client = llm_router.http_client({})
-    for _, url in ipairs(discovery_endpoints(region)) do
-      local models = fetch_model_list(client, url, token)
-      if models then return with_thinking_variants(models) end
-    end
-    -- Desktop-style accounts serve the catalog under their profile ARN.
-    -- Builder ID must not send it (yields 403), so this stays a retry.
-    local arn = data.profile_arn
-    if type(arn) ~= "string" or arn == "" then arn = data.profileArn end
-    if type(arn) == "string" and arn ~= "" then
-      local models = fetch_model_list(client, discovery_endpoints(region)[1], token, arn)
-      if models then return with_thinking_variants(models) end
+    if with_token == 0 then
+      return nil, { message = "kiro access token is required for model discovery", code = "authentication_error", status = 401 }
     end
     return nil, { message = "kiro model discovery failed on every region", code = "server_error", status = 502 }
   end,
