@@ -1,6 +1,6 @@
 --- @plugin Google AI Studio
 --- @author TheSlopMachine
---- @version 5.2.3
+--- @version 5.2.4
 --- @plugin_api 1.5
 --- @description Google Gemini models via AI Studio API
 --- @allow_host generativelanguage.googleapis.com
@@ -69,17 +69,60 @@ local function set_cooldown(cred_id, model_name, ttl_secs)
   )
 end
 
+-- Google stops serving some models to a project ("no longer available to
+-- new users"). That is per key, so it is remembered per credential+model
+-- for a day: other keys still get their own try.
+local DEAD_SCOPE = "model_dead"
+local DEAD_TTL_SECS = 86400
+
+local function mark_model_dead(cred_id, model_name)
+  pcall(
+    llm_router.storage.set,
+    DEAD_SCOPE,
+    cooldown_key(cred_id, model_name),
+    { at = os.time(), reason = "no longer available" },
+    { ttl = DEAD_TTL_SECS }
+  )
+end
+
+local function model_dead_for(cred_id, model_name)
+  local ok, value = pcall(llm_router.storage.get, DEAD_SCOPE, cooldown_key(cred_id, model_name))
+  return ok and value ~= nil
+end
+
+-- True when every given credential has been told the model is gone.
+local function dead_everywhere(creds, model_name)
+  if #creds == 0 then return false end
+  for _, cred in ipairs(creds) do
+    if not model_dead_for(cred.id, model_name) then return false end
+  end
+  return true
+end
+
+local function model_dead_everywhere(model_name)
+  return dead_everywhere(llm_router.credentials.list(), model_name)
+end
+
+-- code=not_found makes the router drop the model from its cache.
+local function model_gone_error()
+  return { message = "gemini model is no longer available to these keys", code = "not_found", status = 404 }
+end
+
 -- Credentials not cooling down for this model. Returns (usable, total):
 -- an empty usable set with a positive total means every key hit this
 -- model's quota, never a credential-wide outage.
 local function usable_credentials(model_name)
   local usable, total = {}, 0
   for _, cred in ipairs(llm_router.credentials.list()) do
-    total = total + 1
-    if cooldown_active(cred.id, model_name) then
-      llm_router.log("debug", "credential cooling down", { cred_id = cred.id, model = model_name })
+    if model_dead_for(cred.id, model_name) then
+      llm_router.log("debug", "model dead for credential", { cred_id = cred.id, model = model_name })
     else
-      table.insert(usable, cred)
+      total = total + 1
+      if cooldown_active(cred.id, model_name) then
+        llm_router.log("debug", "credential cooling down", { cred_id = cred.id, model = model_name })
+      else
+        table.insert(usable, cred)
+      end
     end
   end
   return usable, total
@@ -121,6 +164,24 @@ local function pick_proxies(ctx, limit)
   return res.proxies
 end
 
+-- Generation with grounding can run past a minute; the router default (60s)
+-- cuts it off. Applied to complete and complete_stream.
+local HTTP_TIMEOUT_MS = 300000
+
+-- A timed-out request is slow generation, not a bad exit: retrying it on the
+-- next proxy only repeats the wait.
+local function is_timeout_err(err)
+  local text = string.lower(tostring(err.message or "") .. " " .. tostring(err.code or ""))
+  return string.find(text, "timeout", 1, true) ~= nil or string.find(text, "deadline", 1, true) ~= nil
+end
+
+-- Debug detail: status, truncated Google body and request context.
+local function log_http_failure(stage, status, body, extra)
+  local fields = { stage = stage, status = status, body = string.sub(tostring(body or ""), 1, 1000) }
+  for k, v in pairs(extra or {}) do fields[k] = v end
+  llm_router.log("error", "http failure", fields)
+end
+
 -- Google specifics: geo/auth wording on 400s, key+model-bound quotas.
 -- Outcomes map to loop decisions: "proxy" retries the same credential on
 -- the next exit, "cred" moves to the next credential, "done" returns the
@@ -128,6 +189,7 @@ end
 local function map_upstream(ctx, resp, cred_id, model_name)
   local lower = string.lower(tostring(resp.body or ""))
   local status = resp.status
+  log_http_failure("upstream", status, resp.body, { cred_id = cred_id, model = model_name })
   if status == 400 and string.find(lower, "location is not supported", 1, true) then
     -- Geo-blocked: the proxy exit is at fault, not the request.
     llm_router.log("debug", "location blocked", { status = status, code = "server_error", cred_id = cred_id })
@@ -159,6 +221,19 @@ local function map_upstream(ctx, resp, cred_id, model_name)
     llm_router.log("warn", "rate limited", { status = status, code = "rate_limit", cred_id = cred_id, model = model_name })
     return "cred", { message = "gemini rate limited", code = "rate_limit", status = 429 }
   end
+  if status == 404 and string.find(lower, "no longer available", 1, true) then
+    mark_model_dead(cred_id, model_name)
+    llm_router.log("warn", "model no longer available to key", { status = status, code = "not_found", cred_id = cred_id, model = model_name })
+    return "cred", model_gone_error()
+  end
+  if
+    (status == 503 and (string.find(lower, "unavailable", 1, true) or string.find(lower, "high demand", 1, true)))
+    or (status == 504 and string.find(lower, "deadline_exceeded", 1, true))
+  then
+    -- The model itself is overloaded: other keys hit the same backend.
+    llm_router.log("warn", "model overloaded", { status = status, code = "server_error", cred_id = cred_id, model = model_name })
+    return "done", { message = "gemini model overloaded, try again later", code = "server_error", status = status }
+  end
   if status == 404 then
     llm_router.log("error", "model not found", { status = status, code = "not_found", cred_id = cred_id })
     return "done", { message = "gemini model not found", code = "not_found", status = 404 }
@@ -174,6 +249,34 @@ local function map_upstream(ctx, resp, cred_id, model_name)
   end
   llm_router.log("debug", "unexpected status", { status = status, code = "server_error", cred_id = cred_id })
   return "proxy", { message = "gemini returned status " .. tostring(status), code = "server_error", status = status }
+end
+
+-- Debug: was the native search tool sent, and did the model actually search?
+local function log_search_request(request, payload, model_name)
+  local sent = false
+  for _, t in ipairs(payload.tools or {}) do
+    if t.googleSearch ~= nil then sent = true end
+  end
+  local n = 0
+  if type(request.tools) == "table" then n = #request.tools end
+  llm_router.log("debug", "search request", { model = model_name, request_tools = n, search_tool_sent = sent })
+end
+
+local function log_grounding_result(model_name, g)
+  local cand = type(g) == "table" and g.candidates and g.candidates[1] or nil
+  local meta = cand and cand.groundingMetadata or nil
+  local queries = meta and meta.webSearchQueries or nil
+  local count, first = 0, ""
+  if type(queries) == "table" then
+    count = #queries
+    first = string.sub(tostring(queries[1] or ""), 1, 120)
+  end
+  llm_router.log("debug", "grounding result", {
+    model = model_name,
+    grounded = meta ~= nil,
+    search_queries = count,
+    first_query = first,
+  })
 end
 
 -- Exit-level failure: worth retrying the same request on the next proxy
@@ -614,6 +717,7 @@ local function build_tools(request, provider_config)
 end
 
 local function is_gemini3(model) return (model:lower():match("^gemini%-3") ~= nil) end
+local function is_gemma(model) return (model:lower():match("^gemma") ~= nil) end
 
 local function build_generation_config(request, model)
   local cfg = nil
@@ -652,7 +756,9 @@ local function build_generation_config(request, model)
   local effort = request.reasoning_effort
   if type(effort) == "string" and effort ~= "" then
     if effort == "none" then
-      ensure().thinkingConfig = { thinkingBudget = 0 }
+      -- Gemma rejects any thinking budget ("Thinking budget is not supported
+      -- for this model"), so omit the config for it.
+      if not is_gemma(model) then ensure().thinkingConfig = { thinkingBudget = 0 } end
     elseif effort == "minimal" then
       -- Dynamic thinking, no summaries. thinkingLevel is Gemini-3-only.
       if is_gemini3(model) then ensure().thinkingConfig = { thinkingLevel = "MINIMAL" } end
@@ -1082,6 +1188,7 @@ llm_router.register("google", {
             end
           end
           if lower:find("aqa", 1, true) then skip = true end
+          if not skip and dead_everywhere(creds, name) then skip = true end
           if not skip then
             local display = entry.displayName
             if display == nil or display == "" then display = name end
@@ -1219,6 +1326,9 @@ llm_router.register("google", {
     end
     local model_name = request_model_name(model_ref.model_name or "")
     if model_name == "" then return { status = "unknown", message = "model name is required" } end
+    if model_dead_everywhere(model_name) then
+      return { status = "unhealthy", message = "model no longer available to these keys" }
+    end
     local creds, total = usable_credentials(model_name)
     if #creds == 0 and total > 0 then
       return { status = "quota_exceeded", message = "quota exhausted" }
@@ -1278,10 +1388,12 @@ llm_router.register("google", {
   end,
 
   complete = function(ctx, request)
-    local client = llm_router.http_client({})
+    local client = llm_router.http_client({ timeout_ms = HTTP_TIMEOUT_MS })
     local payload, perr = build_payload(request, ctx.provider_config)
     if perr then return nil, perr end
     local model_name = request_model_name(request.model_name)
+    if model_dead_everywhere(model_name) then return nil, model_gone_error() end
+    log_search_request(request, payload, model_name)
     local creds, total = usable_credentials(model_name)
     if #creds == 0 and total > 0 then
       return nil, { message = "gemini rate limited", code = "rate_limit", status = 429 }
@@ -1301,9 +1413,21 @@ llm_router.register("google", {
           proxy_url = px.url,
         })
         if err == nil and resp.status == 200 then
+          llm_router.log("debug", "request served", { model = model_name, cred_id = cred.id })
+          local parsed_ok, parsed = pcall(json.decode, resp.body)
+          log_grounding_result(model_name, parsed_ok and parsed or nil)
           return assemble_completion(resp.body, request.model)
         elseif err ~= nil then
-          llm_router.log("debug", "transport error", { reason = tostring(err.message or "transport error"), code = err.code, cred_id = cred.id })
+          log_http_failure("transport", nil, nil, {
+            reason = tostring(err.message or "transport error"),
+            code = tostring(err.code or ""),
+            cred_id = cred.id,
+            model = model_name,
+            proxy = px.url or "direct",
+          })
+          if is_timeout_err(err) then
+            return nil, { message = "gemini request timed out after " .. tostring(math.floor(HTTP_TIMEOUT_MS / 1000)) .. "s", code = "server_error", status = 504 }
+          end
           last_err = err
         else
           local action, terr = map_upstream(ctx, resp, cred.id, model_name)
@@ -1319,12 +1443,14 @@ llm_router.register("google", {
   end,
 
   complete_stream = function(ctx, request, emit)
-    local client = llm_router.http_client({})
+    local client = llm_router.http_client({ timeout_ms = HTTP_TIMEOUT_MS })
     local payload, perr = build_payload(request, ctx.provider_config)
     if perr then return nil, perr end
     local full_model = request.model
     local chunk_id = "google-" .. tostring(os.time())
     local model_name = request_model_name(request.model_name)
+    if model_dead_everywhere(model_name) then return nil, model_gone_error() end
+    log_search_request(request, payload, model_name)
     local creds, total = usable_credentials(model_name)
     if #creds == 0 and total > 0 then
       return nil, { message = "gemini rate limited", code = "rate_limit", status = 429 }
@@ -1341,6 +1467,7 @@ llm_router.register("google", {
         -- means "run the tools": Gemini sends a bare STOP after the call.
         local saw_tools = false
         local done = false
+        local grounding_logged = false
         local fatal = false
         local next_cred = false
         local resp, stream_err = client:stream({
@@ -1363,6 +1490,10 @@ llm_router.register("google", {
             local ok, g = pcall(json.decode, data)
             if not ok or type(g) ~= "table" then return end
             local cand = g.candidates and g.candidates[1]
+            if cand and cand.groundingMetadata and not grounding_logged then
+              grounding_logged = true
+              log_grounding_result(model_name, g)
+            end
             if cand then
               local out = { text = {}, reasoning = {}, toolcalls = {} }
               collect_parts(cand, out, tool_seq)
@@ -1417,8 +1548,19 @@ llm_router.register("google", {
           end,
         })
         if stream_err then
+          log_http_failure("transport", nil, nil, {
+            reason = tostring(stream_err.message or "transport error"),
+            code = tostring(stream_err.code or ""),
+            cred_id = cred.id,
+            model = model_name,
+            proxy = px.url or "direct",
+          })
+          if is_timeout_err(stream_err) then
+            return nil, { message = "gemini request timed out after " .. tostring(math.floor(HTTP_TIMEOUT_MS / 1000)) .. "s", code = "server_error", status = 504 }
+          end
           last_err = stream_err
         else
+          llm_router.log("debug", "request served", { model = model_name, cred_id = cred.id })
           return
         end
         if fatal then return nil, last_err end
