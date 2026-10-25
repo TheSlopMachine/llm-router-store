@@ -1,6 +1,6 @@
 --- @plugin OpenCode Free
 --- @author TheSlopMachine
---- @version 6.6.1
+--- @version 6.7.0
 --- @plugin_api 1.5
 --- @description OpenAI/Anthropic/Google compatible free provider OpenCode Free (no key required)
 --- @allow_host opencode.ai
@@ -674,12 +674,19 @@ end
 -- Exit selection and rate-limit memory
 ---------------------------------------------------------------------------
 
--- The anonymous tier enforces its quota per exit IP and the limit lifts
--- after about six hours. A 429 marks the exit in plugin storage with that
--- TTL; selection skips marked exits, so a limited IP is never retried until
--- the entry expires. Expired rows read as missing. Storage faults fail open:
--- an unmarked exit only costs one extra attempt.
-local RL_SCOPE = "exit_limited"
+-- Upstream limits one model on one exit, not the exit as a whole: a 429 marks
+-- that exit + model pair in plugin storage for the upstream retry horizon
+-- (six hours without one). Selection skips a marked pair for that model only,
+-- so the same exit keeps serving every other model. Once the unmarked exits are
+-- spent, the soonest-expiring marked pairs are retried (see exit_stream). Exit-
+-- wide marks (403, 5xx, transport faults) live in RL_SCOPE and are retried
+-- last, after the pair-parked exits. Its name is not the 6.6.x "exit_limited": storage survives updates,
+-- and those old rows hold whole-exit 429 marks that would block every model.
+-- Under the new name they are never read and expire on their own TTL. Expired
+-- rows read as missing. Storage faults fail open: an unmarked pair only costs
+-- one extra attempt.
+local RL_SCOPE = "exit_blocked"
+local RL_MODEL_SCOPE = "exit_model_limited"
 local RL_TTL = 6 * 3600
 local RL_NS = "6d3c2b0e-8f55-4c0a-9d4e-1b7a5e2f9c31"
 -- A 403 marks the exit for an hour: blocked egress addresses recover sooner
@@ -706,16 +713,57 @@ local function exit_key(px)
   return llm_router.uuid_v5(RL_NS, px.url)
 end
 
--- The direct exit is never parked: without a pool it is the only egress, so
--- parking it blocks every request until the entry expires.
-local function exit_limited(px)
-  if is_direct(px) then return false end
-  return store_get(RL_SCOPE, exit_key(px)) ~= nil
+-- Pair key for model-scoped marks: the model name joins the proxy URL in the
+-- hash input, so each exit holds one independent mark per upstream model. The
+-- URL stays hashed, so embedded credentials never land in storage.
+local function pair_key(px, model_name)
+  return llm_router.uuid_v5(RL_NS, px.url .. "\n" .. model_name)
+end
+
+-- The direct exit is never parked, model-scoped marks included: without a pool
+-- it is the only egress, so a parked pair would fail that model for the whole
+-- upstream horizon with no fallback.
+local BLOCKED, PARKED = "blocked", "parked"
+
+-- Why an exit is out of rotation for one model: nil when it is usable, BLOCKED
+-- for an exit-wide mark, or PARKED with the pair row when only its 429 mark is
+-- live.
+local function exit_mark(px, model_name)
+  if is_direct(px) then return nil end
+  local blocked = store_get(RL_SCOPE, exit_key(px))
+  if blocked ~= nil then return BLOCKED, blocked end
+  local row = store_get(RL_MODEL_SCOPE, pair_key(px, model_name))
+  if row ~= nil then return PARKED, row end
+  return nil
 end
 
 local function mark_exit(px, reason, ttl)
   if is_direct(px) then return end
-  store_set(RL_SCOPE, exit_key(px), { at = os.time(), reason = reason }, ttl)
+  local now = os.time()
+  store_set(RL_SCOPE, exit_key(px), { at = now, reason = reason, ["until"] = now + ttl }, ttl)
+end
+
+-- A 429 parks the exit for this upstream model only. The row keeps its expiry
+-- as `until` (epoch seconds), so parked retries can run soonest-expiring first.
+local function mark_exit_model(px, model_name, reason, ttl)
+  if is_direct(px) then return end
+  local now = os.time()
+  store_set(RL_MODEL_SCOPE, pair_key(px, model_name), {
+    at = now, reason = reason, model = model_name, ["until"] = now + ttl,
+  }, ttl)
+end
+
+-- A parked retry that answers cleanly is back in rotation: its pair mark goes
+-- at once instead of living out the TTL.
+local function clear_pair(px, model_name)
+  if is_direct(px) then return end
+  store_delete(RL_MODEL_SCOPE, pair_key(px, model_name))
+end
+
+-- A clean answer from an exit-wide-blocked exit lifts its block.
+local function clear_exit(px)
+  if is_direct(px) then return end
+  store_delete(RL_SCOPE, exit_key(px))
 end
 
 -- Transport breaks bind to the exit, not the request. Marks are short so
@@ -732,49 +780,85 @@ local function mark_exit_transport(px, err)
   })
 end
 
--- Lazy exit iterator: yields one unmarked exit per call, fetching past
--- marked pool heads on demand. Returns the next function plus a counts table
--- carrying skipped. Ends (nil) when the pool is exhausted or the direct
--- fallback is spent. The pool search waits for live exits on the first fetch
--- only; later fetches never wait. A direct pool or an expired wait degrades
--- to one direct attempt, and the direct leg is never parked. A cancelled
--- request ends the iteration: cancellation never degrades to a direct hit.
-local function exit_stream(provider_config)
+-- Most last-resort retries one request may make. The last-resort tier holds the
+-- pair-parked exits and the exit-wide-blocked exits, soonest expiry first. This
+-- cap bounds the extra upstream calls a limited model can cost per request.
+local LAST_RESORT_CAP = 10
+
+-- Lazy exit iterator, in phases. Pool: yields unmarked exits one per call,
+-- fetching past marked pool heads on demand; marked exits are collected for the
+-- last-resort tier. Direct: once the pool is exhausted, the direct fallback is
+-- yielded (never marked). Last resort: the soonest-expiring marked exits, pair
+-- parks and exit-wide blocks alike, at most LAST_RESORT_CAP, each yielded with
+-- its kind ("parked" or "blocked"). Returns the next function plus a counts
+-- table carrying skipped, seen (every exit fetched), model_name, and cancelled.
+-- Ends (nil) when every phase is spent, or at once when the request is
+-- cancelled: cancellation never degrades to a direct hit or a last-resort retry.
+-- The pool search waits for live exits on the first fetch only; later fetches
+-- never wait.
+local function exit_stream(provider_config, job)
   local pool = nil
   if type(provider_config) == "table" and type(provider_config.proxy) == "table" then
     local configured = provider_config.proxy.pool
     if type(configured) == "string" and configured ~= "" then pool = configured end
   end
-  local counts = { skipped = 0 }
-  local seen, pending = {}, {}
-  local first_fetch, finished = true, false
+  local counts = { skipped = 0, seen = {}, model_name = job.model_name, cancelled = false }
+  local seen, pending, last_resort, retries = {}, {}, {}, {}
+  local first_fetch, phase = true, "pool"
   local function next_exit()
     while true do
-      if #pending > 0 then return table.remove(pending, 1) end
-      if finished then return nil end
-      local opts = { pool = pool, exclude = seen, limit = MAX_PROXY_CANDIDATES, fallback = "direct" }
-      if not first_fetch then opts.timeout_ms = 1 end
-      first_fetch = false
-      local res = llm_router.proxies.require(opts)
-      if res == nil then
-        finished = true
+      if #pending > 0 then return table.remove(pending, 1), nil end
+      if phase == "pool" then
+        local opts = { pool = pool, exclude = seen, limit = MAX_PROXY_CANDIDATES, fallback = "direct" }
+        if not first_fetch then opts.timeout_ms = 1 end
+        first_fetch = false
+        local res = llm_router.proxies.require(opts)
+        if res == nil then
+          -- Cancelled: no direct leg and no retries.
+          counts.cancelled = true
+          phase = "done"
+          return nil
+        end
+        if #res.proxies == 0 then
+          phase = "direct"
+        else
+          local usable = 0
+          for _, px in ipairs(res.proxies) do
+            table.insert(seen, px.url)
+            table.insert(counts.seen, px)
+            local mark, row = exit_mark(px, job.model_name)
+            if mark == nil then
+              table.insert(pending, px)
+              usable = usable + 1
+            else
+              counts.skipped = counts.skipped + 1
+              table.insert(last_resort, {
+                px = px,
+                kind = mark == PARKED and "parked" or "blocked",
+                until_at = tonumber(row["until"]) or 0,
+              })
+            end
+          end
+          llm_router.log("debug", "selecting exits", { usable = usable, skipped = counts.skipped, event = "exits" })
+        end
+      elseif phase == "direct" then
+        phase = "retry"
+        table.sort(last_resort, function(a, b) return a.until_at < b.until_at end)
+        for i = 1, math.min(#last_resort, LAST_RESORT_CAP) do retries[i] = last_resort[i] end
+        if #retries > 0 then
+          llm_router.log("debug", "retrying last-resort exits", { model = job.full_model, count = #retries, event = "exits" })
+        end
+        return DIRECT_EXIT, nil
+      elseif phase == "retry" then
+        local item = table.remove(retries, 1)
+        if item == nil then
+          phase = "done"
+          return nil
+        end
+        return item.px, item.kind
+      else
         return nil
       end
-      if #res.proxies == 0 then
-        finished = true
-        return DIRECT_EXIT
-      end
-      local usable = 0
-      for _, px in ipairs(res.proxies) do
-        table.insert(seen, px.url)
-        if exit_limited(px) then
-          counts.skipped = counts.skipped + 1
-        else
-          table.insert(pending, px)
-          usable = usable + 1
-        end
-      end
-      llm_router.log("debug", "selecting exits", { usable = usable, skipped = counts.skipped, event = "exits" })
     end
   end
   return next_exit, counts
@@ -786,14 +870,31 @@ local function new_run()
     denied = 0, -- exits answered with 403
     saw_quota = false, -- any 429 classified as quota
     last_failure = nil, -- message of the latest non-limit failure (cut-off stream, 5xx, ...)
+    direct_until = nil, -- epoch second the direct leg's own 429 horizon ends
   }
 end
 
--- Terminal error when the attempt loop ends without success. Never fatal:
--- exhaustion always surfaces as a short-retry 429 so clients back off and
--- retry instead of giving up.
+-- Fallback retry hint when no limit horizon is known.
 local RETRY_AFTER_SECONDS = "30"
 
+-- Soonest expiry among the pair parks this request knows about and the direct
+-- leg's own horizon. Exit-wide blocks are left out: the hint is about rate limits.
+local function soonest_limit_until(run, exits)
+  local soonest = run.direct_until
+  for _, px in ipairs(exits.seen) do
+    if not is_direct(px) then
+      local row = store_get(RL_MODEL_SCOPE, pair_key(px, exits.model_name))
+      local until_at = row and tonumber(row["until"])
+      if until_at and (soonest == nil or until_at < soonest) then soonest = until_at end
+    end
+  end
+  return soonest
+end
+
+-- Terminal error when the attempt loop ends without success. Never fatal:
+-- exhaustion always surfaces as a short-retry 429. The retry hint is the soonest
+-- moment a limited candidate becomes eligible again, so a client that waits that
+-- long reaches an exit that is no longer parked.
 local function terminal_error(run, exits, attempted)
   local code = "rate_limit"
   local what = "free tier rate limited"
@@ -802,16 +903,19 @@ local function terminal_error(run, exits, attempted)
     what = "free-tier quota busy"
   end
   local why = "tried everything known"
-  if attempted == 0 and exits.skipped > 0 then why = "all known exits parked" end
+  if exits.cancelled then why = "request cancelled" end
   local extra = ""
   if run.denied > 0 then extra = " (" .. tostring(run.denied) .. " exits denied with 403)" end
   if run.last_failure ~= nil then extra = extra .. " (last failure: " .. run.last_failure .. ")" end
+  local wait = RETRY_AFTER_SECONDS
+  local soonest = soonest_limit_until(run, exits)
+  if soonest ~= nil then wait = tostring(math.max(1, math.ceil(soonest - os.time()))) end
   llm_router.log("error", "exits exhausted", { code = code, attempt = attempted, count = exits.skipped })
   return {
-    message = what .. ", retry in ~" .. RETRY_AFTER_SECONDS .. " seconds (" .. why .. ")" .. extra,
+    message = what .. ", retry in ~" .. wait .. " seconds (" .. why .. ")" .. extra,
     code = code,
     status = 429,
-    headers = { ["Retry-After"] = RETRY_AFTER_SECONDS },
+    headers = { ["Retry-After"] = wait },
   }
 end
 
@@ -881,13 +985,15 @@ local function is_quota_body(body)
     or lower:find("free usage", 1, true) ~= nil
 end
 
--- Free-tier mapping. The tier is anonymous and every 429 binds to the exit
--- IP, quota wording included (the quota limiter answers per IP). The exit is
--- marked for the upstream retry horizon (6-hour fallback) and the request
--- moves to the next one; when all exits are limited the terminal 429 reaches
--- the client. Returns (NEXT, err) to try the next exit or (STOP, err) to
--- return err at once. Only ever called for non-200 answers.
-local function map_upstream(run, resp, model_name, px)
+-- Free-tier mapping. The tier is anonymous. A 429 binds to the exit + model
+-- pair, quota wording included: only that pair is marked for the upstream
+-- retry horizon (6-hour fallback), and the request moves to the next exit for
+-- the same model. 403, 5xx and transport faults still mark the whole exit.
+-- When all exits are limited the terminal 429 reaches the client. Returns
+-- (NEXT, err) to try the next exit or (STOP, err) to return err at once. Only
+-- ever called for non-200 answers.
+local function map_upstream(run, resp, job, px)
+  local model_name = job.model_name
   local status = resp.status
   local body = tostring(resp.body or "")
   dump_response(resp, model_name)
@@ -908,8 +1014,9 @@ local function map_upstream(run, resp, model_name, px)
   if status == 429 then
     local quota = is_quota_body(body)
     local ttl = retry_ttl_seconds(resp) or RL_TTL
-    llm_router.log("debug", "exit rate limited", { ttl = ttl, quota = quota, exit = exit_key(px), event = "rate_limit" })
-    mark_exit(px, quota and "quota" or "rate_limit", ttl)
+    llm_router.log("debug", "exit rate limited", { ttl = ttl, quota = quota, exit = exit_key(px), model = job.full_model, event = "rate_limit" })
+    mark_exit_model(px, model_name, quota and "quota" or "rate_limit", ttl)
+    if is_direct(px) then run.direct_until = math.min(run.direct_until or math.huge, os.time() + ttl) end
     if quota then
       run.saw_quota = true
       return NEXT, fault("free-tier quota exhausted", "insufficient_quota", 429)
@@ -1712,7 +1819,7 @@ local function attempt_unary(run, client, job, px)
   end
   if resp.status == 200 then return resp.body end
   dump_request(job)
-  local verdict, mapped = map_upstream(run, resp, job.model_name, px)
+  local verdict, mapped = map_upstream(run, resp, job, px)
   return nil, verdict, mapped
 end
 
@@ -1730,7 +1837,7 @@ local function attempt_stream(run, client, job, px, emit)
       llm_router.log("debug", "stream responded", { status = head.status, event = "stream_response" })
       if head.status ~= 200 then
         dump_request(job)
-        local verdict, mapped = map_upstream(run, head, job.model_name, px)
+        local verdict, mapped = map_upstream(run, head, job, px)
         mapped_verdict = verdict
         return mapped
       end
@@ -1764,15 +1871,20 @@ end
 
 -- Runs `attempt(px, attempt_number)` once per exit until it reports a final
 -- outcome: it returns (false) to try the next exit, or (true, value, err) to
--- finish with that result. Exhausting the exits ends in the terminal 429.
-local function run_attempts(ctx, run, attempt)
-  local next_exit, exits = exit_stream(ctx.provider_config)
+-- finish with that result. Exhausting the exits ends in the terminal 429. A
+-- last-resort retry that succeeds lifts its mark: a pair park clears the pair,
+-- an exit-wide block clears the exit.
+local function run_attempts(ctx, run, job, attempt)
+  local next_exit, exits = exit_stream(ctx.provider_config, job)
   local attempted = 0
   while true do
-    local px = next_exit()
+    local px, kind = next_exit()
     if px == nil then break end
     attempted = attempted + 1
     local final, value, err = attempt(px, attempted)
+    if kind ~= nil and final and err == nil then
+      if kind == "parked" then clear_pair(px, job.model_name) else clear_exit(px) end
+    end
     if final then return value, err end
   end
   return nil, terminal_error(run, exits, attempted)
@@ -1849,7 +1961,7 @@ llm_router.register("opencode-free", {
     if job == nil then return nil, err end
     local run = new_run()
     local client = llm_router.http_client({ timeout_ms = GENERATION_TIMEOUT_MS })
-    return run_attempts(ctx, run, function(px, attempt)
+    return run_attempts(ctx, run, job, function(px, attempt)
       llm_router.log("debug", "sending request", { endpoint = job.protocol.path, body_len = #job.body, attempt = attempt, event = "http" })
       local body, verdict, ferr = attempt_unary(run, client, job, px)
       if body ~= nil then
@@ -1871,7 +1983,7 @@ llm_router.register("opencode-free", {
     if job == nil then return nil, err end
     local run = new_run()
     local client = llm_router.http_client({ timeout_ms = GENERATION_TIMEOUT_MS })
-    return run_attempts(ctx, run, function(px, attempt)
+    return run_attempts(ctx, run, job, function(px, attempt)
       llm_router.log("debug", "sending stream", { endpoint = job.protocol.path, body_len = #job.body, attempt = attempt, event = "stream" })
       local outcome, serr = attempt_stream(run, client, job, px, emit)
       if outcome == "ok" then
