@@ -1,6 +1,6 @@
 --- @plugin Google AI Studio
 --- @author TheSlopMachine
---- @version 5.2.5
+--- @version 5.3.2
 --- @plugin_api 1.5
 --- @description Google Gemini models via AI Studio API
 --- @allow_host generativelanguage.googleapis.com
@@ -1094,6 +1094,83 @@ local function assemble_completion(body, full_model)
   }
 end
 
+-- One probe generation attempt for one credential: direct, no proxies, and no
+-- park or bench on any outcome. Returns {response} or nil with a classified
+-- failure {kind, message}.
+local function probe_model(model_name, endpoint, cred)
+  local client = llm_router.http_client({ timeout_ms = 60000 })
+  local key = api_key_of(cred.data)
+  if key == "" then return nil, { kind = "other", message = "api_key is required" } end
+  
+  -- Build a minimal probe payload for the endpoint.
+  local payload = nil
+  if endpoint == "embeddings" then
+    payload = { model = "models/" .. model_name, content = { parts = { { text = "probe" } } } }
+  elseif endpoint == "speech" then
+    payload = {
+      contents = { { role = "user", parts = { { text = "hi" } } } },
+      generationConfig = { responseModalities = { "AUDIO" }, speechConfig = { voiceConfig = { prebuiltVoiceConfig = { voiceName = "Kore" } } } },
+    }
+  elseif endpoint == "image" then
+    payload = {
+      contents = { { role = "user", parts = { { text = "a dot" } } } },
+      generationConfig = { responseModalities = { "TEXT", "IMAGE" } },
+    }
+  else
+    -- chat, vision: minimal text request.
+    payload = { contents = { { role = "user", parts = { { text = "Reply with: ok" } } } } }
+  end
+  
+  local url = BASE_URL .. "/models/" .. model_name
+  if endpoint == "embeddings" then
+    url = url .. ":embedContent"
+  else
+    url = url .. ":generateContent"
+  end
+  
+  local resp, err = client:request({
+    method = "POST",
+    url = url,
+    headers = { ["x-goog-api-key"] = key, ["Content-Type"] = "application/json" },
+    body = json.encode(payload),
+  })
+  
+  if err then
+    return nil, { kind = "transport", message = tostring(err.message or err) }
+  end
+  
+  local status = resp.status
+  if status == 200 then
+    return { response = "ok" }
+  end
+  
+  local lower = string.lower(tostring(resp.body or ""))
+  local kind = "other"
+  local message = "request failed with status " .. tostring(status)
+  
+  if status == 429 then
+    kind = "quota"
+    message = "rate limited"
+  elseif status == 401 or status == 403 then
+    kind = "rejected"
+    message = "api key rejected"
+  elseif status == 404 then
+    kind = "missing"
+    message = "model not found upstream"
+  elseif status == 400 then
+    if string.find(lower, "location is not supported", 1, true) then
+      kind = "geo"
+    else
+      kind = "provider"
+      message = "gemini rejected the request"
+    end
+  elseif status >= 500 then
+    kind = "provider"
+  end
+  
+  return nil, { kind = kind, message = message }
+end
+
 llm_router.register("google", {
   icon = "https://www.gstatic.com/lamda/images/favicon_v1_150160cddff7f294ce30.svg",
 
@@ -1339,10 +1416,11 @@ llm_router.register("google", {
       return { status = "quota_exceeded", message = "quota exhausted" }
     end
     if #creds == 0 then return { status = "unknown", message = "no credentials available" } end
+    
+    -- Phase 1: metadata check to rule out missing models cheaply.
     local client = llm_router.http_client({ timeout_ms = 15000 })
     local missing = 0
     local tried = 0
-    local seen_quota = false
     local seen_unknown = nil
     for _, cred in ipairs(creds) do
       local key = api_key_of(cred.data)
@@ -1350,7 +1428,7 @@ llm_router.register("google", {
         seen_unknown = seen_unknown or "api_key is required"
       else
         tried = tried + 1
-        llm_router.log("debug", "probing model", { cred_id = cred.id, model = model_ref.model, endpoint = endpoint })
+        llm_router.log("debug", "probing model metadata", { cred_id = cred.id, model = model_ref.model, endpoint = endpoint })
         local resp, err = client:request({
           method = "GET",
           url = BASE_URL .. "/models/" .. model_name,
@@ -1363,7 +1441,8 @@ llm_router.register("google", {
         elseif resp.status == 200 then
           local body_str = tostring(resp.body or "")
           if string.find(body_str, want_method, 1, true) then
-            return { status = "healthy", response = "ok" }
+            -- Model exists and supports the method; proceed to generation probe.
+            break
           end
           seen_unknown = seen_unknown or "model method not listed"
         elseif resp.status == 404 then
@@ -1374,8 +1453,6 @@ llm_router.register("google", {
           else
             seen_unknown = seen_unknown or "model not found upstream"
           end
-        elseif resp.status == 429 then
-          seen_quota = true
         elseif resp.status == 400 or resp.status == 401 or resp.status == 403 then
           seen_unknown = seen_unknown or "api key rejected"
         else
@@ -1383,11 +1460,51 @@ llm_router.register("google", {
         end
       end
     end
+    
     if tried > 0 and missing == tried then
       return { status = "unhealthy", message = "model not found upstream" }
     end
-    if seen_quota then
+    
+    -- Phase 2: actual generation probe to verify real availability.
+    local quota_seen = false
+    local provider_seen = false
+    local provider_message = nil
+    local missing_seen = false
+    for _, cred in ipairs(creds) do
+      local key = api_key_of(cred.data)
+      if key ~= "" then
+        llm_router.log("debug", "probing model generation", { cred_id = cred.id, model = model_ref.model, endpoint = endpoint })
+        local value, failure = probe_model(model_name, endpoint, cred)
+        if value ~= nil then
+          return { status = "healthy", response = value.response or "ok" }
+        end
+        if failure == nil then
+          seen_unknown = seen_unknown or "probe failed"
+        elseif failure.kind == "quota" then
+          quota_seen = true
+        elseif failure.kind == "provider" then
+          provider_seen = true
+          provider_message = failure.message
+        elseif failure.kind == "missing" then
+          missing_seen = true
+        elseif failure.kind == "rejected" then
+          seen_unknown = seen_unknown or failure.message
+        else
+          seen_unknown = seen_unknown or failure.message
+        end
+      end
+    end
+    
+    -- Quota outranks provider failures: a rate limit is transient per account,
+    -- an upstream provider outage is model state.
+    if quota_seen then
       return { status = "quota_exceeded", message = "quota exhausted" }
+    end
+    if missing_seen then
+      return { status = "unhealthy", message = "model not found upstream" }
+    end
+    if provider_seen then
+      return { status = "unhealthy", message = provider_message or "provider failed upstream" }
     end
     return { status = "unknown", message = seen_unknown or "health check inconclusive" }
   end,
