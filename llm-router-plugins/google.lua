@@ -1,6 +1,6 @@
 --- @plugin Google AI Studio
 --- @author TheSlopMachine
---- @version 5.2.4
+--- @version 5.2.5
 --- @plugin_api 1.5
 --- @description Google Gemini models via AI Studio API
 --- @allow_host generativelanguage.googleapis.com
@@ -648,6 +648,7 @@ local function build_tools(request, provider_config)
       table.insert(tool_list, { [name] = {} })
     end
   end
+  local has_decls = false
   local tools = request.tools
   if type(tools) == "table" and #tools > 0 then
     local decls = {}
@@ -672,6 +673,7 @@ local function build_tools(request, provider_config)
       end
     end
     if #decls > 0 then table.insert(tool_list, 1, { functionDeclarations = decls }) end
+    has_decls = #decls > 0
   end
   if type(provider_config) == "table" and type(provider_config.google_tools) == "table" then
     for _, name in ipairs(provider_config.google_tools) do
@@ -708,6 +710,9 @@ local function build_tools(request, provider_config)
       allowed = { tc["function"].name }
     end
   end
+  -- ANY forces a function call; with only native tools (web_search ->
+  -- googleSearch) there is nothing to call and Gemini rejects or hangs.
+  if mode == "ANY" and not has_decls then mode, allowed = nil, nil end
   local tool_config = nil
   if mode then
     tool_config = { functionCallingConfig = { mode = mode } }
