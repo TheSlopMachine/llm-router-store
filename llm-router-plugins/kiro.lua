@@ -1,6 +1,6 @@
 --- @plugin Kiro AI
 --- @author TheSlopMachine
---- @version 5.3.0
+--- @version 5.3.1
 --- @plugin_api 1.5
 --- @description AWS Kiro models via device login (OAuth2 with proactive refresh)
 --- @allow_host codewhisperer.us-east-1.amazonaws.com
@@ -92,7 +92,7 @@ local function parse_model_list(body)
         if type(name) ~= "string" or name == "" then name = id end
         -- Raw catalog entry, so real capabilities (input types, limits) can be read.
         local raw_ok, raw = pcall(json.encode, item)
-        llm_router.log("info", "kiro catalog entry", { model = id, raw = raw_ok and string.sub(raw, 1, 2000) or "unencodable" })
+        llm_router.log("info", "catalog entry", { model = id, raw = raw_ok and string.sub(raw, 1, 2000) or "unencodable" })
         local context = 200000
         local max_output = 32000
         if type(item.tokenLimits) == "table" then
@@ -137,11 +137,11 @@ local function fetch_model_list(client, url, token, profile_arn)
     },
   })
   if err then
-    llm_router.log("warn", "kiro catalog request failed", { url = url, reason = type(err) == "table" and tostring(err.message) or tostring(err) })
+    llm_router.log("warn", "catalog request failed", { url = url, reason = type(err) == "table" and tostring(err.message) or tostring(err) })
     return nil
   end
   if resp.status ~= 200 then
-    llm_router.log("warn", "kiro catalog rejected", { url = url, status = resp.status, body = string.sub(tostring(resp.body or ""), 1, 300) })
+    llm_router.log("warn", "catalog rejected", { url = url, status = resp.status, body = string.sub(tostring(resp.body or ""), 1, 300) })
     return nil
   end
   return parse_model_list(resp.body)
@@ -1048,11 +1048,15 @@ local function do_refresh(data)
     }),
   })
   if err then
-    llm_router.log("warn", "kiro token refresh failed", { reason = type(err) == "table" and tostring(err.message) or tostring(err) })
+    llm_router.log("warn", "token refresh failed", { reason = type(err) == "table" and tostring(err.message) or tostring(err) })
     return nil
   end
   if resp.status ~= 200 then
-    llm_router.log("warn", "kiro token refresh rejected", { status = resp.status, body = string.sub(tostring(resp.body or ""), 1, 300) })
+    -- Log the OAuth error code only: the refresh response body can echo
+    -- client or token material, so it never reaches the event log.
+    local decoded_ok, decoded = pcall(json.decode, resp.body or "")
+    local oauth_error = decoded_ok and type(decoded) == "table" and (decoded.error or decoded.errorCode) or nil
+    llm_router.log("warn", "token refresh rejected", { status = resp.status, code = oauth_error and tostring(oauth_error) or "unknown" })
     return nil
   end
   local out = json.decode(resp.body)
@@ -1254,7 +1258,7 @@ llm_router.register("kiro", {
           local models = fetch_model_list(client, discovery_endpoints(region)[1], token, arn)
           if models then return with_thinking_variants(models) end
         end
-        llm_router.log("warn", "kiro discovery failed for credential", { cred_id = cred.id })
+        llm_router.log("warn", "discovery failed for credential", { cred_id = cred.id })
       end
     end
     if with_token == 0 then

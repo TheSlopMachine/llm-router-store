@@ -1,6 +1,6 @@
 --- @plugin Google AI Studio
 --- @author TheSlopMachine
---- @version 5.3.2
+--- @version 5.3.3
 --- @plugin_api 1.5
 --- @description Google Gemini models via AI Studio API
 --- @allow_host generativelanguage.googleapis.com
@@ -1240,7 +1240,7 @@ llm_router.register("google", {
           break
         end
         if resp.status ~= 200 then
-          llm_router.log("error", "google discovery rejected", {
+          llm_router.log("error", "discovery rejected", {
             status = resp.status,
             body = string.sub(tostring(resp.body or ""), 1, 500),
           })
