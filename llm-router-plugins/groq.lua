@@ -1,134 +1,156 @@
 --- @plugin Groq
 --- @author TheSlopMachine
---- @version 5.4.1
+--- @version 5.5.1
 --- @plugin_api 1.5
 --- @description Groq API: chat/reasoning, Whisper transcription/translation, Orpheus text-to-speech
 --- @allow_host api.groq.com
 
 local BASE_URL = "https://api.groq.com/openai/v1"
 
--- Free-plan values from https://console.groq.com/docs/rate-limits.
--- Limits can vary by account/plan; model discovery cannot retrieve account quotas.
-local RATE_LIMITS = {
-  ["groq/compound"] = { rpm = 30, rpd = 250, tpm = 70000 },
-  ["groq/compound-mini"] = { rpm = 30, rpd = 250, tpm = 70000 },
-  ["openai/gpt-oss-120b"] = { rpm = 30, rpd = 1000, tpm = 8000 },
-  ["openai/gpt-oss-20b"] = { rpm = 30, rpd = 1000, tpm = 8000 },
-  ["openai/gpt-oss-safeguard-20b"] = { rpm = 3, rpd = 1000, tpm = 2000 },
-  ["qwen/qwen3.6-27b"] = { rpm = 30, rpd = 1000, tpm = 8000 },
-  ["qwen/qwen3.8-27b"] = { rpm = 30, rpd = 1000, tpm = 8000 },
-  ["meta-llama/llama-prompt-guard-2-22m"] = { rpm = 30, rpd = 14400, tpm = 15000 },
-  ["meta-llama/llama-prompt-guard-2-86m"] = { rpm = 30, rpd = 14400, tpm = 15000 },
-  ["allam-2-7b"] = { rpm = 30, rpd = 1000, tpm = 8000 },
-  ["canopylabs/orpheus-v1-english"] = { rpm = 10, rpd = 100, tpm = 1200 },
-  ["canopylabs/orpheus-arabic-saudi"] = { rpm = 10, rpd = 100, tpm = 1200 },
-  -- Whisper quotas are measured in audio seconds; tpm stays 0.
-  ["whisper-large-v3"] = { rpm = 20, rpd = 2000, tpm = 0 },
-  ["whisper-large-v3-turbo"] = { rpm = 20, rpd = 2000, tpm = 0 },
-  ["distil-whisper-large-v3-en"] = { rpm = 20, rpd = 1000, tpm = 0 },
-}
-local DEFAULT_LIMITS = { rpm = 30, rpd = 1000, tpm = 8000 }
-local AUDIO_DEFAULT_LIMITS = { rpm = 20, rpd = 2000, tpm = 0 }
+-- Rate limits bind to the organization and the model. No table is kept:
+-- every response carries x-ratelimit-remaining-* for the key+model pair, so
+-- an exhausted daily request quota cools the pair before Groq answers 429,
+-- and every other limit (RPM, TPM, TPD) cools it on the 429 itself.
+local COOLDOWN_SCOPE = "rate_limit"
+local DEFAULT_COOLDOWN_SECS = 60
+local MAX_COOLDOWN_SECS = 86400
+local TERMS_REASON = "terms"
+local TERMS_COOLDOWN_SECS = 3600
 
 local function api_key_of(data)
-  if type(data) ~= "table" then return "" end
-  return data.api_key or ""
+  if type(data) ~= "table" or type(data.api_key) ~= "string" then return "" end
+  return (data.api_key:match("^%s*(.-)%s*$"))
+end
+
+-- How errors name a key: its dashboard label, else its id.
+local function key_name(cred)
+  local label = type(cred) == "table" and cred.label or nil
+  if type(label) == "string" and label ~= "" then return "\"" .. label .. "\"" end
+  return tostring(type(cred) == "table" and cred.id or "?")
+end
+
+local function error_of(message, code, status, headers)
+  local e = { message = message, code = code or "server_error", status = status or 502 }
+  if headers ~= nil then e.headers = headers end
+  return e
+end
+
+local function invalid_request(message)
+  return error_of(message, "invalid_request_error", 400)
+end
+
+local function retry_headers(secs)
+  if type(secs) ~= "number" or secs < 1 then return nil end
+  return { ["Retry-After"] = tostring(math.ceil(secs)) }
 end
 
 -- Dead-key bench: shared disable when automation is on (visible in the
 -- dashboard, global to every path), unified cooldown park otherwise.
 local function bench(ctx, cred_id, reason, wait_secs)
-  local cfg = ctx.provider_config or {}
-  if cfg.disable_failed_credentials == true then
-    llm_router.credentials.disable(cred_id, reason)
-  else
-    llm_router.credentials.park(cred_id, wait_secs, reason)
+  local cfg = ctx.provider_config
+  if type(cfg) == "table" and cfg.disable_failed_credentials == true then
+    if pcall(llm_router.credentials.disable, cred_id, reason) then return end
   end
+  pcall(llm_router.credentials.park, cred_id, wait_secs, reason)
 end
 
+-- Groq durations: "2m59.56s", "7.66s", "250ms", "1h2m", or plain seconds.
 local function parse_duration_secs(raw)
   if type(raw) ~= "string" then return nil end
   local n = tonumber(raw)
-  if n and n > 0 then return math.ceil(n) end
+  if n then return n > 0 and math.ceil(n) or nil end
+  local scale = { h = 3600, m = 60, s = 1, ms = 0.001 }
   local total = 0
-  local h = tonumber(raw:match("([%d%.]+)h")) or 0
-  local m = tonumber(raw:match("([%d%.]+)m")) or 0
-  local s = tonumber(raw:match("([%d%.]+)s")) or 0
-  local ms = tonumber(raw:match("([%d%.]+)ms")) or 0
-  total = h * 3600 + m * 60 + s + ms / 1000
+  for num, unit in raw:gmatch("([%d%.]+)(%a+)") do
+    local value = tonumber(num)
+    if value == nil or scale[unit] == nil then return nil end
+    total = total + value * scale[unit]
+  end
   if total > 0 then return math.ceil(total) end
   return nil
 end
 
-local function retry_after_secs(resp)
-  local headers = resp and resp.headers or {}
-  local wait = parse_duration_secs(headers["retry-after"] or headers["retry_after"])
-  if wait then return wait end
-  -- Groq reset headers use durations such as "2m59.56s", not Unix timestamps.
-  wait = parse_duration_secs(headers["x-ratelimit-reset-requests"])
-  if wait then return wait end
-  wait = parse_duration_secs(headers["x-ratelimit-reset-tokens"])
-  return wait or 60
+local function upstream_error(resp)
+  local body = resp and resp.body
+  if type(body) ~= "string" or body == "" then return nil end
+  local ok, parsed = pcall(json.decode, body)
+  if ok and type(parsed) == "table" and type(parsed.error) == "table" then return parsed.error end
+  return nil
 end
 
 local function upstream_message(resp, fallback)
-  local body = resp and resp.body
-  if type(body) ~= "string" or body == "" then return fallback end
-  local ok, parsed = pcall(json.decode, body)
-  if ok and type(parsed) == "table" then
-    if type(parsed.error) == "table" and type(parsed.error.message) == "string" then
-      return parsed.error.message
-    end
-    if type(parsed.message) == "string" then return parsed.message end
-  end
+  local e = upstream_error(resp)
+  if e and type(e.message) == "string" and e.message ~= "" then return e.message end
   return fallback
 end
 
-local function is_daily_quota(resp)
-  local body = string.lower(tostring(resp and resp.body or ""))
-  return string.find(body, "per day", 1, true) ~= nil
-    or string.find(body, "daily quota", 1, true) ~= nil
-    or string.find(body, "daily limit", 1, true) ~= nil
+local function upstream_code(resp)
+  local e = upstream_error(resp)
+  return e and type(e.code) == "string" and e.code or nil
 end
 
-local function rate_limit_error(resp)
-  local daily = is_daily_quota(resp)
-  if daily then
-    return {
-      message = upstream_message(resp, "groq daily quota exhausted"),
-      code = "insufficient_quota",
-      status = 429,
-    }, "groq daily quota exhausted"
+-- ---------------------------------------------------------------------------
+-- Per key+model cooldowns
+-- ---------------------------------------------------------------------------
+
+-- Groq limits bind to the organization and the model, so a 429 cools only the
+-- key+model pair (parking would hide the key from every model). Rows live in
+-- plugin storage with a TTL.
+local function pair_key(cred_id, model_name)
+  return tostring(cred_id) .. ":" .. tostring(model_name)
+end
+
+local function set_cooldown(cred_id, model_name, secs, reason)
+  secs = math.ceil(tonumber(secs) or DEFAULT_COOLDOWN_SECS)
+  if secs < 1 then secs = 1 end
+  if secs > MAX_COOLDOWN_SECS then secs = MAX_COOLDOWN_SECS end
+  local now = os.time()
+  pcall(llm_router.storage.set, COOLDOWN_SCOPE, pair_key(cred_id, model_name),
+    { ["until"] = now + secs, reason = reason or "rate limited" }, { ttl = secs })
+end
+
+local function clear_cooldown(cred_id, model_name)
+  pcall(llm_router.storage.delete, COOLDOWN_SCOPE, pair_key(cred_id, model_name))
+end
+
+local function cooldown_remaining(cred_id, model_name)
+  local ok, value = pcall(llm_router.storage.get, COOLDOWN_SCOPE, pair_key(cred_id, model_name))
+  if not ok or type(value) ~= "table" then return nil end
+  local remaining = (tonumber(value["until"]) or 0) - os.time()
+  if remaining > 0 then return remaining, value.reason end
+  return nil
+end
+
+-- (usable, total, min_wait, all_terms): all_terms is true when every key
+-- cools because its organization has not accepted the model's terms.
+local function plan_credentials(model_name)
+  local usable, total, min_wait, terms = {}, 0, nil, 0
+  for _, cred in ipairs(llm_router.credentials.list()) do
+    total = total + 1
+    local remaining, reason = cooldown_remaining(cred.id, model_name)
+    if remaining ~= nil then
+      min_wait = min_wait and math.min(min_wait, remaining) or remaining
+      if reason == TERMS_REASON then terms = terms + 1 end
+    else
+      usable[#usable + 1] = cred
+    end
   end
-  return {
-    message = upstream_message(resp, "groq rate limited"),
-    code = "rate_limit",
-    status = 429,
-  }, "groq rate limited"
+  return usable, total, min_wait, (terms > 0 and terms == total)
 end
 
-local function has(list, value)
-  for _, item in ipairs(list or {}) do
-    if item == value then return true end
-  end
-  return false
+local function terms_url(model_name)
+  return "https://console.groq.com/playground?model=" .. tostring(model_name):gsub("/", "%%2F")
 end
 
-local ORPHEUS_VOICES = {
-  ["canopylabs/orpheus-v1-english"] = {
-    autumn = true, diana = true, hannah = true,
-    austin = true, daniel = true, troy = true,
-  },
-  ["canopylabs/orpheus-arabic-saudi"] = {
-    abdullah = true, fahad = true, sultan = true,
-    lulwa = true, noura = true, aisha = true,
-  },
-}
-
-local function utf8_length(value)
-  local _, count = tostring(value or ""):gsub("[^\128-\191]", "")
-  return count
+local function terms_error(model_name)
+  return error_of("groq model " .. tostring(model_name)
+    .. " requires accepting its terms; no configured key's organization has accepted them. The org admin accepts them at "
+    .. terms_url(model_name), "model_unavailable", 403)
 end
+
+-- ---------------------------------------------------------------------------
+-- Proxies
+-- ---------------------------------------------------------------------------
 
 local function pick_proxies(ctx, limit)
   -- Unconfigured providers go direct: only an explicit pool selection
@@ -147,9 +169,9 @@ local function pick_proxies(ctx, limit)
   return res.proxies
 end
 
--- One request through the selected pool, for every call that is not chat.
--- A 403 (egress block), a 5xx or a transport fault on one exit moves on to
--- the next; a direct pool yields one direct attempt.
+-- One request through the selected pool, for every call that is not
+-- generation. A 403 (egress block), a 5xx or a transport fault on one exit
+-- moves on to the next; a direct pool yields one direct attempt.
 local function pooled_request(ctx, client, request)
   local resp, err
   for _, px in ipairs(pick_proxies(ctx, 3)) do
@@ -160,43 +182,301 @@ local function pooled_request(ctx, client, request)
   return resp, err
 end
 
--- Build the upstream payload from the OpenAI-shaped request table:
--- pass everything through, fix the model id, pin the stream flag.
--- Router-only fields (model_name, cache_key) never leave the plugin.
-local function build_payload(request, stream)
-  local payload = {}
-  for k, v in pairs(request) do
-    if k ~= "model_name" and k ~= "cache_key" then payload[k] = v end
-  end
-  payload.model = request.model_name
-  payload.stream = stream
-  if not stream then payload.stream_options = nil end
+-- ---------------------------------------------------------------------------
+-- Upstream status classification
+-- ---------------------------------------------------------------------------
 
-  -- The router accepts OpenRouter's reasoning envelope, but Groq expects flat
-  -- reasoning_effort/reasoning_format fields rather than `reasoning: {...}`.
-  local reasoning = payload.reasoning
-  payload.reasoning = nil
-  if type(reasoning) == "table" then
-    local model_name = request.model_name or ""
-    local is_qwen3 = string.find(model_name, "qwen3", 1, true) ~= nil
-    if reasoning.enabled == false then
-      -- Qwen3 families support `none`; GPT-OSS only documents low/medium/high.
-      payload.reasoning_effort = is_qwen3 and "none" or nil
-    elseif type(reasoning.effort) == "string" and reasoning.effort ~= "" and reasoning.effort ~= "default" then
-      payload.reasoning_effort = reasoning.effort
-    elseif reasoning.enabled == true and is_qwen3
-        and (payload.reasoning_effort == nil or payload.reasoning_effort == "default") then
-      -- Groq's Qwen default is `none`, so an explicit enabled=true needs an effort.
-      payload.reasoning_effort = "medium"
-    end
-    if reasoning.exclude == true and payload.reasoning_format == nil then
-      payload.reasoning_format = "hidden"
-    end
+local function is_daily_quota(resp)
+  local body = string.lower(tostring(resp and resp.body or ""))
+  return body:find("per day", 1, true) ~= nil or body:find("daily", 1, true) ~= nil
+end
+
+-- 429 wait: retry-after, then the body's "Please try again in 7.5s", then the
+-- reset header of the exhausted dimension, then a minute.
+local function rate_limit_wait(resp, daily)
+  local headers = resp.headers or {}
+  local wait = parse_duration_secs(headers["retry-after"])
+  if wait then return wait end
+  wait = parse_duration_secs(tostring(resp.body or ""):match("try again in ([%d%.hms]+)"))
+  if wait then return wait end
+  wait = parse_duration_secs(headers[daily and "x-ratelimit-reset-requests" or "x-ratelimit-reset-tokens"])
+  return wait or DEFAULT_COOLDOWN_SECS
+end
+
+-- A served response that spent the last request of the day (remaining
+-- requests 0; x-ratelimit-*-requests always count per day) cools the
+-- key+model pair until the daily window refills, so the next call skips it.
+local function note_limits(cred, model_name, resp)
+  local headers = resp.headers or {}
+  if headers["x-ratelimit-remaining-requests"] ~= "0" then return end
+  local wait = parse_duration_secs(headers["x-ratelimit-reset-requests"]) or DEFAULT_COOLDOWN_SECS
+  set_cooldown(cred.id, model_name, wait, "daily quota")
+  llm_router.log("info", "groq daily requests spent", { cred_id = cred.id, model = model_name, wait = wait })
+end
+
+-- Actions: "ok" (value is the response), "proxy" (next exit, then next key),
+-- "cred" (next key), "server" (next exit, never another key: an upstream
+-- fault every key shares), "stop" (value is the final error).
+local function classify(ctx, cred, model_name, resp, err)
+  if err ~= nil then
+    llm_router.log("debug", "transport error", { reason = tostring(err.message or "transport error"), code = err.code, cred_id = cred.id })
+    return "proxy", err
   end
-  -- `default` means use provider defaults; omitting it is more portable than
-  -- sending an effort literal unsupported by some model families.
-  if payload.reasoning_effort == "default" then payload.reasoning_effort = nil end
-  return payload
+  local status = resp.status
+  if status == 200 then
+    note_limits(cred, model_name, resp)
+    return "ok", resp
+  end
+  local message = upstream_message(resp, "groq returned status " .. tostring(status))
+  local code = upstream_code(resp)
+  if status == 401 then
+    bench(ctx, cred.id, "groq rejected the api key", 300)
+    llm_router.log("warn", "api key rejected", { status = 401, code = "authentication_error", cred_id = cred.id })
+    return "cred", error_of(message, "authentication_error", 401)
+  end
+  if status == 403 then
+    llm_router.log("debug", "egress blocked", { status = 403, code = "server_error", cred_id = cred.id })
+    return "proxy", error_of(message, "server_error", 502)
+  end
+  if status == 429 then
+    local daily = is_daily_quota(resp)
+    local wait = rate_limit_wait(resp, daily)
+    set_cooldown(cred.id, model_name, wait, daily and "daily quota" or "rate limited")
+    local e = error_of(message, daily and "insufficient_quota" or "rate_limit", 429, retry_headers(wait))
+    llm_router.log("warn", daily and "groq daily quota exhausted" or "groq rate limited",
+      { status = 429, code = e.code, cred_id = cred.id, model = model_name, wait = wait })
+    return "cred", e
+  end
+  if code == "model_terms_required" then
+    set_cooldown(cred.id, model_name, TERMS_COOLDOWN_SECS, TERMS_REASON)
+    llm_router.log("warn", "model terms not accepted", { status = status, cred_id = cred.id, model = model_name })
+    return "cred", terms_error(model_name)
+  end
+  if status == 404 then
+    return "stop", error_of(message, "not_found", 404)
+  end
+  if status == 400 or status == 413 or status == 422 then
+    llm_router.log("error", "request rejected", { status = status, code = "invalid_request_error", cred_id = cred.id })
+    return "stop", error_of(message, "invalid_request_error", status)
+  end
+  if status == 498 or status == 503 then
+    -- Capacity (flex 498, overload 503) is the backend's, not the key's.
+    local wait = parse_duration_secs((resp.headers or {})["retry-after"]) or 5
+    return "stop", error_of(message, "server_error", 503, retry_headers(wait))
+  end
+  llm_router.log("debug", "unexpected status", { status = status, code = "server_error", cred_id = cred.id })
+  if status >= 500 then return "server", error_of(message, "server_error", status) end
+  return "stop", error_of(message, "server_error", status)
+end
+
+-- Credential x exit loop shared by every generation path. send(cred, key,
+-- proxy_url) returns an action and a value as classify does.
+local function attempt(ctx, model_name, send)
+  local usable, total, min_wait, all_terms = plan_credentials(model_name)
+  if total == 0 then
+    return nil, error_of("no groq credentials configured", "server_error", 503)
+  end
+  if #usable == 0 then
+    if all_terms then return nil, terms_error(model_name) end
+    return nil, error_of("every groq key is rate limited on " .. tostring(model_name), "rate_limit", 429, retry_headers(min_wait))
+  end
+  local last_err = nil
+  for _, cred in ipairs(usable) do
+    llm_router.log("debug", "trying credential", { cred_id = cred.id, model = model_name })
+    local key = api_key_of(cred.data)
+    local action, value = nil, nil
+    for _, px in ipairs(pick_proxies(ctx, 3)) do
+      action, value = send(cred, key, px.url)
+      if action == "ok" then return value end
+      if action == "stop" then return nil, value end
+      last_err = value
+      if action == "cred" then break end
+    end
+    if action == "server" then break end
+  end
+  local left, _, wait, terms = plan_credentials(model_name)
+  if #left == 0 and terms then return nil, terms_error(model_name) end
+  if #left == 0 and last_err and (last_err.code == "rate_limit" or last_err.code == "insufficient_quota") then
+    last_err.headers = retry_headers(wait) or last_err.headers
+  end
+  local exhausted = last_err or error_of("all groq credentials exhausted", "server_error", 502)
+  llm_router.log("error", "all credentials exhausted", { reason = tostring(exhausted.message or "request failed"), code = exhausted.code })
+  return nil, exhausted
+end
+
+-- ---------------------------------------------------------------------------
+-- Reasoning
+-- ---------------------------------------------------------------------------
+
+-- Router scale none/low/medium/high/max onto Groq reasoning_effort (checked
+-- live 2026-11-12). "default" means the model default: accepted, never
+-- advertised, sent as nothing.
+--   gpt-oss (all):  high, medium, low   (reasoning always runs)
+--   qwen3.x:        high, medium, low, none (Groq default: none)
+local EFFORT_ORDER = { "max", "high", "medium", "low", "none" }
+
+local function effort_levels(model_name)
+  local lower = tostring(model_name):lower()
+  if lower:find("gpt%-oss") then
+    return { high = "high", medium = "medium", low = "low" }, { default_effort = "medium", default_enabled = true, mandatory = true }
+  end
+  if lower:find("qwen3", 1, true) then
+    return { high = "high", medium = "medium", low = "low", none = "none" }, { default_effort = "none", default_enabled = false }
+  end
+  return nil
+end
+
+local function effort_list(levels)
+  local list = {}
+  for _, effort in ipairs(EFFORT_ORDER) do
+    if levels[effort] then list[#list + 1] = effort end
+  end
+  return list
+end
+
+local function reasoning_info(model_name)
+  local levels, defaults = effort_levels(model_name)
+  if not levels then return { default_enabled = true } end
+  return {
+    supported_efforts = effort_list(levels),
+    default_effort = defaults.default_effort,
+    default_enabled = defaults.default_enabled,
+    mandatory = defaults.mandatory,
+  }
+end
+
+-- (reasoning_effort to send or nil, error). reasoning_effort or
+-- reasoning.effort; reasoning.enabled=false reads as "none" and
+-- enabled=true on an off-by-default model as "medium".
+local function reasoning_effort_for(request)
+  local model_name = request.model_name or ""
+  local effort = request.reasoning_effort
+  local r = type(request.reasoning) == "table" and request.reasoning or {}
+  if effort == nil and type(r.effort) == "string" then effort = r.effort end
+  if effort == nil and r.enabled == false then effort = "none" end
+  if type(effort) ~= "string" or effort == "" or effort == "default" then effort = nil end
+  local levels, defaults = effort_levels(model_name)
+  if effort == nil and r.enabled == true and defaults and defaults.default_enabled == false then
+    effort = "medium"
+  end
+  if type(r.max_tokens) == "number" then
+    return nil, invalid_request("model " .. model_name .. " takes no reasoning.max_tokens; use reasoning_effort")
+  end
+  if effort ~= nil and levels then
+    if not levels[effort] then
+      return nil, invalid_request("reasoning_effort " .. effort .. " is not supported by model " .. model_name
+        .. "; supported: " .. table.concat(effort_list(levels), ", "))
+    end
+    effort = levels[effort]
+  end
+  return effort, nil
+end
+
+-- ---------------------------------------------------------------------------
+-- Payload
+-- ---------------------------------------------------------------------------
+
+-- Groq rejects every property it does not know ("property 'x' is
+-- unsupported"), so the payload is built from a whitelist. Router fields
+-- without a Groq counterpart (verbosity, prompt_cache_key, Ollama options...)
+-- are dropped; known ones Groq refuses for a model (logprobs, n>1, stop>4)
+-- reach it and come back with its own message.
+local PASS_FIELDS = {
+  "tools", "tool_choice", "parallel_tool_calls", "stream_options", "max_completion_tokens",
+  "temperature", "top_p", "n", "stop", "seed", "frequency_penalty", "presence_penalty",
+  "logprobs", "top_logprobs", "response_format", "user", "service_tier",
+}
+local MESSAGE_FIELDS = { "role", "content", "name", "tool_calls", "tool_call_id" }
+
+local function build_messages(messages)
+  local out = {}
+  for i, m in ipairs(messages or {}) do
+    local msg = {}
+    for _, k in ipairs(MESSAGE_FIELDS) do msg[k] = m[k] end
+    -- Groq takes earlier chain-of-thought as `reasoning`; the router's
+    -- `reasoning_content` and `refusal` are unsupported properties there.
+    local reasoning = m.reasoning_content or m.reasoning
+    if m.role == "assistant" and type(reasoning) == "string" and reasoning ~= "" then
+      msg.reasoning = reasoning
+    end
+    out[i] = msg
+  end
+  return out
+end
+
+-- (payload, error)
+local function build_payload(request, stream)
+  local effort, err = reasoning_effort_for(request)
+  if err then return nil, err end
+  local payload = { model = request.model_name, messages = build_messages(request.messages), stream = stream }
+  for _, k in ipairs(PASS_FIELDS) do payload[k] = request[k] end
+  if payload.max_completion_tokens == nil then payload.max_completion_tokens = request.max_tokens end
+  if payload.seed == nil then payload.seed = request.random_seed end
+  if not stream then payload.stream_options = nil end
+  payload.reasoning_effort = effort
+  if type(request.reasoning) == "table" and request.reasoning.exclude == true then
+    -- Hidden works on every reasoning model (gpt-oss rejects only "raw").
+    payload.reasoning_format = "hidden"
+  end
+  return payload, nil
+end
+
+-- ---------------------------------------------------------------------------
+-- Audio helpers
+-- ---------------------------------------------------------------------------
+
+local ORPHEUS_VOICES = {
+  ["canopylabs/orpheus-v1-english"] = {
+    autumn = true, diana = true, hannah = true,
+    austin = true, daniel = true, troy = true,
+  },
+  ["canopylabs/orpheus-arabic-saudi"] = {
+    abdullah = true, fahad = true, sultan = true,
+    lulwa = true, noura = true, aisha = true,
+  },
+}
+
+local function utf8_length(value)
+  local _, count = tostring(value or ""):gsub("[^\128-\191]", "")
+  return count
+end
+
+local function le32(n)
+  return string.char(n % 256, math.floor(n / 256) % 256, math.floor(n / 65536) % 256, math.floor(n / 16777216) % 256)
+end
+
+-- Orpheus streams its WAV and leaves the RIFF and data sizes at 0xFFFFFFFF;
+-- strict decoders reject that, so the sizes are written from the real length.
+local function fix_wav_sizes(raw)
+  if #raw < 44 or raw:sub(1, 4) ~= "RIFF" or raw:sub(9, 12) ~= "WAVE" then return raw end
+  local pos = 13
+  while pos + 7 <= #raw do
+    local id = raw:sub(pos, pos + 3)
+    local b1, b2, b3, b4 = raw:byte(pos + 4, pos + 7)
+    if id == "data" then
+      local data_len = #raw - (pos + 7)
+      return "RIFF" .. le32(#raw - 8) .. raw:sub(9, pos + 3) .. le32(data_len) .. raw:sub(pos + 8)
+    end
+    pos = pos + 8 + b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
+  end
+  return raw
+end
+
+-- ---------------------------------------------------------------------------
+-- Plugin
+-- ---------------------------------------------------------------------------
+
+local function has(list, value)
+  for _, item in ipairs(list or {}) do
+    if item == value then return true end
+  end
+  return false
+end
+
+local function bearer(key, ctype)
+  local h = { ["Authorization"] = "Bearer " .. key }
+  if ctype then h["Content-Type"] = ctype end
+  return h
 end
 
 llm_router.register("groq", {
@@ -244,25 +524,43 @@ llm_router.register("groq", {
   get_model_infos = function(ctx)
     local creds = llm_router.credentials.list()
     if #creds == 0 then
-      return nil, { message = "no groq credentials configured", code = "invalid_request_error", status = 400 }
+      return nil, { message = "no Groq keys configured", code = "invalid_request_error", status = 400 }
     end
+    -- Every key until one answers: a dead first key must not hide the list
+    -- the others can fetch. The error names each key that failed and why.
     local client = llm_router.http_client({})
-    local resp, err = pooled_request(ctx, client, {
-      method = "GET",
-      url = BASE_URL .. "/models",
-      headers = { ["Authorization"] = "Bearer " .. api_key_of(creds[1].data) },
-    })
-    if err then return nil, err end
-    if resp.status ~= 200 then
-      return nil, {
-        message = "groq model discovery failed with status " .. tostring(resp.status),
-        code = "server_error",
-        status = resp.status,
-      }
+    local page, failures, last_status = nil, {}, 502
+    for _, cred in ipairs(creds) do
+      local resp, err = pooled_request(ctx, client, {
+        method = "GET",
+        url = BASE_URL .. "/models",
+        headers = bearer(api_key_of(cred.data)),
+      })
+      local reason = nil
+      if err then
+        reason = (type(err) == "table" and err.message) or tostring(err)
+      elseif resp.status == 200 then
+        local ok, decoded = pcall(json.decode, resp.body or "")
+        if ok and type(decoded) == "table" then
+          page = decoded
+          break
+        end
+        reason = "Groq returned an unreadable model list"
+      elseif resp.status == 401 then
+        reason = "Groq rejected the key: " .. upstream_message(resp, "invalid API key")
+        last_status = 401
+      else
+        reason = "Groq answered " .. tostring(resp.status) .. ": " .. upstream_message(resp, "no details")
+        last_status = resp.status
+      end
+      failures[#failures + 1] = "key " .. key_name(cred) .. ": " .. reason
     end
-    local decoded, page = pcall(json.decode, resp.body or "")
-    if not decoded or type(page) ~= "table" then
-      return nil, { message = "groq model discovery returned invalid JSON", code = "server_error", status = 502 }
+    if not page then
+      return nil, {
+        message = table.concat(failures, "; "),
+        code = last_status == 401 and "authentication_error" or "server_error",
+        status = last_status,
+      }
     end
 
     local infos = {}
@@ -273,7 +571,6 @@ llm_router.register("groq", {
 
       if m.active and has(input, "audio")
           and (has(output, "text") or has(output, "transcription")) then
-        local limits = RATE_LIMITS[m.id] or AUDIO_DEFAULT_LIMITS
         local endpoints = { "audio/transcriptions" }
         -- Groq documents translation only for whisper-large-v3, not Turbo.
         if m.id == "whisper-large-v3" then
@@ -282,28 +579,20 @@ llm_router.register("groq", {
         table.insert(infos, {
           name = m.id,
           display_name = name,
-          rpm = limits.rpm,
-          tpm = limits.tpm,
-          rpd = limits.rpd,
           input_modalities = input,
           output_modalities = output,
           endpoints = endpoints,
         })
       elseif m.active and has(input, "text")
           and (has(output, "speech") or has(output, "audio")) then
-        local limits = RATE_LIMITS[m.id] or DEFAULT_LIMITS
         table.insert(infos, {
           name = m.id,
           display_name = name,
-          rpm = limits.rpm,
-          tpm = limits.tpm,
-          rpd = limits.rpd,
           input_modalities = input,
           output_modalities = output,
           endpoints = { "audio/speech" },
         })
       elseif m.active and has(input, "text") and has(output, "text") then
-        local limits = RATE_LIMITS[m.id] or DEFAULT_LIMITS
         local params = {}
         for _, p in ipairs(m.supported_sampling_parameters or {}) do
           table.insert(params, p)
@@ -319,33 +608,11 @@ llm_router.register("groq", {
         if has(m.supported_features, "reasoning") then
           table.insert(params, "reasoning")
           table.insert(params, "reasoning_effort")
-          if m.id == "openai/gpt-oss-20b" or m.id == "openai/gpt-oss-120b"
-              or m.id == "openai/gpt-oss-safeguard-20b" then
-            reasoning = {
-              supported_efforts = { "high", "medium", "low" },
-              default_effort = "medium",
-              default_enabled = true,
-            }
-          elseif m.id == "qwen/qwen3.8-27b" then
-            reasoning = {
-              supported_efforts = { "high", "medium", "low", "default", "none" },
-              default_effort = "none",
-              default_enabled = false,
-            }
-          else
-            reasoning = {
-              supported_efforts = { "default", "none" },
-              default_effort = "default",
-              default_enabled = true,
-            }
-          end
+          reasoning = reasoning_info(m.id)
         end
         table.insert(infos, {
           name = m.id,
           display_name = name,
-          rpm = limits.rpm,
-          tpm = limits.tpm,
-          rpd = limits.rpd,
           context_window = m.context_window or 0,
           max_tokens = m.max_completion_tokens or 0,
           input_modalities = input,
@@ -367,33 +634,32 @@ llm_router.register("groq", {
     local key = api_key_of(credential.data)
     if key == "" then return { status = "unhealthy", message = "api_key is required" } end
     local client = llm_router.http_client({ timeout_ms = 15000 })
-    local resp, err = pooled_request(ctx, client, {
-      method = "GET",
-      url = BASE_URL .. "/models",
-      headers = { ["Authorization"] = "Bearer " .. key },
-    })
+    local resp, err = pooled_request(ctx, client, { method = "GET", url = BASE_URL .. "/models", headers = bearer(key) })
     if err then
       local message = "request failed"
       if type(err) == "table" and type(err.message) == "string" then message = err.message end
       return { status = "unknown", message = message }
     end
     if resp.status == 200 then return { status = "healthy" } end
-    if resp.status == 401 then return { status = "unhealthy", message = "api key rejected" } end
-    return { status = "unknown", message = "status " .. tostring(resp.status) }
+    if resp.status == 401 then
+      return { status = "unhealthy", message = "Groq rejected the key: " .. upstream_message(resp, "invalid API key") }
+    end
+    return { status = "unknown", message = "Groq answered " .. tostring(resp.status) .. ": " .. upstream_message(resp, "no details") }
   end,
 
-  -- Model liveness: per-model metadata GET proves existence with zero
-  -- generation spend, through the selected pool. Retries across credentials with unanimity for death: healthy
-  -- wins at once, quota outranks unknown, unhealthy needs every tried key
-  -- to report model-missing. Probes never park or disable.
+  -- Model liveness with zero generation spend, through the selected pool.
+  -- Chat and Whisper: per-model metadata GET proves existence. Speech: an
+  -- empty-input request is rejected before generation, with
+  -- model_terms_required when the key's org has not accepted the terms and
+  -- invalid_input when it has. Healthy wins at once, quota outranks unknown,
+  -- unhealthy needs every tried key to agree. Probes never park or disable.
   check_model = function(ctx, model_ref)
     local endpoint = model_ref.endpoint or "chat"
     -- Vision-capable chat models still serve chat/completions upstream;
     -- vision is a dashboard-side input distinction, not a separate API.
-    if endpoint ~= "chat" and endpoint ~= "vision" and endpoint ~= "transcription"
-        and endpoint ~= "translation" and endpoint ~= "speech"
-        and endpoint ~= "audio/transcriptions" and endpoint ~= "audio/translations"
-        and endpoint ~= "audio/speech" then
+    local speech = endpoint == "speech" or endpoint == "audio/speech"
+    if not speech and endpoint ~= "chat" and endpoint ~= "vision" and endpoint ~= "transcription"
+        and endpoint ~= "translation" and endpoint ~= "audio/transcriptions" and endpoint ~= "audio/translations" then
       return { status = "unknown", message = "endpoint not supported: " .. tostring(endpoint) }
     end
     local model_name = model_ref.model_name or ""
@@ -401,8 +667,7 @@ llm_router.register("groq", {
     local creds = llm_router.credentials.list()
     if #creds == 0 then return { status = "unknown", message = "no credentials available" } end
     local client = llm_router.http_client({ timeout_ms = 15000 })
-    local missing = 0
-    local tried = 0
+    local missing, terms, tried = 0, 0, 0
     local seen_quota = false
     local seen_unknown = nil
     for _, cred in ipairs(creds) do
@@ -412,33 +677,35 @@ llm_router.register("groq", {
       else
         tried = tried + 1
         llm_router.log("debug", "probing model", { cred_id = cred.id, model = model_ref.model, endpoint = endpoint })
-        local resp, err = pooled_request(ctx, client, {
-          method = "GET",
-          url = BASE_URL .. "/models/" .. model_name,
-          headers = { ["Authorization"] = "Bearer " .. key },
-        })
+        local request
+        if speech then
+          request = {
+            method = "POST",
+            url = BASE_URL .. "/audio/speech",
+            headers = bearer(key, "application/json"),
+            body = json.encode({ model = model_name, input = "", voice = "" }),
+          }
+        else
+          request = { method = "GET", url = BASE_URL .. "/models/" .. model_name, headers = bearer(key) }
+        end
+        local resp, err = pooled_request(ctx, client, request)
+        local code = (not err) and upstream_code(resp) or nil
         if err then
           local message = "request failed"
           if type(err) == "table" and type(err.message) == "string" then message = err.message end
           seen_unknown = seen_unknown or message
-        elseif resp.status == 200 then
+        elseif code == "model_terms_required" then
+          terms = terms + 1
+          set_cooldown(cred.id, model_name, TERMS_COOLDOWN_SECS, TERMS_REASON)
+          seen_unknown = seen_unknown or "model terms not accepted"
+        elseif resp.status == 200 or (speech and resp.status == 400) then
+          clear_cooldown(cred.id, model_name)
           return { status = "healthy", response = "ok" }
         elseif resp.status == 404 then
           missing = missing + 1
           seen_unknown = seen_unknown or "model not found upstream"
-        elseif resp.status == 429 then
+        elseif resp.status == 429 or code == "blocked_api_access" then
           seen_quota = true
-        elseif resp.status == 400 then
-          local blocked = false
-          local ok, page = pcall(json.decode, resp.body or "")
-          if ok and type(page) == "table" and type(page.error) == "table" and page.error.code == "blocked_api_access" then
-            blocked = true
-          end
-          if blocked then
-            seen_quota = true
-          else
-            seen_unknown = seen_unknown or ("status " .. tostring(resp.status))
-          end
         elseif resp.status == 401 or resp.status == 403 then
           seen_unknown = seen_unknown or "api key rejected"
         else
@@ -449,6 +716,9 @@ llm_router.register("groq", {
     if tried > 0 and missing == tried then
       return { status = "unhealthy", message = "model not found upstream" }
     end
+    if tried > 0 and terms + missing == tried and terms > 0 then
+      return { status = "unhealthy", message = terms_error(model_name).message }
+    end
     if seen_quota then
       return { status = "quota_exceeded", message = "quota exhausted" }
     end
@@ -456,139 +726,73 @@ llm_router.register("groq", {
   end,
 
   complete = function(ctx, request)
+    local payload, perr = build_payload(request, false)
+    if perr then return nil, perr end
+    local body = json.encode(payload)
     local client = llm_router.http_client({})
-    local last_err = nil
-    for _, cred in ipairs(llm_router.credentials.list()) do
-      llm_router.log("debug", "trying credential", { cred_id = cred.id, model = request.model })
-      local key = api_key_of(cred.data)
-      for _, px in ipairs(pick_proxies(ctx, 3)) do
-        local resp, err = client:request({
-          method = "POST",
-          url = BASE_URL .. "/chat/completions",
-          headers = { ["Authorization"] = "Bearer " .. key, ["Content-Type"] = "application/json" },
-          body = json.encode(build_payload(request, false)),
-          proxy_url = px.url,
-        })
-        if err == nil and resp.status == 200 then
-          local ok, out = pcall(json.decode, resp.body or "")
-          if not ok or type(out) ~= "table" then
-            return nil, { message = "groq returned invalid JSON", code = "server_error", status = 502 }
-          end
-          out.model = request.model
-          return out
-        elseif err ~= nil then
-          llm_router.log("debug", "transport error", { reason = tostring(err.message or "transport error"), code = err.code, cred_id = cred.id })
-          last_err = err
-        elseif resp.status == 401 then
-          bench(ctx, cred.id, "groq rejected the api key", 300)
-          last_err = { message = upstream_message(resp, "groq rejected the api key"), code = "authentication_error", status = 401 }
-          llm_router.log("warn", "api key rejected", { status = 401, code = "authentication_error", cred_id = cred.id })
-          break
-        elseif resp.status == 403 then
-          llm_router.log("debug", "egress blocked", { status = 403, code = "server_error", cred_id = cred.id })
-          last_err = { message = upstream_message(resp, "groq egress block on current exit"), code = "server_error", status = 502 }
-        elseif resp.status == 429 then
-          local quota_err, park_reason = rate_limit_error(resp)
-          llm_router.credentials.park(cred.id, retry_after_secs(resp), park_reason)
-          llm_router.log("warn", park_reason, { status = 429, code = quota_err.code, cred_id = cred.id })
-          last_err = quota_err
-          break
-        elseif resp.status == 400 or resp.status == 404 or resp.status == 422 then
-          local message = upstream_message(resp, "groq rejected the request with status " .. tostring(resp.status))
-          llm_router.log("error", "request rejected", { status = resp.status, code = "invalid_request_error", cred_id = cred.id })
-          return nil, { message = message, code = "invalid_request_error", status = resp.status }
-        else
-          llm_router.log("debug", "unexpected status", { status = resp.status, code = "server_error", cred_id = cred.id })
-          last_err = {
-            message = upstream_message(resp, "groq returned status " .. tostring(resp.status)),
-            code = "server_error",
-            status = resp.status,
-          }
-        end
-      end
+    local resp, err = attempt(ctx, request.model_name, function(cred, key, proxy_url)
+      local r, e = client:request({
+        method = "POST",
+        url = BASE_URL .. "/chat/completions",
+        headers = bearer(key, "application/json"),
+        body = body,
+        proxy_url = proxy_url,
+      })
+      return classify(ctx, cred, request.model_name, r, e)
+    end)
+    if not resp then return nil, err end
+    local ok, out = pcall(json.decode, resp.body or "")
+    if not ok or type(out) ~= "table" then
+      return nil, error_of("groq returned invalid JSON", "server_error", 502)
     end
-    local exhausted = last_err or { message = "all groq credentials exhausted", code = "server_error" }
-    llm_router.log("error", "all credentials exhausted", { reason = tostring(exhausted.message or "request failed"), code = exhausted.code })
-    return nil, exhausted
+    out.model = request.model
+    return out
   end,
 
   complete_stream = function(ctx, request, emit)
+    local payload, perr = build_payload(request, true)
+    if perr then return nil, perr end
+    local body = json.encode(payload)
     local client = llm_router.http_client({})
     local full_model = request.model
-    local last_err = nil
-    for _, cred in ipairs(llm_router.credentials.list()) do
-      llm_router.log("debug", "trying credential", { cred_id = cred.id, model = request.model })
-      local key = api_key_of(cred.data)
-      for _, px in ipairs(pick_proxies(ctx, 3)) do
-        local done = false
-        local next_cred = false
-        local terminal_err = nil
-        local resp, stream_err = client:stream({
-          method = "POST",
-          url = BASE_URL .. "/chat/completions",
-          headers = { ["Authorization"] = "Bearer " .. key, ["Content-Type"] = "application/json" },
-          body = json.encode(build_payload(request, true)),
-          proxy_url = px.url,
-          on_response = function(r)
-            if r.status == 401 then
-              bench(ctx, cred.id, "groq rejected the api key", 300)
-              next_cred = true
-              return { message = upstream_message(r, "groq rejected the api key"), code = "authentication_error", status = 401 }
-            end
-            if r.status == 403 then
-              return { message = upstream_message(r, "groq egress block on current exit"), code = "server_error", status = 502 }
-            end
-            if r.status == 429 then
-              local quota_err, park_reason = rate_limit_error(r)
-              llm_router.credentials.park(cred.id, retry_after_secs(r), park_reason)
-              next_cred = true
-              llm_router.log("warn", park_reason, { status = 429, code = quota_err.code, cred_id = cred.id })
-              return quota_err
-            end
-            if r.status == 400 or r.status == 404 or r.status == 422 then
-              terminal_err = {
-                message = upstream_message(r, "groq rejected the request with status " .. tostring(r.status)),
-                code = "invalid_request_error",
-                status = r.status,
-              }
-              return terminal_err
-            end
-            if r.status ~= 200 then
-              return {
-                message = upstream_message(r, "groq returned status " .. tostring(r.status)),
-                code = "server_error",
-                status = r.status,
-              }
-            end
-          end,
-          on_line = function(line)
-            if line:sub(1, 6) ~= "data: " then return end
-            local data = line:sub(7)
-            if data == "[DONE]" then return end
-            local ok, chunk = pcall(json.decode, data)
-            if not ok or type(chunk) ~= "table" then return end
-            local has_choices = type(chunk.choices) == "table" and #chunk.choices > 0
-            if not has_choices and chunk.usage == nil then return end
-            chunk.model = full_model
-            emit(chunk)
-            done = true
-          end,
-        })
-        if terminal_err then return nil, terminal_err end
-        if stream_err then
-          last_err = stream_err
-        else
-          return
-        end
-        if next_cred then break end
-        -- A stream that emitted already belongs to that attempt: surface
-        -- instead of failing over mid-stream.
-        if done then return nil, last_err end
-      end
-    end
-    local exhausted = last_err or { message = "all groq credentials exhausted", code = "server_error" }
-    llm_router.log("error", "all credentials exhausted", { reason = tostring(exhausted.message or "request failed"), code = exhausted.code })
-    return nil, exhausted
+    local emitted = false
+    local _, err = attempt(ctx, request.model_name, function(cred, key, proxy_url)
+      local action, value = nil, nil
+      local _, stream_err = client:stream({
+        method = "POST",
+        url = BASE_URL .. "/chat/completions",
+        headers = bearer(key, "application/json"),
+        body = body,
+        proxy_url = proxy_url,
+        on_response = function(r)
+          if r.status == 200 then
+            note_limits(cred, request.model_name, r)
+            return nil
+          end
+          action, value = classify(ctx, cred, request.model_name, r, nil)
+          return value
+        end,
+        on_line = function(line)
+          if line:sub(1, 6) ~= "data: " then return end
+          local data = line:sub(7)
+          if data == "[DONE]" then return end
+          local ok, chunk = pcall(json.decode, data)
+          if not ok or type(chunk) ~= "table" then return end
+          local has_choices = type(chunk.choices) == "table" and #chunk.choices > 0
+          if not has_choices and chunk.usage == nil then return end
+          chunk.model = full_model
+          emit(chunk)
+          emitted = true
+        end,
+      })
+      if action ~= nil then return action, value end
+      if stream_err == nil then return "ok", true end
+      -- A stream that emitted already belongs to that attempt: surface
+      -- instead of failing over mid-stream.
+      if emitted then return "stop", stream_err end
+      return classify(ctx, cred, request.model_name, nil, stream_err)
+    end)
+    if err then return nil, err end
   end,
 
   -- Speech-to-text: always fetch verbose_json upstream; the router renders
@@ -597,10 +801,10 @@ llm_router.register("groq", {
   transcribe = function(ctx, request)
     local task = request.task or "transcribe"
     if task ~= "transcribe" and task ~= "translate" then
-      return nil, { message = "unsupported audio task: " .. tostring(task), code = "invalid_request_error", status = 400 }
+      return nil, invalid_request("unsupported audio task: " .. tostring(task))
     end
     if task == "translate" and request.language and request.language ~= "" and request.language ~= "en" then
-      return nil, { message = "Groq audio translations only accept language=en", code = "invalid_request_error", status = 400 }
+      return nil, invalid_request("Groq audio translations only accept language=en")
     end
 
     local client = llm_router.http_client({ timeout_ms = 300000 })
@@ -626,55 +830,22 @@ llm_router.register("groq", {
     end
     local body, ctype = llm_router.multipart(parts)
     local path = task == "translate" and "/audio/translations" or "/audio/transcriptions"
-    local last_err = nil
-    for _, cred in ipairs(llm_router.credentials.list()) do
-      llm_router.log("debug", "trying credential", { cred_id = cred.id, model = request.model, task = task })
-      local key = api_key_of(cred.data)
-      for _, px in ipairs(pick_proxies(ctx, 3)) do
-        local resp, err = client:request({
-          method = "POST",
-          url = BASE_URL .. path,
-          headers = { ["Authorization"] = "Bearer " .. key, ["Content-Type"] = ctype },
-          body = body,
-          proxy_url = px.url,
-        })
-        if err == nil and resp.status == 200 then
-          local ok, out = pcall(json.decode, resp.body or "")
-          if not ok or type(out) ~= "table" then
-            return nil, { message = "groq returned invalid transcription JSON", code = "server_error", status = 502 }
-          end
-          return out
-        elseif err ~= nil then
-          llm_router.log("debug", "transport error", { reason = tostring(err.message or "transport error"), code = err.code, cred_id = cred.id })
-          last_err = err
-        elseif resp.status == 401 then
-          bench(ctx, cred.id, "groq rejected the api key", 300)
-          last_err = { message = upstream_message(resp, "groq rejected the api key"), code = "authentication_error", status = 401 }
-          llm_router.log("warn", "api key rejected", { status = 401, code = "authentication_error", cred_id = cred.id })
-          break
-        elseif resp.status == 429 then
-          local quota_err, park_reason = rate_limit_error(resp)
-          llm_router.credentials.park(cred.id, retry_after_secs(resp), park_reason)
-          last_err = quota_err
-          llm_router.log("warn", park_reason, { status = 429, code = quota_err.code, cred_id = cred.id })
-          break
-        elseif resp.status == 400 or resp.status == 404 or resp.status == 422 then
-          local message = upstream_message(resp, "groq rejected the request with status " .. tostring(resp.status))
-          llm_router.log("error", "request rejected", { status = resp.status, code = "invalid_request_error", cred_id = cred.id })
-          return nil, { message = message, code = "invalid_request_error", status = resp.status }
-        else
-          llm_router.log("debug", "unexpected status", { status = resp.status, code = "server_error", cred_id = cred.id })
-          last_err = {
-            message = upstream_message(resp, "groq returned status " .. tostring(resp.status)),
-            code = "server_error",
-            status = resp.status,
-          }
-        end
-      end
+    local resp, err = attempt(ctx, request.model_name, function(cred, key, proxy_url)
+      local r, e = client:request({
+        method = "POST",
+        url = BASE_URL .. path,
+        headers = bearer(key, ctype),
+        body = body,
+        proxy_url = proxy_url,
+      })
+      return classify(ctx, cred, request.model_name, r, e)
+    end)
+    if not resp then return nil, err end
+    local ok, out = pcall(json.decode, resp.body or "")
+    if not ok or type(out) ~= "table" then
+      return nil, error_of("groq returned invalid transcription JSON", "server_error", 502)
     end
-    local exhausted = last_err or { message = "all groq credentials exhausted", code = "server_error" }
-    llm_router.log("error", "all credentials exhausted", { reason = tostring(exhausted.message or "request failed"), code = exhausted.code })
-    return nil, exhausted
+    return out
   end,
 
   -- Orpheus TTS only supports WAV, requires a model-specific voice, and limits
@@ -683,90 +854,52 @@ llm_router.register("groq", {
     local model = request.model_name or ""
     local voices = ORPHEUS_VOICES[model]
     if not voices then
-      return nil, { message = "unsupported Groq speech model: " .. model, code = "invalid_request_error", status = 400 }
+      return nil, invalid_request("unsupported Groq speech model: " .. model)
     end
     local text = tostring(request.input or "")
     local voice = tostring(request.voice or "")
-    if text == "" then
-      return nil, { message = "input is required", code = "invalid_request_error", status = 400 }
-    end
-    if voice == "" then
-      return nil, { message = "voice is required for Groq Orpheus", code = "invalid_request_error", status = 400 }
-    end
+    if text == "" then return nil, invalid_request("input is required") end
+    if voice == "" then return nil, invalid_request("voice is required for Groq Orpheus") end
     if not voices[voice] then
-      return nil, { message = "voice is not supported by " .. model, code = "invalid_request_error", status = 400 }
+      local names = {}
+      for v in pairs(voices) do names[#names + 1] = v end
+      table.sort(names)
+      return nil, invalid_request("voice " .. voice .. " is not supported by " .. model .. "; supported: " .. table.concat(names, ", "))
     end
     local format = request.response_format
     if format ~= nil and format ~= "" and format ~= "wav" then
-      return nil, { message = "Groq Orpheus supports only response_format=wav", code = "invalid_request_error", status = 400 }
+      return nil, invalid_request("Groq Orpheus supports only response_format=wav")
     end
     if request.speed ~= nil and tonumber(request.speed) and tonumber(request.speed) ~= 1 then
-      return nil, { message = "Groq Orpheus does not support the speed parameter", code = "invalid_request_error", status = 400 }
+      return nil, invalid_request("Groq Orpheus does not support the speed parameter")
     end
     if request.instructions and request.instructions ~= "" then
       if model ~= "canopylabs/orpheus-v1-english" then
-        return nil, { message = "vocal directions are supported only by the English Orpheus model", code = "invalid_request_error", status = 400 }
+        return nil, invalid_request("vocal directions are supported only by the English Orpheus model")
       end
       local direction = tostring(request.instructions):gsub("^%[", ""):gsub("%]$", "")
       text = "[" .. direction .. "] " .. text
     end
     if utf8_length(text) > 200 then
-      return nil, { message = "Groq Orpheus input is limited to 200 characters", code = "invalid_request_error", status = 400 }
+      return nil, invalid_request("Groq Orpheus input is limited to 200 characters")
     end
 
     local body = json.encode({ model = model, input = text, voice = voice, response_format = "wav" })
     local client = llm_router.http_client({ timeout_ms = 300000 })
-    local last_err = nil
-    for _, cred in ipairs(llm_router.credentials.list()) do
-      llm_router.log("debug", "trying credential", { cred_id = cred.id, model = request.model })
-      local key = api_key_of(cred.data)
-      for _, px in ipairs(pick_proxies(ctx, 3)) do
-        local resp, err = client:request({
-          method = "POST",
-          url = BASE_URL .. "/audio/speech",
-          headers = { ["Authorization"] = "Bearer " .. key, ["Content-Type"] = "application/json" },
-          body = body,
-          proxy_url = px.url,
-        })
-        if err == nil and resp.status == 200 then
-          if type(resp.body) ~= "string" or #resp.body == 0 then
-            return nil, { message = "groq returned empty audio", code = "server_error", status = 502 }
-          end
-          return { audio_b64 = llm_router.base64_encode(resp.body), format = "wav" }
-        elseif err ~= nil then
-          last_err = err
-          llm_router.log("debug", "transport error", { reason = tostring(err.message or "transport error"), code = err.code, cred_id = cred.id })
-        elseif resp.status == 401 then
-          bench(ctx, cred.id, "groq rejected the api key", 300)
-          last_err = { message = upstream_message(resp, "groq rejected the api key"), code = "authentication_error", status = 401 }
-          llm_router.log("warn", "api key rejected", { status = 401, code = "authentication_error", cred_id = cred.id })
-          break
-        elseif resp.status == 403 then
-          last_err = { message = upstream_message(resp, "groq egress block on current exit"), code = "server_error", status = 502 }
-          llm_router.log("debug", "egress blocked", { status = 403, code = "server_error", cred_id = cred.id })
-        elseif resp.status == 429 then
-          local quota_err, park_reason = rate_limit_error(resp)
-          llm_router.credentials.park(cred.id, retry_after_secs(resp), park_reason)
-          last_err = quota_err
-          llm_router.log("warn", park_reason, { status = 429, code = quota_err.code, cred_id = cred.id })
-          break
-        elseif resp.status == 400 or resp.status == 404 or resp.status == 422 then
-          return nil, {
-            message = upstream_message(resp, "groq rejected the speech request with status " .. tostring(resp.status)),
-            code = "invalid_request_error",
-            status = resp.status,
-          }
-        else
-          last_err = {
-            message = upstream_message(resp, "groq returned status " .. tostring(resp.status)),
-            code = "server_error",
-            status = resp.status,
-          }
-        end
-      end
+    local resp, err = attempt(ctx, model, function(cred, key, proxy_url)
+      local r, e = client:request({
+        method = "POST",
+        url = BASE_URL .. "/audio/speech",
+        headers = bearer(key, "application/json"),
+        body = body,
+        proxy_url = proxy_url,
+      })
+      return classify(ctx, cred, model, r, e)
+    end)
+    if not resp then return nil, err end
+    if type(resp.body) ~= "string" or #resp.body == 0 then
+      return nil, error_of("groq returned empty audio", "server_error", 502)
     end
-    local exhausted = last_err or { message = "all groq credentials exhausted", code = "server_error" }
-    llm_router.log("error", "all credentials exhausted", { reason = tostring(exhausted.message or "request failed"), code = exhausted.code })
-    return nil, exhausted
+    return { audio_b64 = llm_router.base64_encode(fix_wav_sizes(resp.body)), format = "wav" }
   end,
 })

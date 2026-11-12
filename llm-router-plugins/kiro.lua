@@ -1,12 +1,22 @@
 --- @plugin Kiro AI
 --- @author TheSlopMachine
---- @version 5.3.2
+--- @version 5.3.3
 --- @plugin_api 1.5
 --- @description AWS Kiro models via device login (OAuth2 with proactive refresh)
 --- @allow_host codewhisperer.us-east-1.amazonaws.com
 --- @allow_host oidc.us-east-1.amazonaws.com
 --- @allow_host q.us-east-1.amazonaws.com
 --- @allow_host q.eu-central-1.amazonaws.com
+
+-- The client identity every Kiro call sends. AWS answers "This version of Kiro
+-- is no longer supported" (FEATURE_NOT_SUPPORTED) when the identifier carries
+-- no KiroIDE version or a retired one (0.x, kiro-ide/1.0.0 included). Bump
+-- KIRO_IDE_VERSION to the newest IDE release (kiro.dev/changelog/ide) when that
+-- error comes back. 1.4.154: Nov 10, 2026.
+local KIRO_IDE_VERSION = "1.4.154"
+local KIRO_SDK_VERSION = "3.738.0"
+local USER_AGENT = "aws-sdk-js/" .. KIRO_SDK_VERSION .. " KiroIDE-" .. KIRO_IDE_VERSION
+local AMZ_USER_AGENT = "aws-sdk-js/" .. KIRO_SDK_VERSION .. " KiroIDE-" .. KIRO_IDE_VERSION
 
 local DEFAULT_REGION = "us-east-1"
 local BUILDER_START_URL = "https://view.awsapps.com/start"
@@ -62,6 +72,22 @@ end
 local function runtime_host(region)
   if region == "us-east-1" then return "https://codewhisperer.us-east-1.amazonaws.com" end
   return "https://q." .. region .. ".amazonaws.com"
+end
+
+-- GenerateAssistantResponse now demands a profileArn from every account.
+-- Builder ID accounts have no Q Developer profile of their own: kiro-cli sends
+-- AWS's shared Builder ID profile for them, and so does this plugin. Accounts
+-- with a stored profile (IdC, desktop imports) send theirs.
+local BUILDER_ID_PROFILE_ARN = "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
+
+local function profile_arn_for(credential)
+  local data = credential and credential.data or {}
+  local arn = data.profile_arn
+  if type(arn) ~= "string" or arn == "" then arn = data.profileArn end
+  if type(arn) == "string" and arn ~= "" then return arn end
+  local start_url = data.start_url
+  if start_url == nil or start_url == "" or start_url == BUILDER_START_URL then return BUILDER_ID_PROFILE_ARN end
+  return nil
 end
 
 local function generate_url(credential, provider_config)
@@ -134,7 +160,7 @@ local function fetch_model_list(send, url, token, profile_arn)
     headers = {
       ["Authorization"] = "Bearer " .. token,
       ["Accept"] = "application/json",
-      ["User-Agent"] = "AWS-SDK-JS/3.0.0 kiro-ide/1.0.0",
+      ["User-Agent"] = USER_AGENT,
     },
   })
   if err then
@@ -728,8 +754,8 @@ local function generate_headers(credential)
     ["Content-Type"] = "application/json",
     ["Accept"] = "application/vnd.amazon.eventstream",
     ["X-Amz-Target"] = "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
-    ["User-Agent"] = "AWS-SDK-JS/3.0.0 kiro-ide/1.0.0",
-    ["X-Amz-User-Agent"] = "aws-sdk-js/3.0.0 kiro-ide/1.0.0",
+    ["User-Agent"] = USER_AGENT,
+    ["X-Amz-User-Agent"] = AMZ_USER_AGENT,
     ["Amz-Sdk-Request"] = "attempt=1; max=3",
     ["Amz-Sdk-Invocation-Id"] = llm_router.random_hex(16),
     ["x-amzn-bedrock-cache-control"] = "enable",
@@ -1265,11 +1291,10 @@ llm_router.register("kiro", {
           local models = fetch_model_list(send, url, token)
           if models then return with_thinking_variants(models) end
         end
-        -- Desktop-style accounts serve the catalog under their profile ARN.
-        -- Builder ID must not send it (yields 403), so this stays a retry.
-        local arn = data.profile_arn
-        if type(arn) ~= "string" or arn == "" then arn = data.profileArn end
-        if type(arn) == "string" and arn ~= "" then
+        -- Since Nov 2026 the catalog answers "Invalid profileArn." without one:
+        -- the stored profile, or the shared Builder ID profile, is the retry.
+        local arn = profile_arn_for(cred)
+        if arn then
           local models = fetch_model_list(send, discovery_endpoints(region)[1], token, arn)
           if models then return with_thinking_variants(models) end
         end
@@ -1292,9 +1317,8 @@ llm_router.register("kiro", {
     if token == "" then return { status = "unhealthy", message = "access_token is required" } end
     local region = runtime_region(credential, provider_config)
     local target = discovery_endpoints(region)[1] .. "?origin=AI_EDITOR"
-    local arn = data.profile_arn
-    if type(arn) ~= "string" or arn == "" then arn = data.profileArn end
-    if type(arn) == "string" and arn ~= "" then target = target .. "&profileArn=" .. arn end
+    local arn = profile_arn_for(credential)
+    if arn then target = target .. "&profileArn=" .. arn end
     local client = llm_router.http_client({ timeout_ms = 15000 })
     local resp, err = pooled_request({ provider_config = provider_config or ctx.provider_config }, client, {
       method = "GET",
@@ -1302,7 +1326,7 @@ llm_router.register("kiro", {
       headers = {
         ["Authorization"] = "Bearer " .. token,
         ["Accept"] = "application/json",
-        ["User-Agent"] = "AWS-SDK-JS/3.0.0 kiro-ide/1.0.0",
+        ["User-Agent"] = USER_AGENT,
       },
     })
     if err then
@@ -1311,8 +1335,12 @@ llm_router.register("kiro", {
       return { status = "unknown", message = message }
     end
     if resp.status == 200 then return { status = "healthy" } end
-    if resp.status == 401 then return { status = "unhealthy", message = "access token rejected" } end
-    return { status = "unknown", message = "status " .. tostring(resp.status) }
+    local detail = tostring(resp.body or "")
+    local ok, parsed = pcall(json.decode, detail)
+    if ok and type(parsed) == "table" and type(parsed.message) == "string" then detail = parsed.message end
+    detail = string.sub(detail, 1, 300)
+    if resp.status == 401 then return { status = "unhealthy", message = "Kiro rejected the access token: " .. detail } end
+    return { status = "unknown", message = "Kiro answered " .. tostring(resp.status) .. ": " .. detail }
   end,
 
   -- Model liveness: catalog membership proves servability with zero
@@ -1346,8 +1374,7 @@ llm_router.register("kiro", {
         tried = tried + 1
         llm_router.log("debug", "probing model", { cred_id = cred.id, model = model_ref.model, endpoint = endpoint })
         local region = runtime_region(cred, ctx.provider_config)
-        local arn = data.profile_arn
-        if type(arn) ~= "string" or arn == "" then arn = data.profileArn end
+        local arn = profile_arn_for(cred)
         local targets = {}
         for _, url in ipairs(discovery_endpoints(region)) do
           table.insert(targets, { url = url, arn = nil })
@@ -1367,7 +1394,7 @@ llm_router.register("kiro", {
             headers = {
               ["Authorization"] = "Bearer " .. token,
               ["Accept"] = "application/json",
-              ["User-Agent"] = "AWS-SDK-JS/3.0.0 kiro-ide/1.0.0",
+              ["User-Agent"] = USER_AGENT,
             },
           })
           if err then
@@ -1560,6 +1587,7 @@ llm_router.register("kiro", {
     local last_err = nil
     for _, cred in ipairs(llm_router.credentials.list()) do
       llm_router.log("debug", "trying credential", { cred_id = cred.id, model = request.model_name })
+      payload.profileArn = profile_arn_for(cred)
       for _, px in ipairs(pick_proxies(ctx, 3)) do
         local resp, err = client:request({
           method = "POST",
@@ -1595,6 +1623,7 @@ llm_router.register("kiro", {
     local last_err = nil
     for _, cred in ipairs(llm_router.credentials.list()) do
       llm_router.log("debug", "trying credential", { cred_id = cred.id, model = request.model })
+      payload.profileArn = profile_arn_for(cred)
       for _, px in ipairs(pick_proxies(ctx, 3)) do
         local response_id = "kiro-" .. tostring(os.time())
         local created = os.time()

@@ -1,6 +1,6 @@
 --- @plugin Google AI Studio
 --- @author TheSlopMachine
---- @version 6.1.0
+--- @version 6.1.2
 --- @plugin_api 1.6
 --- @allow_host generativelanguage.googleapis.com
 --- @description Google Gemini models via the AI Studio API: chat, streaming, tools, embeddings, speech, transcription and image generation
@@ -61,6 +61,15 @@ local function api_key_of(data)
     return ""
   end
   return (data.api_key:match("^%s*(.-)%s*$"))
+end
+
+-- How errors name a key: its dashboard label, else its id.
+local function key_name(cred)
+  local label = type(cred) == "table" and cred.label or nil
+  if type(label) == "string" and label ~= "" then
+    return "\"" .. label .. "\""
+  end
+  return tostring(type(cred) == "table" and cred.id or "?")
 end
 
 local function error_of(message, code, status, headers)
@@ -256,18 +265,6 @@ end
 local function model_dead_for(cred_id, model_name)
   local ok, value = pcall(llm_router.storage.get, DEAD_SCOPE, pair_key(cred_id, model_name))
   return ok and value ~= nil
-end
-
-local function dead_everywhere(creds, model_name)
-  if #creds == 0 then
-    return false
-  end
-  for _, cred in ipairs(creds) do
-    if not model_dead_for(cred.id, model_name) then
-      return false
-    end
-  end
-  return true
 end
 
 -- One credentials.list() pass: (usable, total, min_wait, all_dead, all_free_tier).
@@ -2468,11 +2465,13 @@ local function model_info_of(entry)
     return nil
   end
 
-  -- Gemini takes text, image, audio, video and file (document) input; gemma-4
-  -- takes images. Output stays text unless the family says otherwise: chat
-  -- completions here never request IMAGE/AUDIO response modalities.
+  -- Gemini (nano-banana aliases included) takes text, image, audio, video and
+  -- file (document) input; gemma-4 takes images. The router rejects parts a
+  -- model does not list, so a missing modality here blocks real input.
+  -- Output stays text unless the family says otherwise: chat completions here
+  -- never request IMAGE/AUDIO response modalities.
   local in_modalities = { "text" }
-  if lower:match("^gemini") then
+  if lower:match("^gemini") or lower:find("nano-banana", 1, true) then
     in_modalities = { "text", "image", "audio", "video", "file" }
   elseif lower:match("^gemma") then
     in_modalities = { "text", "image" }
@@ -2874,51 +2873,55 @@ llm_router.register("google", {
   get_model_infos = function(ctx)
     local creds = llm_router.credentials.list()
     if #creds == 0 then
-      return nil, invalid_request("no google credentials configured")
+      return nil, invalid_request("no Google keys configured")
     end
-    local entries, failure = nil, nil
+    -- Every key until one answers; the error names each key that failed and
+    -- quotes Google's own reason.
+    local entries, failures, last_status = nil, {}, 502
     for _, cred in ipairs(creds) do
       local key = api_key_of(cred.data)
-      if key ~= "" then
+      local reason = nil
+      if key == "" then
+        reason = "no api_key stored"
+      else
         local found, why = list_models(ctx, key)
         if found then
           entries = found
           break
         end
-        failure = why
+        if why.kind == "status" then
+          local status = why.resp.status
+          local body = tostring(why.resp.body or "")
+          last_status = (status >= 400 and status < 600) and status or 502
+          local detail = upstream_message(body) or ("status " .. tostring(status))
+          if is_key_rejection(status, body:lower()) then
+            reason = "Google rejected the key: " .. detail
+          elseif is_geo_block(status, body:lower()) then
+            reason = "Google refused this location (pick a proxy pool in another country): " .. detail
+          else
+            reason = "Google answered " .. tostring(status) .. ": " .. detail
+          end
+          llm_router.log("error", "discovery rejected",
+            { operation = "get_model_infos", cred_id = cred.id, status = status, body = trunc(body, 500) })
+        elseif why.kind == "transport" then
+          reason = "request failed: " .. fault_reason(why.err)
+          llm_router.log("error", "discovery transport error",
+            { operation = "get_model_infos", cred_id = cred.id, reason = fault_reason(why.err) })
+        else
+          reason = "Google returned an unreadable model list"
+        end
       end
+      failures[#failures + 1] = "key " .. key_name(cred) .. ": " .. reason
     end
     if entries == nil then
-      if failure == nil then
-        return nil, invalid_request("google credentials carry no api_key")
-      end
-      if failure.kind == "status" then
-        local status = failure.resp.status
-        llm_router.log(
-          "error",
-          "discovery rejected",
-          { operation = "get_model_infos", status = status, body = trunc(failure.resp.body, 500) }
-        )
-        return nil,
-          error_of(
-            "google model discovery failed with status " .. tostring(status),
-            "server_error",
-            (status >= 400 and status < 600) and status or 502
-          )
-      elseif failure.kind == "transport" then
-        llm_router.log(
-          "error",
-          "discovery transport error",
-          { operation = "get_model_infos", reason = fault_reason(failure.err) }
-        )
-        return nil, error_of("google model discovery failed: " .. fault_reason(failure.err), "server_error", 502)
-      end
-      return nil, error_of("google model discovery returned an unparsable page", "server_error", 502)
+      return nil, error_of(table.concat(failures, "; "), last_status == 401 and "authentication_error" or "server_error", last_status)
     end
+    -- Models the keys lost ("no longer available") stay listed: requests get
+    -- a clear 404, and disabling them is the dashboard's call.
     local infos = {}
     for _, entry in ipairs(entries) do
       local info = model_info_of(entry)
-      if info and not dead_everywhere(creds, info.name) then
+      if info then
         infos[#infos + 1] = info
       end
     end
@@ -2940,10 +2943,12 @@ llm_router.register("google", {
     if resp.status == 200 then
       return { status = "healthy" }
     end
-    if is_key_rejection(resp.status, tostring(resp.body or ""):lower()) then
-      return { status = "unhealthy", message = "api key rejected" }
+    local body = tostring(resp.body or "")
+    local detail = upstream_message(body) or ("status " .. tostring(resp.status))
+    if is_key_rejection(resp.status, body:lower()) then
+      return { status = "unhealthy", message = "Google rejected the key: " .. detail }
     end
-    return { status = "unknown", message = "status " .. tostring(resp.status) }
+    return { status = "unknown", message = "Google answered " .. tostring(resp.status) .. ": " .. detail }
   end,
 
   check_model = check_model,
