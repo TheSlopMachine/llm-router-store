@@ -1,6 +1,6 @@
 --- @plugin Google AI Studio
 --- @author TheSlopMachine
---- @version 6.0.2
+--- @version 6.1.0
 --- @plugin_api 1.6
 --- @allow_host generativelanguage.googleapis.com
 --- @description Google Gemini models via the AI Studio API: chat, streaming, tools, embeddings, speech, transcription and image generation
@@ -36,6 +36,7 @@ local MAX_COOLDOWN_SECS = 86400
 local DEAD_TTL_SECS = 86400
 
 local COOLDOWN_SCOPE = "rate_limit"
+local FREE_TIER_REASON = "free tier"
 local DEAD_SCOPE = "model_dead"
 
 -- Gemini is served in most countries (not RU, BY, CN, IR and a few others): any
@@ -177,7 +178,11 @@ end
 -- nil: the family takes no thinking configuration (sending one is a 400).
 local function thinking_mode(name)
   local lower = tostring(name):lower()
-  if is_gemma(lower) or is_tts_model(lower) or is_embedding_model(lower) or is_transcribe_model(lower) then
+  if is_gemma(lower) then
+    -- Gemma 4 toggles thinking through thinkingLevel; earlier Gemma has none.
+    return (tonumber(lower:match("^gemma%-(%d+)") or "0") or 0) >= 4 and "level" or nil
+  end
+  if is_tts_model(lower) or is_embedding_model(lower) or is_transcribe_model(lower) then
     return nil
   end
   if lower:find("image", 1, true) then
@@ -208,30 +213,30 @@ local function pair_key(cred_id, model_name)
   return tostring(cred_id) .. ":" .. bare_model(model_name)
 end
 
-local function set_cooldown(cred_id, model_name, secs)
+local function set_cooldown(cred_id, model_name, secs, reason)
   secs = clamp(math.ceil(tonumber(secs) or DEFAULT_COOLDOWN_SECS), 1, MAX_COOLDOWN_SECS)
   local now = os.time()
   pcall(
     llm_router.storage.set,
     COOLDOWN_SCOPE,
     pair_key(cred_id, model_name),
-    { at = now, ["until"] = now + secs, reason = "rate limited" },
+    { at = now, ["until"] = now + secs, reason = reason or "rate limited" },
     { ttl = secs }
   )
 end
 
--- Seconds left on a cooldown, or nil when the pair is free.
+-- Seconds left on a cooldown plus its reason, or nil when the pair is free.
 local function cooldown_remaining(cred_id, model_name)
   local ok, value = pcall(llm_router.storage.get, COOLDOWN_SCOPE, pair_key(cred_id, model_name))
   if not ok or type(value) ~= "table" then
     return nil
   end
   if value["until"] == nil then
-    return 1
+    return 1, value.reason
   end -- row from before expiry stamps; the TTL still bounds it
   local remaining = (tonumber(value["until"]) or 0) - os.time()
   if remaining > 0 then
-    return remaining
+    return remaining, value.reason
   end
   return nil
 end
@@ -265,27 +270,31 @@ local function dead_everywhere(creds, model_name)
   return true
 end
 
--- One credentials.list() pass: (usable, total, min_wait, all_dead).
+-- One credentials.list() pass: (usable, total, min_wait, all_dead, all_free_tier).
 -- total counts keys not dead for this model; an empty usable set with a
 -- positive total means every key is cooling down on this model's quota, never
--- a credential-wide outage.
+-- a credential-wide outage. all_free_tier: every cooling key is cooling
+-- because its free tier does not offer the model.
 local function plan_credentials(model_name)
   local all = llm_router.credentials.list()
-  local usable, total, dead, min_wait = {}, 0, 0, nil
+  local usable, total, dead, min_wait, free_tier = {}, 0, 0, nil, 0
   for _, cred in ipairs(all) do
     if model_dead_for(cred.id, model_name) then
       dead = dead + 1
     else
       total = total + 1
-      local remaining = cooldown_remaining(cred.id, model_name)
+      local remaining, reason = cooldown_remaining(cred.id, model_name)
       if remaining ~= nil then
         min_wait = min_wait and math.min(min_wait, remaining) or remaining
+        if reason == FREE_TIER_REASON then
+          free_tier = free_tier + 1
+        end
       else
         usable[#usable + 1] = cred
       end
     end
   end
-  return usable, total, min_wait, (#all > 0 and dead == #all)
+  return usable, total, min_wait, (#all > 0 and dead == #all), (free_tier > 0 and free_tier == total)
 end
 
 -- Dead-key bench: shared disable when automation is on (visible in the
@@ -309,6 +318,29 @@ local function retry_headers(secs)
     return nil
   end
   return { ["Retry-After"] = tostring(math.ceil(secs)) }
+end
+
+-- 429 naming a free-tier quota of 0: the key's tier does not offer the model
+-- at all (a paid project gets it with the same key, so this is not final).
+local function is_free_tier_block(status, body)
+  return status == 429 and body:find("free_tier", 1, true) ~= nil and body:find("limit: 0", 1, true) ~= nil
+end
+
+-- Agent models (Antigravity, Deep Research) answer generateContent with this.
+local function is_interactions_only(status, lower)
+  return status == 400 and lower:find("only supports interactions api", 1, true) ~= nil
+end
+
+local function free_tier_error()
+  return error_of("gemini model is not available on the free tier of this key", "model_unavailable", 403)
+end
+
+local function interactions_only_error()
+  return error_of(
+    "gemini model works only through the Interactions API, which this plugin does not use",
+    "model_unavailable",
+    400
+  )
 end
 
 local function rate_limited_error(wait)
@@ -386,7 +418,7 @@ local function rate_limit_wait(resp)
     if type(details) == "table" then
       for _, d in ipairs(details) do
         if type(d) == "table" and type(d.retryDelay) == "string" then
-          local seconds = tonumber(d.retryDelay:match("^([%d%.]+)s$"))
+          local seconds = tonumber(d.retryDelay:match("^([%d%.]+)s$") or "")
           if seconds ~= nil and seconds > 0 then
             wait = seconds
           end
@@ -469,11 +501,27 @@ local function map_upstream(env, resp, cred_id)
 
   if status == 429 then
     local wait = rate_limit_wait(resp)
-    set_cooldown(cred_id, env.name, wait)
+    local free_tier = is_free_tier_block(status, body)
+    set_cooldown(cred_id, env.name, wait, free_tier and FREE_TIER_REASON or nil)
+    if free_tier then
+      local keys = failure_keys(env, status, "model_unavailable", cred_id, body, "rate_limit")
+      keys.wait = wait
+      llm_router.log("warn", "model not on the free tier of key", keys)
+      return "next_cred", free_tier_error()
+    end
     local keys = failure_keys(env, status, "rate_limit", cred_id, body, "rate_limit")
     keys.wait = wait
     llm_router.log("warn", "rate limited", keys)
     return "next_cred", rate_limited_error(wait)
+  end
+
+  if is_interactions_only(status, lower) then
+    llm_router.log(
+      "error",
+      "model needs the interactions api",
+      failure_keys(env, status, "model_unavailable", cred_id, body, "http_error")
+    )
+    return "done", interactions_only_error()
   end
 
   if status == 404 and lower:find("no longer available", 1, true) then
@@ -891,9 +939,60 @@ local function text_of_content(content)
   return table.concat(parts, "\n")
 end
 
+-- Inline types Gemini reads (checked 2026-11-12): image, audio, video, any
+-- text/* (plain, markdown, csv, html, xml, code), PDF, JSON, XML, RTF and
+-- Office/OpenDocument files.
+local DOCUMENT_MIMES = {
+  ["application/pdf"] = true,
+  ["application/json"] = true,
+  ["application/xml"] = true,
+  ["application/rtf"] = true,
+  ["application/msword"] = true,
+  ["application/vnd.ms-excel"] = true,
+  ["application/vnd.ms-powerpoint"] = true,
+}
+local MIME_BY_EXTENSION = {
+  pdf = "application/pdf",
+  txt = "text/plain",
+  md = "text/markdown",
+  csv = "text/csv",
+  tsv = "text/tab-separated-values",
+  html = "text/html",
+  htm = "text/html",
+  xml = "text/xml",
+  json = "application/json",
+  rtf = "text/rtf",
+  py = "text/x-python",
+  js = "text/javascript",
+  ts = "text/x-typescript",
+  go = "text/x-go",
+  lua = "text/x-lua",
+  doc = "application/msword",
+  docx = "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  xls = "application/vnd.ms-excel",
+  xlsx = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ppt = "application/vnd.ms-powerpoint",
+  pptx = "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  odt = "application/vnd.oasis.opendocument.text",
+  ods = "application/vnd.oasis.opendocument.spreadsheet",
+  odp = "application/vnd.oasis.opendocument.presentation",
+}
+
+local function inline_mime_ok(mime)
+  local family = mime:match("^([^/]+)/")
+  return family == "image"
+    or family == "audio"
+    or family == "video"
+    or family == "text"
+    or DOCUMENT_MIMES[mime] == true
+    or mime:find("^application/vnd%.openxmlformats%-officedocument%.") ~= nil
+    or mime:find("^application/vnd%.oasis%.opendocument%.") ~= nil
+end
+
 -- A text whose entire trimmed content is a data: URL carries binary inline
--- (fallback for clients that cannot send typed parts). Returns mime, base64.
-local function parse_data_url(s)
+-- (fallback for clients that cannot send typed parts). A generic or missing
+-- type falls back to the file name's extension. Returns mime, base64.
+local function parse_data_url(s, filename)
   if type(s) ~= "string" then
     return nil
   end
@@ -906,13 +1005,16 @@ local function parse_data_url(s)
     return nil
   end
   b64 = b64:gsub("%s+$", "")
-  local mime = head:match("^([^;,]+)")
-  if not mime or b64 == "" then
+  local mime = (head:match("^([^;,]+)") or ""):lower()
+  if b64 == "" then
     return nil
   end
-  local family = mime:match("^([^/]+)/")
-  if family ~= "image" and family ~= "audio" and family ~= "video" and mime ~= "application/pdf" then
-    return nil
+  if not inline_mime_ok(mime) then
+    local ext = tostring(filename or ""):lower():match("%.(%w+)$")
+    mime = ext and MIME_BY_EXTENSION[ext]
+    if not mime then
+      return nil
+    end
   end
   return mime, b64
 end
@@ -1104,9 +1206,10 @@ local function build_contents(messages, model_name)
         return nil
       end
       if type(seg.file) == "table" then
-        local mime, b64 = parse_data_url(seg.file.file_data)
+        local mime, b64 = parse_data_url(seg.file.file_data, seg.file.filename)
         if not mime then
-          return "file parts need file_data as a base64 data: URL"
+          return "file parts need file_data as a base64 data: URL of a type gemini reads"
+            .. " (image, audio, video, text, pdf, json, xml, rtf, office)"
         end
         push_binary({ inlineData = { mimeType = mime, data = b64 } })
         return nil
@@ -1397,10 +1500,56 @@ end
 -- Generation config
 -- ---------------------------------------------------------------------------
 
-local EFFORTS = { none = true, minimal = true, low = true, medium = true, high = true, xhigh = true, max = true }
-local EFFORT_BUDGETS = { low = 1024, medium = 8192, high = 24576 }
+-- Router reasoning scale, highest first: max, high, medium, low, none. A model
+-- accepts exactly the efforts it advertises in supported_efforts ("default"
+-- means the model default and is never advertised); anything else is a 400.
+-- Efforts map onto thinkingLevel per family (checked 2026-11-12):
+--   Flash up to 3.6, every Flash-Lite:   high, medium, low, none=MINIMAL
+--   Flash from 3.7, Pro tiers, Gemini 4: high, medium, low (thinking stays on)
+--   Gemini 3 Pro:                        high, low
+--   Gemma 4:                             max=HIGH (on), none=MINIMAL (off)
+-- Gemini 2.5 takes only reasoning.max_tokens (thinkingBudget).
+local EFFORT_ORDER = { "max", "high", "medium", "low", "none" }
 
--- reasoning_effort, or the OpenRouter-style reasoning object, as (effort, max_tokens).
+local function effort_levels(name)
+  local lower = tostring(name):lower()
+  if is_gemma(lower) then
+    return { max = "HIGH", none = "MINIMAL" }
+  end
+  if lower:match("^gemini%-3%-pro") then
+    return { high = "HIGH", low = "LOW" }
+  end
+  local levels = { high = "HIGH", medium = "MEDIUM", low = "LOW" }
+  if lower:find("%-pro") or lower:match("^gemini%-4") then
+    return levels
+  end
+  local major, minor = model_generation(lower)
+  if not lower:find("lite", 1, true) and major ~= nil and (major > 3 or (major == 3 and minor >= 7)) then
+    return levels
+  end
+  levels.none = "MINIMAL"
+  return levels
+end
+
+-- Advertised efforts of a level-mode model, highest first.
+local function effort_list(name)
+  local levels = effort_levels(name)
+  local list = {}
+  for _, effort in ipairs(EFFORT_ORDER) do
+    if levels[effort] then
+      list[#list + 1] = effort
+    end
+  end
+  return list
+end
+
+-- OpenRouter-style reasoning.exclude: thinking still runs, its text is not returned.
+local function reasoning_excluded(request)
+  return type(request.reasoning) == "table" and request.reasoning.exclude == true
+end
+
+-- reasoning_effort (or reasoning.effort; reasoning.enabled=false as "none")
+-- and reasoning.max_tokens, as given. Empty or "default" means the model default.
 local function reasoning_request(request)
   local effort = request.reasoning_effort
   local max_tokens = nil
@@ -1419,73 +1568,59 @@ local function reasoning_request(request)
   if type(effort) ~= "string" or effort == "" or effort == "default" then
     effort = nil
   end
-  if effort == nil and max_tokens ~= nil then
-    if max_tokens == 0 then
-      effort = "none"
-    elseif max_tokens <= 2048 then
-      effort = "low"
-    elseif max_tokens <= 12000 then
-      effort = "medium"
-    else
-      effort = "high"
-    end
-  end
   return effort, max_tokens
 end
 
--- Maps an effort onto what the model family accepts: Gemini 3+ takes
--- thinkingLevel (minimal only on Flash tiers, medium not on 3 Pro, thinking
--- cannot be turned off on Pro); Gemini 2.5 takes thinkingBudget (Pro cannot
--- drop below 128, Flash-Lite below 512 unless 0). Returns nil when the family
--- takes no thinking config.
-local function thinking_config(model_name, effort, max_tokens)
+-- Rejects reasoning controls the model does not take. Returns an error or nil.
+local function reasoning_check(model_name, effort, max_tokens)
+  local mode = thinking_mode(model_name)
+  if effort ~= nil and not (mode == "level" and effort_levels(model_name)[effort]) then
+    if mode ~= "level" then
+      return invalid_request(
+        "model "
+          .. model_name
+          .. " takes no reasoning_effort"
+          .. (mode == "budget" and "; use reasoning.max_tokens" or "")
+      )
+    end
+    return invalid_request(
+      "reasoning_effort "
+        .. effort
+        .. " is not supported by model "
+        .. model_name
+        .. "; supported: "
+        .. table.concat(effort_list(model_name), ", ")
+    )
+  end
+  if max_tokens ~= nil and mode ~= "budget" then
+    return invalid_request(
+      "model " .. model_name .. " takes no reasoning.max_tokens" .. (mode == "level" and "; use reasoning_effort" or "")
+    )
+  end
+  return nil
+end
+
+-- thinkingConfig for a request that passed reasoning_check: the effort's level
+-- (Gemini 3+, Gemma 4) or the client's budget as given (Gemini 2.5); neither
+-- keeps the model default. Thought summaries are requested unless the client
+-- excluded them or thinking is off; Gemma returns its thoughts unasked and
+-- rejects the flag. Returns nil when there is nothing to send.
+local function thinking_config(model_name, effort, max_tokens, exclude)
   local mode = thinking_mode(model_name)
   if mode == nil then
     return nil
   end
-  local lower = model_name:lower()
-  local pro = lower:find("%-pro") ~= nil
-  local lite = lower:find("lite", 1, true) ~= nil
-  local quiet = effort == "none" or effort == "minimal"
-  if mode == "level" then
-    local level
-    if quiet then
-      level = pro and "LOW" or "MINIMAL"
-    elseif effort == "low" then
-      level = "LOW"
-    elseif effort == "medium" then
-      level = lower:match("^gemini%-3%-pro") and "HIGH" or "MEDIUM"
-    else
-      level = "HIGH"
-    end
-    local cfg = { thinkingLevel = level }
-    if not quiet then
-      cfg.includeThoughts = true
-    end
-    return cfg
+  local cfg = {}
+  if mode == "level" and effort ~= nil then
+    cfg.thinkingLevel = effort_levels(model_name)[effort]
+  elseif mode == "budget" and max_tokens ~= nil then
+    cfg.thinkingBudget = max_tokens
   end
-  local top = pro and 32768 or 24576
-  local minimum = pro and 128 or (lite and 512 or 1)
-  local budget
-  if max_tokens ~= nil then
-    budget = max_tokens
-  elseif effort == "none" then
-    budget = pro and 128 or 0
-  elseif effort == "minimal" then
-    budget = pro and 128 or (lite and 512 or 128)
-  else
-    budget = EFFORT_BUDGETS[effort == "xhigh" and "high" or effort == "max" and "high" or effort] or EFFORT_BUDGETS.high
-  end
-  budget = math.min(budget, top)
-  if budget > 0 and budget < minimum then
-    budget = minimum
-  end
-  if budget == 0 and pro then
-    budget = minimum
-  end
-  local cfg = { thinkingBudget = budget }
-  if budget > 0 and not quiet then
+  if not exclude and not is_gemma(model_name) and cfg.thinkingLevel ~= "MINIMAL" and cfg.thinkingBudget ~= 0 then
     cfg.includeThoughts = true
+  end
+  if next(cfg) == nil then
+    return nil
   end
   return cfg
 end
@@ -1544,20 +1679,13 @@ local function build_generation_config(request, model_name)
   -- /models exposes no per-model capability flag for them.
 
   local effort, budget_tokens = reasoning_request(request)
-  if effort ~= nil then
-    if not EFFORTS[effort] then
-      return nil, invalid_request("unknown reasoning_effort " .. tostring(effort))
-    end
-    local thinking = thinking_config(model_name, effort, budget_tokens)
-    if thinking then
-      ensure().thinkingConfig = thinking
-    else
-      llm_router.log(
-        "debug",
-        "reasoning effort ignored for model family",
-        { operation = "build_generation_config", reason = effort }
-      )
-    end
+  local rerr = reasoning_check(model_name, effort, budget_tokens)
+  if rerr then
+    return nil, rerr
+  end
+  local thinking = thinking_config(model_name, effort, budget_tokens, reasoning_excluded(request))
+  if thinking then
+    ensure().thinkingConfig = thinking
   end
 
   local rf = request.response_format
@@ -1788,7 +1916,7 @@ local function sig_in_id_of(provider_config)
 end
 
 -- Unary assembly: Gemini response -> (kind, value) for the runner.
-local function assemble_completion(g, full_model, sig_in_id)
+local function assemble_completion(g, full_model, sig_in_id, hide_reasoning)
   local cand = type(g.candidates) == "table" and g.candidates[1] or nil
   if cand == nil then
     if type(g.promptFeedback) == "table" and g.promptFeedback.blockReason then
@@ -1802,7 +1930,7 @@ local function assemble_completion(g, full_model, sig_in_id)
     return "done", finish_fault(cand)
   end
   local message = { role = "assistant", content = table.concat(out.text, "") }
-  if #out.reasoning > 0 then
+  if #out.reasoning > 0 and not hide_reasoning then
     message.reasoning_content = table.concat(out.reasoning, "")
   end
   if #out.toolcalls > 0 then
@@ -1864,6 +1992,23 @@ local function no_media_outcome(g, what)
 end
 
 -- RIFF/WAVE header around PCM s16le (the only encoding Gemini TTS emits).
+-- PCM payload of a RIFF/WAVE file (its "data" chunk), or nil.
+local function wav_data(raw)
+  if raw:sub(1, 4) ~= "RIFF" or raw:sub(9, 12) ~= "WAVE" then
+    return nil
+  end
+  local pos = 13
+  while pos + 7 <= #raw do
+    local b1, b2, b3, b4 = raw:byte(pos + 4, pos + 7)
+    local size = b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
+    if raw:sub(pos, pos + 3) == "data" then
+      return raw:sub(pos + 8, pos + 7 + size)
+    end
+    pos = pos + 8 + size + (size % 2)
+  end
+  return nil
+end
+
 local function wrap_wav(pcm, rate, channels)
   local bits = 16
   local function u32(n)
@@ -2051,11 +2196,14 @@ end
 -- "transport" (value is the http_client fault). Returns result, err.
 local function run(ctx, spec)
   local env = { ctx = ctx, op = spec.op, model = spec.model, name = spec.name }
-  local usable, total, min_wait, all_dead = plan_credentials(spec.name)
+  local usable, total, min_wait, all_dead, all_free_tier = plan_credentials(spec.name)
   if all_dead then
     return nil, model_gone_error()
   end
   if #usable == 0 then
+    if all_free_tier then
+      return nil, free_tier_error()
+    end
     if total > 0 then
       return nil, rate_limited_error(min_wait or DEFAULT_COOLDOWN_SECS)
     end
@@ -2281,17 +2429,17 @@ local function supports_method(entry, method)
   return false
 end
 
--- Efforts the translation layer accepts for the family (thinking cannot be
--- turned off on Pro tiers, so "none" is not offered there).
-local function supported_efforts(name)
-  if thinking_mode(name) == nil then
-    return nil
+-- OpenRouter-style reasoning block of the model listing: level-mode models
+-- advertise their efforts (see effort_levels), budget-mode models (Gemini 2.5)
+-- advertise reasoning.max_tokens instead. Nil when the family does not reason.
+local function reasoning_info(name)
+  local mode = thinking_mode(name)
+  if mode == "level" then
+    return { default_enabled = true, supported_efforts = effort_list(name) }
+  elseif mode == "budget" then
+    return { default_enabled = true, supports_max_tokens = true }
   end
-  local efforts = { "high", "medium", "low", "minimal" }
-  if not name:lower():find("%-pro") then
-    efforts[#efforts + 1] = "none"
-  end
-  return efforts
+  return nil
 end
 
 local CHAT_PARAMETERS = {
@@ -2320,12 +2468,12 @@ local function model_info_of(entry)
     return nil
   end
 
-  -- Gemini takes text, image, audio and video input; gemma-4 takes images.
-  -- Output stays text unless the family says otherwise: chat completions here
-  -- never request IMAGE/AUDIO response modalities.
+  -- Gemini takes text, image, audio, video and file (document) input; gemma-4
+  -- takes images. Output stays text unless the family says otherwise: chat
+  -- completions here never request IMAGE/AUDIO response modalities.
   local in_modalities = { "text" }
   if lower:match("^gemini") then
-    in_modalities = { "text", "image", "audio", "video" }
+    in_modalities = { "text", "image", "audio", "video", "file" }
   elseif lower:match("^gemma") then
     in_modalities = { "text", "image" }
   end
@@ -2363,11 +2511,8 @@ local function model_info_of(entry)
   if endpoints then
     info.endpoints = endpoints
   end
-  if entry.thinking == true then
-    local efforts = supported_efforts(name)
-    if efforts then
-      info.reasoning = { default_enabled = true, supported_efforts = efforts }
-    end
+  if entry.thinking == true or is_gemma(lower) then
+    info.reasoning = reasoning_info(name)
   end
   return info
 end
@@ -2447,6 +2592,12 @@ end
 -- probe or a capability mismatch caused), key (rejected), other.
 local function classify_probe_failure(status, body)
   local lower = tostring(body or ""):lower()
+  if is_free_tier_block(status, lower) then
+    return { kind = "free_tier", message = "model is not available on the free tier" }
+  end
+  if is_interactions_only(status, lower) then
+    return { kind = "interactions", message = "model works only through the Interactions API" }
+  end
   if status == 429 then
     return { kind = "quota", message = "rate limited" }
   end
@@ -2516,9 +2667,12 @@ local function check_model(ctx, model_ref)
     return { status = "unknown", message = "endpoint not supported for this model: " .. endpoint }
   end
 
-  local usable, total, _, all_dead = plan_credentials(name)
+  local usable, total, _, all_dead, all_free_tier = plan_credentials(name)
   if all_dead then
     return { status = "unhealthy", message = "model no longer available to these keys" }
+  end
+  if #usable == 0 and all_free_tier then
+    return { status = "unhealthy", message = "model is not available on the free tier of these keys" }
   end
   if #usable == 0 then
     if total > 0 then
@@ -2572,7 +2726,7 @@ local function check_model(ctx, model_ref)
   end
 
   local quota_seen, missing_seen = false, false
-  local generations, provider_failures = 0, 0
+  local generations, provider_failures, free_tier = 0, 0, 0
   for _, cred in ipairs(usable) do
     local key = api_key_of(cred.data)
     if key ~= "" then
@@ -2586,7 +2740,11 @@ local function check_model(ctx, model_ref)
       if ok then
         return { status = "healthy", response = "ok" }
       end
-      if failure.kind == "quota" then
+      if failure.kind == "interactions" then
+        return { status = "unhealthy", message = "model works only through the Interactions API" }
+      elseif failure.kind == "free_tier" then
+        free_tier = free_tier + 1
+      elseif failure.kind == "quota" then
         quota_seen = true
       elseif failure.kind == "missing" then
         missing_seen = true
@@ -2596,6 +2754,9 @@ local function check_model(ctx, model_ref)
         seen_unknown = seen_unknown or failure.message
       end
     end
+  end
+  if generations > 0 and free_tier == generations then
+    return { status = "unhealthy", message = "model is not available on the free tier of these keys" }
   end
   if quota_seen then
     return { status = "quota_exceeded", message = "quota exhausted" }
@@ -2805,7 +2966,7 @@ llm_router.register("google", {
         local resp, call_err = post_json(client, url, key, payload, proxy_url)
         return unary_outcome(env, resp, call_err, cred, function(g)
           log_grounding_result(env, g)
-          return assemble_completion(g, request.model, sig_in_id)
+          return assemble_completion(g, request.model, sig_in_id, reasoning_excluded(request))
         end)
       end,
     })
@@ -2827,6 +2988,7 @@ llm_router.register("google", {
     local name = bare_model(request.model_name)
     local full_model = request.model
     local sig_in_id = sig_in_id_of(ctx.provider_config)
+    local hide_reasoning = reasoning_excluded(request)
     local chunk_id = "google-" .. random_id()
     local url = BASE_URL .. "/models/" .. name .. ":streamGenerateContent?alt=sse"
     log_search_request({ op = "complete_stream", model = full_model }, request, payload)
@@ -2919,7 +3081,7 @@ llm_router.register("google", {
             return
           end
           local delta = {}
-          if #out.reasoning > 0 then
+          if #out.reasoning > 0 and not hide_reasoning then
             delta.reasoning_content = table.concat(out.reasoning, "")
           end
           if #out.text > 0 then
@@ -3068,18 +3230,30 @@ llm_router.register("google", {
           if not inline then
             return no_media_outcome(g, "audio")
           end
-          -- Upstream audio is always PCM s16le (mimeType "audio/L16;...;rate=24000").
+          -- Upstream audio is raw PCM s16le ("audio/L16;...;rate=24000") on
+          -- older TTS models and a finished WAV ("audio/wav") from 3.8 on.
           -- Only pcm and wav are servable without transcoding; every other
           -- requested format gets wav, the lossless playable container.
-          if requested == "pcm" then
-            return "ok", { audio_b64 = inline.data, format = "pcm" }
-          end
-          local rate = tonumber(tostring(inline.mimeType):match("rate=(%d+)")) or 24000
-          local decoded, pcm = pcall(llm_router.base64_decode, inline.data)
+          local mime = tostring(inline.mimeType or ""):lower()
+          local decoded, raw = pcall(llm_router.base64_decode, inline.data)
           if not decoded then
             return "retry_exit", error_of("upstream returned undecodable audio", "server_error", 502)
           end
-          return "ok", { audio_b64 = llm_router.base64_encode(wrap_wav(pcm, rate, 1)), format = "wav" }
+          if raw:sub(1, 4) == "RIFF" then
+            if requested ~= "pcm" then
+              return "ok", { audio_b64 = inline.data, format = "wav" }
+            end
+            local pcm = wav_data(raw)
+            if not pcm then
+              return "retry_exit", error_of("upstream returned a malformed wav", "server_error", 502)
+            end
+            return "ok", { audio_b64 = llm_router.base64_encode(pcm), format = "pcm" }
+          end
+          if requested == "pcm" then
+            return "ok", { audio_b64 = inline.data, format = "pcm" }
+          end
+          local rate = tonumber(mime:match("rate=(%d+)") or "24000") or 24000
+          return "ok", { audio_b64 = llm_router.base64_encode(wrap_wav(raw, rate, 1)), format = "wav" }
         end)
       end,
     })
