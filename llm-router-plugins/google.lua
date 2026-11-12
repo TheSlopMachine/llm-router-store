@@ -1,6 +1,6 @@
 --- @plugin Google AI Studio
 --- @author TheSlopMachine
---- @version 6.0.1
+--- @version 6.0.2
 --- @plugin_api 1.6
 --- @allow_host generativelanguage.googleapis.com
 --- @description Google Gemini models via the AI Studio API: chat, streaming, tools, embeddings, speech, transcription and image generation
@@ -3153,6 +3153,16 @@ llm_router.register("google", {
             collect_parts(cand, out, { n = 0 }, false)
           end
           local text = table.concat(out.text, ""):match("^%s*(.-)%s*$")
+          if text == "" and cand and type(cand.content) == "table" then
+            -- Transcribe models answer with audioTranscription parts, not text parts.
+            local spoken = {}
+            for _, part in ipairs(cand.content.parts or {}) do
+              if type(part.audioTranscription) == "table" and type(part.audioTranscription.text) == "string" then
+                spoken[#spoken + 1] = part.audioTranscription.text
+              end
+            end
+            text = table.concat(spoken, ""):match("^%s*(.-)%s*$")
+          end
           if text == "" then
             return no_media_outcome(g, "transcript")
           end
