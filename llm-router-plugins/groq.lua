@@ -1,6 +1,6 @@
 --- @plugin Groq
 --- @author TheSlopMachine
---- @version 5.4.0
+--- @version 5.4.1
 --- @plugin_api 1.5
 --- @description Groq API: chat/reasoning, Whisper transcription/translation, Orpheus text-to-speech
 --- @allow_host api.groq.com
@@ -147,6 +147,19 @@ local function pick_proxies(ctx, limit)
   return res.proxies
 end
 
+-- One request through the selected pool, for every call that is not chat.
+-- A 403 (egress block), a 5xx or a transport fault on one exit moves on to
+-- the next; a direct pool yields one direct attempt.
+local function pooled_request(ctx, client, request)
+  local resp, err
+  for _, px in ipairs(pick_proxies(ctx, 3)) do
+    request.proxy_url = px.url
+    resp, err = client:request(request)
+    if err == nil and resp.status ~= 403 and resp.status < 500 then break end
+  end
+  return resp, err
+end
+
 -- Build the upstream payload from the OpenAI-shaped request table:
 -- pass everything through, fix the model id, pin the stream flag.
 -- Router-only fields (model_name, cache_key) never leave the plugin.
@@ -234,7 +247,7 @@ llm_router.register("groq", {
       return nil, { message = "no groq credentials configured", code = "invalid_request_error", status = 400 }
     end
     local client = llm_router.http_client({})
-    local resp, err = client:request({
+    local resp, err = pooled_request(ctx, client, {
       method = "GET",
       url = BASE_URL .. "/models",
       headers = { ["Authorization"] = "Bearer " .. api_key_of(creds[1].data) },
@@ -354,7 +367,7 @@ llm_router.register("groq", {
     local key = api_key_of(credential.data)
     if key == "" then return { status = "unhealthy", message = "api_key is required" } end
     local client = llm_router.http_client({ timeout_ms = 15000 })
-    local resp, err = client:request({
+    local resp, err = pooled_request(ctx, client, {
       method = "GET",
       url = BASE_URL .. "/models",
       headers = { ["Authorization"] = "Bearer " .. key },
@@ -370,8 +383,7 @@ llm_router.register("groq", {
   end,
 
   -- Model liveness: per-model metadata GET proves existence with zero
-  -- generation spend. Direct, no proxy: pool health must not decide model
-  -- health. Retries across credentials with unanimity for death: healthy
+  -- generation spend, through the selected pool. Retries across credentials with unanimity for death: healthy
   -- wins at once, quota outranks unknown, unhealthy needs every tried key
   -- to report model-missing. Probes never park or disable.
   check_model = function(ctx, model_ref)
@@ -400,7 +412,7 @@ llm_router.register("groq", {
       else
         tried = tried + 1
         llm_router.log("debug", "probing model", { cred_id = cred.id, model = model_ref.model, endpoint = endpoint })
-        local resp, err = client:request({
+        local resp, err = pooled_request(ctx, client, {
           method = "GET",
           url = BASE_URL .. "/models/" .. model_name,
           headers = { ["Authorization"] = "Bearer " .. key },

@@ -1,6 +1,6 @@
 --- @plugin OpenRouter
 --- @author llm-router
---- @version 1.1.0
+--- @version 1.1.1
 --- @plugin_api 1.6
 --- @allow_host openrouter.ai
 --- @description OpenRouter API: chat (unary and streaming), embeddings, speech-to-text, text-to-speech, image and video generation, model discovery and health probes
@@ -150,8 +150,8 @@ end
 
 -- TTS voices are provider-specific and the endpoints listing hides them; the
 -- speech-filtered model list declares them under supported_voices.
-local function probe_voice(model_name, client)
-  local resp, call_err = client:request({
+local function probe_voice(model_name, send)
+  local resp, call_err = send({
     method = "GET",
     url = BASE_URL .. "/models?output_modalities=speech",
   })
@@ -356,6 +356,19 @@ local function pick_proxies(ctx, limit)
     return { {} }
   end
   return res.proxies
+end
+
+-- One request through the selected pool, for every call that is not
+-- generation. A 403 (egress block), a 5xx or a transport fault on one exit
+-- moves on to the next; a direct pool yields one direct attempt.
+local function pooled_request(ctx, client, request)
+  local resp, call_err
+  for _, px in ipairs(pick_proxies(ctx, 3)) do
+    request.proxy_url = px.url
+    resp, call_err = client:request(request)
+    if call_err == nil and resp.status ~= 403 and resp.status < 500 then break end
+  end
+  return resp, call_err
 end
 
 -- Upstream chat body. Router-only fields never leave the plugin. OpenRouter's
@@ -635,10 +648,10 @@ local function probe_request(endpoint, model_name, voice)
   return nil
 end
 
--- One probe generation attempt for one credential: direct, no proxies, and no
--- park or bench on any outcome. Returns {response} or nil with a classified
--- failure {kind, message}.
-local function probe_attempt(spec, cred)
+-- One probe generation attempt for one credential, through the selected pool,
+-- and no park or bench on any outcome. Returns {response} or nil with a
+-- classified failure {kind, message}.
+local function probe_attempt(ctx, spec, cred)
   local client = llm_router.http_client({ timeout_ms = PROBE_GENERATION_TIMEOUT_MS })
   local bodies = { spec.body }
   for _, alt in ipairs(as_list(spec.alt_bodies)) do
@@ -646,7 +659,7 @@ local function probe_attempt(spec, cred)
   end
   local failure = nil
   for index, body in ipairs(bodies) do
-    local resp, call_err = client:request({
+    local resp, call_err = pooled_request(ctx, client, {
       method = "POST",
       url = BASE_URL .. spec.path,
       headers = {
@@ -688,7 +701,7 @@ local function probe_attempt(spec, cred)
   return nil, failure
 end
 
--- Direct GET for a video job, tried across credentials: the job belongs to the
+-- GET for a video job, tried across credentials: the job belongs to the
 -- account that created it, and a key from another account sees a 404.
 local function job_request(ctx, path)
   local creds = llm_router.credentials.list()
@@ -698,7 +711,7 @@ local function job_request(ctx, path)
   local client = llm_router.http_client({ timeout_ms = UNARY_TIMEOUT_MS })
   local last_err = nil
   for _, cred in ipairs(creds) do
-    local resp, call_err = client:request({
+    local resp, call_err = pooled_request(ctx, client, {
       method = "GET",
       url = BASE_URL .. path,
       headers = { ["Authorization"] = "Bearer " .. api_key_of(cred.data) },
@@ -856,7 +869,7 @@ llm_router.register("openrouter", {
     local client = llm_router.http_client({ timeout_ms = DISCOVERY_TIMEOUT_MS })
     local last_err = nil
     for _, cred in ipairs(creds) do
-      local resp, call_err = client:request({
+      local resp, call_err = pooled_request(ctx, client, {
         method = "GET",
         url = BASE_URL .. "/models?output_modalities=all",
         headers = { ["Authorization"] = "Bearer " .. api_key_of(cred.data) },
@@ -892,7 +905,7 @@ llm_router.register("openrouter", {
     local key = api_key_of(credential.data)
     if key == "" then return { status = "unhealthy", message = "api_key is required" } end
     local client = llm_router.http_client({ timeout_ms = PROBE_TIMEOUT_MS })
-    local resp, call_err = client:request({
+    local resp, call_err = pooled_request(ctx, client, {
       method = "GET",
       url = BASE_URL .. "/key",
       headers = { ["Authorization"] = "Bearer " .. key },
@@ -951,7 +964,7 @@ llm_router.register("openrouter", {
       else
         tried = tried + 1
         llm_router.log("debug", "probing model", { cred_id = cred.id, model = model_ref.model, endpoint = endpoint })
-        local resp, call_err = client:request({
+        local resp, call_err = pooled_request(ctx, client, {
           method = "GET",
           url = BASE_URL .. "/models/" .. model_name .. "/endpoints",
           headers = { ["Authorization"] = "Bearer " .. key },
@@ -981,7 +994,7 @@ llm_router.register("openrouter", {
     -- reject the probe on missing voice, not on model state.
     local voice = nil
     if endpoint == "speech" or endpoint == "audio/speech" then
-      voice = probe_voice(model_name, client)
+      voice = probe_voice(model_name, function(request) return pooled_request(ctx, client, request) end)
     end
     local spec = probe_request(endpoint, model_name, voice)
     local quota_seen = false
@@ -993,7 +1006,7 @@ llm_router.register("openrouter", {
       local key = api_key_of(cred.data)
       if key ~= "" then
         llm_router.log("debug", "probing model generation", { cred_id = cred.id, model = model_ref.model, endpoint = endpoint })
-        local value, failure = probe_attempt(spec, cred)
+        local value, failure = probe_attempt(ctx, spec, cred)
         if value ~= nil then
           return { status = "healthy", response = value.response or "ok" }
         end

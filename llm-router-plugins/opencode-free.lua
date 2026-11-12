@@ -1,6 +1,6 @@
 --- @plugin OpenCode Free
 --- @author TheSlopMachine
---- @version 6.7.0
+--- @version 6.7.1
 --- @plugin_api 1.5
 --- @description OpenAI/Anthropic/Google compatible free provider OpenCode Free (no key required)
 --- @allow_host opencode.ai
@@ -145,9 +145,35 @@ end
 
 local TEXT_CACHE_SCOPE = "remote_text"
 
+-- provider_config of the running handler. Each handler call owns its Lua
+-- state, so the value set at handler entry is read only by that call.
+local ACTIVE_CONFIG = nil
+
+-- One request through the selected proxy pool, for every call outside the
+-- generation exit scheduler. A transport fault or a 5xx on one exit moves on
+-- to the next; a direct pool yields one direct attempt.
+local function pooled_request(client, request)
+  local pool = nil
+  local cfg = ACTIVE_CONFIG
+  if type(cfg) == "table" and type(cfg.proxy) == "table" then
+    local configured = cfg.proxy.pool
+    if type(configured) == "string" and configured ~= "" then pool = configured end
+  end
+  local res = llm_router.proxies.require({ pool = pool, limit = 3, fallback = "direct" })
+  local exits = { {} }
+  if res ~= nil and #res.proxies > 0 then exits = res.proxies end
+  local resp, err
+  for _, px in ipairs(exits) do
+    request.proxy_url = px.url
+    resp, err = client:request(request)
+    if err == nil and resp.status < 500 then break end
+  end
+  return resp, err
+end
+
 local function http_get_text(url)
   local client = llm_router.http_client({ timeout_ms = 30000 })
-  local resp, err = client:request({ method = "GET", url = url, headers = {} })
+  local resp, err = pooled_request(client, { method = "GET", url = url, headers = {} })
   if err ~= nil or resp.status ~= 200 or type(resp.body) ~= "string" or resp.body == "" then
     llm_router.log("warn", "remote text fetch failed", {
       detail = url,
@@ -1113,7 +1139,7 @@ local function refresh_model_catalog()
   if version == nil then return nil end
   local headers = { ["User-Agent"] = catalog_user_agent(version), ["Accept"] = "application/json" }
   local client = llm_router.http_client({})
-  local resp, err = client:request({ method = "GET", url = BASE_URL .. "/models", headers = headers })
+  local resp, err = pooled_request(client, { method = "GET", url = BASE_URL .. "/models", headers = headers })
   if err ~= nil or resp.status ~= 200 then
     llm_router.log("warn", "model list fetch failed", { status = resp and resp.status, reason = err and err.message })
     return nil
@@ -1126,7 +1152,7 @@ local function refresh_model_catalog()
   end
   local enriched = {}
   local catalog_client = llm_router.http_client({ timeout_ms = 60000 })
-  local eres, eerr = catalog_client:request({ method = "GET", url = MODELS_DEV_URL, headers = headers })
+  local eres, eerr = pooled_request(catalog_client, { method = "GET", url = MODELS_DEV_URL, headers = headers })
   if eerr == nil and eres.status == 200 then
     local catalog = decode_json_table(eres.body)
     if catalog ~= nil and type(catalog.opencode) == "table" and type(catalog.opencode.models) == "table" then
@@ -1900,6 +1926,7 @@ llm_router.register("opencode-free", {
   proxy_schema = {},
 
   get_model_infos = function(ctx)
+    ACTIVE_CONFIG = ctx.provider_config
     local cached = store_get(MODEL_CACHE_SCOPE, "infos")
     if is_filled_array(cached) then
       llm_router.log("debug", "model catalog loaded", { count = #cached })
@@ -1909,13 +1936,14 @@ llm_router.register("opencode-free", {
     return refresh_model_catalog()
   end,
 
-  -- Model liveness: the tier is anonymous, so a single direct
-  -- discriminator POST proves existence with zero generation spend
+  -- Model liveness: the tier is anonymous, so a single discriminator POST,
+  -- through the selected pool, proves existence with zero generation spend
   -- (rejection happens pre-generation). Free names answer 403
   -- FreeTierError (gated to genuine clients, not missing); paid names answer
   -- 401 (not on tier); unknown names answer 400 Model-unavailable. Probes
   -- never write storage marks.
   check_model = function(ctx, model_ref)
+    ACTIVE_CONFIG = ctx.provider_config
     local capability = model_ref.endpoint or "chat"
     if capability ~= "chat" and capability ~= "vision" then
       return { status = "unknown", message = "endpoint not supported: " .. tostring(capability) }
@@ -1927,7 +1955,7 @@ llm_router.register("opencode-free", {
     local client = llm_router.http_client({ timeout_ms = 15000 })
     local ms = mint_ms()
     llm_router.log("debug", "probing model", { model = model_ref.model, endpoint = capability })
-    local resp, err = client:request({
+    local resp, err = pooled_request(client, {
       method = "POST",
       url = BASE_URL .. "/chat/completions",
       headers = opencode_headers(version, mint_session(ms), mint_msg(ms)),
@@ -1956,6 +1984,7 @@ llm_router.register("opencode-free", {
   end,
 
   complete = function(ctx, request)
+    ACTIVE_CONFIG = ctx.provider_config
     log_request_start("starting request", request, protocol_for_model(request.model_name))
     local job, err = prepare_job(request)
     if job == nil then return nil, err end
@@ -1978,6 +2007,7 @@ llm_router.register("opencode-free", {
   end,
 
   complete_stream = function(ctx, request, emit)
+    ACTIVE_CONFIG = ctx.provider_config
     log_request_start("starting stream", request, protocol_for_model(request.model_name))
     local job, err = prepare_job(request)
     if job == nil then return nil, err end

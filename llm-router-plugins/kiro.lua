@@ -1,6 +1,6 @@
 --- @plugin Kiro AI
 --- @author TheSlopMachine
---- @version 5.3.1
+--- @version 5.3.2
 --- @plugin_api 1.5
 --- @description AWS Kiro models via device login (OAuth2 with proactive refresh)
 --- @allow_host codewhisperer.us-east-1.amazonaws.com
@@ -124,10 +124,11 @@ local function parse_model_list(body)
   return out
 end
 
-local function fetch_model_list(client, url, token, profile_arn)
+-- `send` performs one request, through the selected proxy pool.
+local function fetch_model_list(send, url, token, profile_arn)
   local target = url .. "?origin=AI_EDITOR"
   if type(profile_arn) == "string" and profile_arn ~= "" then target = target .. "&profileArn=" .. profile_arn end
-  local resp, err = client:request({
+  local resp, err = send({
     method = "GET",
     url = target,
     headers = {
@@ -888,6 +889,19 @@ local function pick_proxies(ctx, limit)
   return res.proxies
 end
 
+-- One request through the selected pool, for every call that is not
+-- generation. A 403 (egress block), a 5xx or a transport fault on one exit
+-- moves on to the next; a direct pool yields one direct attempt.
+local function pooled_request(ctx, client, request)
+  local resp, err
+  for _, px in ipairs(pick_proxies(ctx, 3)) do
+    request.proxy_url = px.url
+    resp, err = client:request(request)
+    if err == nil and resp.status ~= 403 and resp.status < 500 then break end
+  end
+  return resp, err
+end
+
 -- Kiro status mapping: 429 quota wording parks the OAuth account, other
 -- outcomes move on. Returns "proxy" (next exit, same credential), "cred"
 -- (next credential) or "done" (terminal, return at once).
@@ -1032,11 +1046,11 @@ end
 
 -- OIDC refresh moved out of refresh_credential: returns the merged data
 -- map on success, nil on any failure (the next tick retries).
-local function do_refresh(data)
+local function do_refresh(ctx, data)
   local region = data.region
   if not region or region == "" then region = DEFAULT_REGION end
   local client = llm_router.http_client({})
-  local resp, err = client:request({
+  local resp, err = pooled_request(ctx, client, {
     method = "POST",
     url = oidc_url(region, "token"),
     headers = { ["Content-Type"] = "application/json", ["Accept"] = "application/json" },
@@ -1207,7 +1221,7 @@ llm_router.register("kiro", {
         for _, c in ipairs(llm_router.credentials.list()) do
           local data = c.data or {}
           if is_token_stale(data) then
-            local merged, err = do_refresh(data)
+            local merged, err = do_refresh(ctx, data)
             if merged then llm_router.credentials.update(c.id, merged) end
           end
         end
@@ -1246,8 +1260,9 @@ llm_router.register("kiro", {
         -- Short cap: with several credentials an unreachable AWS would otherwise
         -- hold discovery for minutes.
         local client = llm_router.http_client({ timeout_ms = 20000 })
+        local function send(request) return pooled_request(ctx, client, request) end
         for _, url in ipairs(discovery_endpoints(region)) do
-          local models = fetch_model_list(client, url, token)
+          local models = fetch_model_list(send, url, token)
           if models then return with_thinking_variants(models) end
         end
         -- Desktop-style accounts serve the catalog under their profile ARN.
@@ -1255,7 +1270,7 @@ llm_router.register("kiro", {
         local arn = data.profile_arn
         if type(arn) ~= "string" or arn == "" then arn = data.profileArn end
         if type(arn) == "string" and arn ~= "" then
-          local models = fetch_model_list(client, discovery_endpoints(region)[1], token, arn)
+          local models = fetch_model_list(send, discovery_endpoints(region)[1], token, arn)
           if models then return with_thinking_variants(models) end
         end
         llm_router.log("warn", "discovery failed for credential", { cred_id = cred.id })
@@ -1281,7 +1296,7 @@ llm_router.register("kiro", {
     if type(arn) ~= "string" or arn == "" then arn = data.profileArn end
     if type(arn) == "string" and arn ~= "" then target = target .. "&profileArn=" .. arn end
     local client = llm_router.http_client({ timeout_ms = 15000 })
-    local resp, err = client:request({
+    local resp, err = pooled_request({ provider_config = provider_config or ctx.provider_config }, client, {
       method = "GET",
       url = target,
       headers = {
@@ -1346,7 +1361,7 @@ llm_router.register("kiro", {
           if type(target.arn) == "string" and target.arn ~= "" then
             fetch_url = fetch_url .. "&profileArn=" .. target.arn
           end
-          local resp, err = client:request({
+          local resp, err = pooled_request(ctx, client, {
             method = "GET",
             url = fetch_url,
             headers = {
@@ -1441,7 +1456,7 @@ llm_router.register("kiro", {
       if method == "builder-id" then start_url = BUILDER_START_URL end
 
       local client = llm_router.http_client({})
-      local reg_resp, reg_err = client:request({
+      local reg_resp, reg_err = pooled_request(ctx, client, {
         method = "POST",
         url = oidc_url(region, "client/register"),
         headers = { ["Content-Type"] = "application/json" },
@@ -1460,7 +1475,7 @@ llm_router.register("kiro", {
         return start_page("Client registration response was incomplete.", region, start_url, method)
       end
 
-      local dev_resp, dev_err = client:request({
+      local dev_resp, dev_err = pooled_request(ctx, client, {
         method = "POST",
         url = oidc_url(region, "device_authorization"),
         headers = { ["Content-Type"] = "application/json" },
@@ -1499,7 +1514,7 @@ llm_router.register("kiro", {
         return start_page("Device login expired. Start again.", state.region, state.start_url, state.method)
       end
       local client = llm_router.http_client({})
-      local resp, err = client:request({
+      local resp, err = pooled_request(ctx, client, {
         method = "POST",
         url = oidc_url(state.region, "token"),
         headers = { ["Content-Type"] = "application/json", ["Accept"] = "application/json" },
