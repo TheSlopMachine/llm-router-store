@@ -1,6 +1,6 @@
 --- @plugin Z.ai
 --- @author TheSlopMachine
---- @version 0.1.0
+--- @version 0.1.1
 --- @plugin_api 1.5
 --- @description (beta) Z.ai (Zhipu GLM, international platform): chat, thinking switch, tools, vision; GLM Flash models are free
 --- @allow_host api.z.ai
@@ -426,7 +426,7 @@ end
 -- ---------------------------------------------------------------------------
 
 llm_router.register("zai", {
-  icon = "https://z.ai/favicon.ico",
+  icon = "https://z-cdn.chatglm.cn/z-ai/static/logo.svg",
 
   proxy_schema = {},
 

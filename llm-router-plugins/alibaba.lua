@@ -1,6 +1,6 @@
 --- @plugin Alibaba Model Studio
 --- @author TheSlopMachine
---- @version 0.1.0
+--- @version 0.1.1
 --- @plugin_api 1.5
 --- @description (beta) Alibaba Cloud Model Studio (DashScope, OpenAI-compatible mode): Qwen, DeepSeek, GLM and Kimi chat with thinking control, tools, image input, embeddings
 --- @allow_host dashscope-intl.aliyuncs.com
@@ -619,8 +619,10 @@ local function embed_payload(request)
   return payload
 end
 
+local ICON = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgBAMAAACBVGfHAAAACXBIWXMAAAsSAAALEgHS3X78AAAAKlBMVEVHcEz/agD/agD/agD/agD/agD/agD/agD/agD/agD/agD/agD/agD/agBkDl66AAAADXRSTlMAQIDgkKBgULDwENAgShlO4gAAAHxJREFUKM9jYKAPqL4LBAIMDIwgejsDAyuIvgKS8QWxAhhygeTNAJAA61wg8xqD7d27JgUQzezOd+9eZgAJwgFQOVCgASHAARZYgBDgAgsguwEmIKQEBIpIArogJ1zCJ3BQEAhkkARQDcWwFsNhaE7H8ByG9zECCCMI6QIA4hd1i6STk2oAAAAASUVORK5CYII="
+
 llm_router.register("alibaba", {
-  icon = "https://www.alibabacloud.com/favicon.ico",
+  icon = ICON,
 
   proxy_schema = {},
 

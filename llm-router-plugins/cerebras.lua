@@ -1,6 +1,6 @@
 --- @plugin Cerebras
 --- @author TheSlopMachine
---- @version 1.0.0
+--- @version 1.0.1
 --- @plugin_api 1.5
 --- @description Cerebras Inference: fast chat, reasoning, tools, structured outputs, vision
 --- @allow_host api.cerebras.ai
@@ -425,7 +425,7 @@ end
 -- ---------------------------------------------------------------------------
 
 llm_router.register("cerebras", {
-  icon = "https://www.cerebras.ai/favicon.ico",
+  icon = "https://cdn.sanity.io/images/e4qjo92p/production/e7a55ae5ab7e2c4fdfd4e66a51f628d1f2f44207-967x967.png?w=128&h=128&fit=max&auto=format",
 
   proxy_schema = {},
 

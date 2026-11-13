@@ -1,6 +1,6 @@
 --- @plugin OpenCode Free
 --- @author TheSlopMachine
---- @version 6.7.1
+--- @version 6.7.2
 --- @plugin_api 1.5
 --- @description OpenAI/Anthropic/Google compatible free provider OpenCode Free (no key required)
 --- @allow_host opencode.ai
@@ -1920,8 +1920,10 @@ end
 -- Provider registration
 ---------------------------------------------------------------------------
 
+local ICON = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAMKADAAQAAAABAAAAMAAAAADbN2wMAAAA1ElEQVRoBe2ZUQqEMAwF12UPoOid9P7nWPAIuyD0M5BHm4bA+FMoMbEzIVBc9nX9vQo/78Lf/nw6B8g2iAEMdBKghToBdr/+UTN871t9RYo/tk2Kp4UkXAHBGAiAKqUsb0CeQhYedXqMmmblDXAAq6Vm7WNgFmmrzrApdF6XVSN0nxYKxetIjgEHpNAQDITidSTHgANSaAgGQvE6kpc3sKg/OEbdpCy46s2uvAEOYLXCrH0MzCJt1ZGnkJUoa58WyiLf6mKgkchaMZBFvtXFQCORtf4BPMwN0WQ9ayAAAAAASUVORK5CYII="
+
 llm_router.register("opencode-free", {
-  icon = "https://opencode.ai/favicon.ico",
+  icon = ICON,
 
   proxy_schema = {},
 

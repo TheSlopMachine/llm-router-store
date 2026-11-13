@@ -1,6 +1,6 @@
 --- @plugin Kiro AI
 --- @author TheSlopMachine
---- @version 5.3.3
+--- @version 5.3.4
 --- @plugin_api 1.5
 --- @description AWS Kiro models via device login (OAuth2 with proactive refresh)
 --- @allow_host codewhisperer.us-east-1.amazonaws.com
@@ -1167,8 +1167,10 @@ local function assemble_completion(body, thinking, full_model)
   }
 end
 
+local ICON = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAMKADAAQAAAABAAAAMAAAAADbN2wMAAAEJElEQVRoBdVaPUwUQRR+e5JQaPAoUAtNDrHSRH4qrmJNNIKNZ2ElyUGl3eViYQmJlQ13l1iZGCDRykKwMCRanI3YQTShAnOJNEJzMVrQsL5v17nbvdvFebN3x/ES2NmZN2++b+bN2/k5iyKkMOnYZNFdLrYdohQ5lIxQbU+2RVWLqMLGy4xjOf/e2gxriHWCwsBTnLPIoO1gyfG+WRatcCfm82tWxY8k4X9ZmHSyjkUb3QYeGB2HMsBWYox+zLURAHguWPIXdmv6FNFMbs1aBj6XANwG7Dru56Y9hPnh0CjcyXMhiwonBjxIewFlEUmrcMcZcQ6590+gsPvcSPDkmDmB2F3I7PaZHk5NtJrAxetEV8aJ8Ow941k/+E30a49o+zPR7jdO/4zfKo/ABAik4pvyLFy9RZR+QNR3PsQi5w0MEQ2lvbKtD0Trr+MRcRh7Tysmb+9p/uo9JAIBXYEuRujdU6L9Hd1aDXo8mQMfsoZirVeAv/9MBl4ZxkhNP+e6N1WO/BmbQHracw150/Ua9iNzG7EIwA1GM3UgpimM4u28We1YBDBhWyWY4CauZEwAEzA02sRgNHZPXtmYgAqH8iajawxc9iJTtEZziTGBSzwCOpLP58nixXypVKqpVyoV6u/vp8HBQapWq7V8JEBCIsYEdBsqFosunvn5+RoukAFwEFldXa3lI6FrV1UyIqDbiL93o9Ig4ZdzPJklYkRArW/+11AymST8QdSzMT08POyWq3/SwGBEQNLI3NycCz6XyymMlM1mKZVKkW3blMkEPyT4JkjE4q0kr4lkMs7xH1/gdklhSt9y20dAH0pdUzIKRgTOhi2X6+3HTh380TdhRACf/W4RMQF3lyWcaBKy+98l2kRiAtdirN11oGHrKRERAYRPya5LAkTpSndnIgKtXD4rwI3P7S+NOUe/iwi0u/cBtW0jIInNR/dZdOn2OpEkhMKS9gjA8O7XYOPSxoK1m992+MxIKjgX0pY3T7xzHSzmcDCFVSmOU1ohsLf1UW5JRADmd3iYlYzh/qZFsv7KzJC2C4WZ77sQlivPM+19tBSLQCsmNuYRXNNUYhHQOaA9aqIr8Dp2oggm+I4muKuO0gzJL7+IDnsAh8Pbl9nm6AVTAI2el8b9AAzc1CxMObhaGgkUCF6wvMAGB3tZuNQeL8awINt4WyendHCSAeA/+HjdXy5oLqDKhx2bIFBkAvX9XkCly1/4tCbBl2UrXQ4zEh6PwFKCb/rKfNNRjtTq0gIGv4LbexWFZuNM5k5zZPBVdnv3PNslgPtWdiU3o9NgTNo79P3kQI0AMYkldqWuHgn0PJ8BzT5mrIo4Yw6K+2MPvvjGbxOCJcf79m+ezsJb/EiaCKhC9wKc75BZYYLzUkwoqco68XT9nH9uwz3+CZESwSas3b8/ExZRJVh0vQAAAABJRU5ErkJggg=="
+
 llm_router.register("kiro", {
-  icon = "https://kiro.dev/favicon.ico",
+  icon = ICON,
 
   proxy_schema = {},
 
