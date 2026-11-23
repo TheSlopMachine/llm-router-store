@@ -1,6 +1,6 @@
 --- @plugin OpenRouter
 --- @author llm-router
---- @version 1.1.1
+--- @version 1.1.2
 --- @plugin_api 1.6
 --- @allow_host openrouter.ai
 --- @description OpenRouter API: chat (unary and streaming), embeddings, speech-to-text, text-to-speech, image and video generation, model discovery and health probes
@@ -170,7 +170,9 @@ end
 -- "You requested up to N tokens, but can only afford M."
 local function afford_tokens(message)
   if type(message) ~= "string" then return nil end
-  return tonumber(string.match(message, "can only afford (%d+)"))
+  local n = string.match(message, "can only afford (%d+)")
+  if n == nil then return nil end
+  return tonumber(n)
 end
 
 -- The provider's own error text under OpenRouter's "Provider returned error"
