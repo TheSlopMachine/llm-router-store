@@ -1,6 +1,6 @@
 --- @plugin Qwen Web
 --- @author TheSlopMachine
---- @version 0.3.0
+--- @version 0.3.3
 --- @plugin_api 1.9
 --- @description Qwen web chat (chat.qwen.ai) with your account through a headless browser in Docker: streaming, thinking, web search
 --- @license MIT
@@ -67,6 +67,11 @@ local STREAM_TIMEOUT_MS = 900000
 local RISK_PARK_SECONDS = 60
 local MAX_RISK_PARK_SECONDS = 3600
 local RISK_STREAK_SCOPE = "risk_streak"
+-- account/model pairs that reached the model's daily limit.
+local MODEL_LIMIT_SCOPE = "model_limit"
+-- Accounts whose memory was checked off recently.
+local MEMORY_SCOPE = "memory_off"
+local MEMORY_CHECK_SECONDS = 24 * 3600
 -- A streak older than this is forgotten.
 local RISK_STREAK_SECONDS = 2 * 3600
 local DEFAULT_PARK_SECONDS = 60
@@ -173,6 +178,7 @@ end
 
 -- A problem is {kind, message, wait?, fault?}. Kinds:
 --   risk, challenge, rate, quota: transient, the account parks.
+--   model_limit: the daily limit of one model, the account skips that model.
 --   invalid_credentials, auth: Qwen rejects the account.
 --   blocked: sign-in blocked by risk control, the account parks.
 --   bad_request, not_found: the request itself is wrong.
@@ -220,7 +226,7 @@ end
 local function call_error(issue)
   local kind = issue.kind
   if kind == "transport" and issue.fault ~= nil then return issue.fault end
-  if kind == "risk" or kind == "challenge" or kind == "rate" or kind == "quota" or kind == "blocked" then
+  if kind == "risk" or kind == "challenge" or kind == "rate" or kind == "quota" or kind == "model_limit" or kind == "blocked" then
     return { message = issue.message, code = "rate_limit", status = 429 }
   end
   if kind == "auth" or kind == "invalid_credentials" then
@@ -404,6 +410,46 @@ local function access_token(account, renew)
   return signed_in.access_token, nil
 end
 
+-- ── Account memory ──
+
+-- Qwen memory carries facts from one chat into the next, so one router
+-- request would leak into another. The plugin turns it off for each account
+-- and checks again once a day: the user may turn it back on. A failure only
+-- logs; the request goes on.
+local function disable_memory(account, token)
+  local key = session_key(account.email)
+  if llm_router.storage.get(MEMORY_SCOPE, key) ~= nil then return end
+  local response, issue = page_request(account, token, "GET", "/api/v2/users/user/settings", nil)
+  local decoded = response and decode_json(response.body)
+  local settings = decoded and decoded.data
+  if issue ~= nil or response.status ~= 200 or type(settings) ~= "table" then
+    llm_router.log("warn", "account memory not checked", {
+      operation = "memory", error = issue and issue.message or excerpt(response and response.body, 300),
+    })
+    return
+  end
+  local memory = type(settings.memory) == "table" and settings.memory or {}
+  if memory.enable_memory ~= false or memory.enable_history_memory ~= false then
+    -- Only the memory section goes up: the endpoint merges it into the rest.
+    local update, update_issue = page_request(account, token, "POST", "/api/v2/users/user/settings/update", json.encode({
+      memory = {
+        enable_memory = false,
+        enable_history_memory = false,
+        memory_version_reminder = memory.memory_version_reminder == true,
+      },
+    }))
+    local answer = update and decode_json(update.body)
+    if update_issue ~= nil or update.status ~= 200 or (answer and answer.success == false) then
+      llm_router.log("warn", "account memory not turned off", {
+        operation = "memory", error = update_issue and update_issue.message or excerpt(update and update.body, 300),
+      })
+      return
+    end
+    llm_router.log("info", "account memory turned off", { operation = "memory" })
+  end
+  llm_router.storage.set(MEMORY_SCOPE, key, true, { ttl = MEMORY_CHECK_SECONDS })
+end
+
 -- ── Chat ──
 
 local function text_of(content)
@@ -550,7 +596,10 @@ local function handle_line(state, line, sink)
   local phase = delta.phase
   if phase == "answer" then
     if type(delta.extra) == "table" and delta.extra.update_member == true then
-      state.issue = problem("quota", "the Qwen account used up its quota")
+      -- The answer text names the limit, for example "You've reached
+      -- today's Qwen4-Max limit": it is per model, not per account.
+      local text = type(delta.content) == "string" and delta.content or ""
+      state.issue = problem("model_limit", text ~= "" and text or "Qwen reached the limit of this model")
       error(STREAM_STOP)
     end
     if type(delta.content) == "string" and delta.content ~= "" then sink("content", delta.content) end
@@ -622,6 +671,7 @@ end
 local function attempt(account, model, search, request, output)
   local token, issue = access_token(account, false)
   if token == nil then return nil, issue end
+  disable_memory(account, token)
   local usage, completion_issue = run_completion(account, token, model, search, request, output.sink)
   if completion_issue == nil or output.delivered()
     or (completion_issue.kind ~= "auth" and completion_issue.kind ~= "challenge") then
@@ -663,10 +713,14 @@ local function serve(ctx, request, output)
   end
   local model, search = upstream_model(request.model_name)
   local tried = 0
+  local limited = 0
   local last_issue = nil
   for _, credential_entry in ipairs(llm_router.credentials.list()) do
     local account = account_of(credential_entry.data)
-    if account ~= nil then
+    local limit_key = credential_entry.id .. "/" .. model
+    if account ~= nil and llm_router.storage.get(MODEL_LIMIT_SCOPE, limit_key) ~= nil then
+      limited = limited + 1
+    elseif account ~= nil then
       tried = tried + 1
       output.reset()
       local usage, issue = attempt(account, model, search, request, output)
@@ -676,7 +730,12 @@ local function serve(ctx, request, output)
       end
       last_issue = issue
       if output.delivered() then return nil, call_error(issue) end
-      if PARK_SECONDS[issue.kind] ~= nil then
+      if issue.kind == "model_limit" then
+        -- The account keeps serving other models.
+        limited = limited + 1
+        llm_router.storage.set(MODEL_LIMIT_SCOPE, limit_key, true, { ttl = QUOTA_PARK_SECONDS })
+        llm_router.log("warn", "model limit reached", { cred_id = credential_entry.id, model = model, wait = QUOTA_PARK_SECONDS })
+      elseif PARK_SECONDS[issue.kind] ~= nil then
         park(credential_entry, park_seconds(credential_entry, issue.kind), issue.kind, issue.message)
       elseif issue.kind == "invalid_credentials" or issue.kind == "auth" then
         llm_router.log("warn", "account rejected", { cred_id = credential_entry.id, error = issue.message })
@@ -688,6 +747,9 @@ local function serve(ctx, request, output)
   end
   -- list() skips parked accounts, so an empty list means either none is
   -- signed in or every one waits out a park.
+  if tried == 0 and limited > 0 then
+    return nil, { message = "every Qwen account reached today's limit for " .. model .. ": pick another model", code = "rate_limit", status = 429 }
+  end
   if tried == 0 then
     return nil, { message = "no Qwen account is available: sign one in or wait until a parked one returns", code = "rate_limit", status = 429 }
   end
