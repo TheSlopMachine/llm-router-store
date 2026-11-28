@@ -1,6 +1,6 @@
 --- @plugin Claude
 --- @author TheSlopMachine
---- @version 0.1.2
+--- @version 0.2.0
 --- @plugin_api 1.8
 --- @description Claude models with an Anthropic API key or with your own Claude subscription. The subscription runs the official Claude Code in a container.
 --- @license MIT
@@ -11,7 +11,7 @@
 --- @allow_host platform.claude.com
 --- @allow_host console.anthropic.com
 --- @require_api docker
---- @docker.image ghcr.io/theslopmachine/llm-router-asterisk-bridge:v0.1.0@sha256:1240a7085bc06f7a45f857c402655ad2f0bfb9cdf4c7373fe18d463d2978acb5
+--- @docker.image ghcr.io/theslopmachine/llm-router-asterisk-bridge:v0.2.0@sha256:b990bf9ca8078917e0d2de37770b23649fa712315a5c8c49215b4d7ee0cc4343
 --- @docker.memory_limit_mb 3072
 --- @docker.cpu_limit 2
 --- @docker.pids_limit 1024
@@ -32,7 +32,7 @@ local docker = llm_router.docker
 
 local API_URL = "https://api.anthropic.com/v1"
 local API_VERSION = "2023-06-01"
-local IMAGE = "ghcr.io/theslopmachine/llm-router-asterisk-bridge:v0.1.0@sha256:1240a7085bc06f7a45f857c402655ad2f0bfb9cdf4c7373fe18d463d2978acb5"
+local IMAGE = "ghcr.io/theslopmachine/llm-router-asterisk-bridge:v0.2.0@sha256:b990bf9ca8078917e0d2de37770b23649fa712315a5c8c49215b4d7ee0cc4343"
 -- Claude Code release the bridge installs. Every flag the bridge passes
 -- exists in this release.
 local CLAUDE_CODE_VERSION = "2.1.296"
@@ -825,12 +825,21 @@ end
 
 -- ── Model cards ──
 
-local SUBSCRIPTION_MODELS = {
-  { name = "claude-opus-5-5", display_name = "Claude Opus 5.5" },
-  { name = "claude-sonnet-5-5", display_name = "Claude Sonnet 5.5" },
-  { name = "claude-haiku-5-5", display_name = "Claude Haiku 5.5" },
-  { name = "claude-fable-5-2", display_name = "Claude Fable 5.2" },
-}
+local ALL_EFFORTS = { "low", "medium", "high", "xhigh", "max" }
+
+-- Sets the reasoning fields from the effort levels a model takes, lowest
+-- first. A model without effort levels has no reasoning.
+local function set_efforts(card, efforts)
+  if #efforts == 0 then
+    card.capabilities = { "tools" }
+    card.reasoning = nil
+    return
+  end
+  local highest_first = {}
+  for index = #efforts, 1, -1 do table.insert(highest_first, efforts[index]) end
+  card.capabilities = { "tools", "reasoning", "structured_outputs" }
+  card.reasoning = { supported_efforts = highest_first, default_enabled = true }
+end
 
 local function model_card(name, display_name, context_window, max_tokens)
   local card = {
@@ -840,13 +849,9 @@ local function model_card(name, display_name, context_window, max_tokens)
     max_tokens = max_tokens,
     input_modalities = { "text", "image", "file" },
     output_modalities = { "text" },
-    capabilities = { "tools" },
     endpoints = { "chat/completions" },
   }
-  if supports_adaptive(name) then
-    card.capabilities = { "tools", "reasoning", "structured_outputs" }
-    card.reasoning = { supported_efforts = { "max", "xhigh", "high", "medium", "low" }, default_enabled = true }
-  end
+  set_efforts(card, supports_adaptive(name) and ALL_EFFORTS or {})
   return card
 end
 
@@ -862,6 +867,32 @@ local function api_models(credential_entry)
     table.insert(cards, model_card(entry.id, entry.display_name, entry.max_input_tokens, entry.max_tokens))
   end
   return cards, nil
+end
+
+-- Lists the models Claude Code offers the subscription accounts: the union
+-- over every account, since plans differ. Fails only when no account
+-- answers.
+local function subscription_models(subscriptions)
+  local models, order, last_fault = {}, {}, nil
+  for _, credential_entry in ipairs(subscriptions) do
+    local decoded, status, fault = bridge_call("GET", "/accounts/" .. credential_entry.data.account .. "/models", nil, 90000)
+    if fault == nil and status ~= 200 then fault = router_error(bridge_failure(decoded, status)) end
+    if fault ~= nil then
+      last_fault = fault
+      llm_router.log("warn", "subscription model list failed", { cred_id = credential_entry.id, error = fault.message })
+    else
+      for _, model in ipairs(decoded.models or {}) do
+        if models[model.id] == nil then
+          models[model.id] = model
+          table.insert(order, model.id)
+        end
+      end
+    end
+  end
+  if #order == 0 and last_fault ~= nil then return nil, last_fault end
+  local listed = {}
+  for _, id in ipairs(order) do table.insert(listed, models[id]) end
+  return listed, nil
 end
 
 -- ── Sign-in wizard ──
@@ -1145,23 +1176,37 @@ llm_router.register("claude", {
     return probe_model(ctx, model_ref)
   end,
 
+  -- API keys list models with their limits. Claude Code lists the models of
+  -- the subscription with the effort levels each one takes.
   get_model_infos = function(ctx)
-    local cards, seen = {}, {}
-    local _, api_keys = ordered_credentials(ctx)
+    local cards, by_name, last_fault = {}, {}, nil
+    local subscriptions, api_keys = ordered_credentials(ctx)
     for _, credential_entry in ipairs(api_keys) do
       local listed, fault = api_models(credential_entry)
       if fault == nil then
         for _, card in ipairs(listed) do
-          seen[card.name] = true
+          by_name[card.name] = card
           table.insert(cards, card)
         end
         break
       end
+      last_fault = fault
       llm_router.log("warn", "model list failed", { cred_id = credential_entry.id, error = fault.message })
     end
-    for _, model in ipairs(SUBSCRIPTION_MODELS) do
-      if not seen[model.name] then table.insert(cards, model_card(model.name, model.display_name, 1000000, 128000)) end
+    if #subscriptions > 0 then
+      local listed, fault = subscription_models(subscriptions)
+      if fault ~= nil then last_fault = fault end
+      for _, model in ipairs(listed or {}) do
+        local card = by_name[model.id]
+        if card == nil then
+          card = model_card(model.id, "Claude " .. tostring(model.display_name or model.id))
+          card.description = model.description
+          table.insert(cards, card)
+        end
+        set_efforts(card, model.efforts or {})
+      end
     end
+    if #cards == 0 and last_fault ~= nil then return nil, last_fault end
     return cards, nil
   end,
 
